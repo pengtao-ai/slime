@@ -50,6 +50,34 @@ Standard slime JSONL with three keys:
 
 Wire it up with `--input-key prompt --label-key label --metadata-key metadata`.
 
+## Mid-turn LLM offload (PyroDash)
+
+Offload is implemented **on this black-box agent path**, not as post-hoc math custom-rm.
+**Every agent round** is: agent → SLM → (if offload span) GLM → **complete** reply → agent.
+
+1. Offload usage is appended to Claude Code's **system** prompt via `--append-system-prompt` (`SLIME_AGENT_CC_APPEND_SYSTEM_PROMPT` / `offload.OFFLOAD_SYSTEM_PROMPT_APPEND`); the task user prompt (`SWE_PROMPT`) is unchanged.
+2. Actor may emit `<|llm_offload|>N<|/llm_offload|>` mid-turn (`N`: `0`=no think, `1–5`=`high`, `6–9`=`max`). PyroDash: open **248077**, close **248078** (stop on close).
+3. Adapter waits for GLM (when needed), merges SLM prefix + GLM into one assistant message, then responds to Claude Code / Codex.
+4. Only local-model `output_ids` are trained; GLM text lands in history with `loss_mask=0` on later turns.
+5. Train reward: `solved - λ * cost_ratio` (`offload.py`), using session token accounting + optional `metadata.usage` baseline.
+
+```bash
+# CPU plumbing smoke (mock GLM, 2 adapter turns; no GPU/Docker)
+python examples/coding_agent_rl/smoke_offload_adapter.py
+
+# 1-sample docker train smoke
+export DASHSCOPE_API_KEY=...
+export DASHSCOPE_BASE_URL=http://host:8000/v1
+bash examples/coding_agent_rl/run_pyrodash4b_swe_offload_smoke.sh
+
+# full async docker train (after convert_pyrodash4b_to_torch_dist.sh)
+bash examples/coding_agent_rl/run_pyrodash4b_swe_offload_1node_docker_async.sh
+```
+
+Key env: `SLIME_AGENT_OFFLOAD=1`, `OFFLOAD_EFFICIENCY_LAMBDA`, `ROLLOUT_STOP_TOKEN_IDS` (includes offload id), `DASHSCOPE_*`.
+
+> `examples/llm_offload/` is a separate **math** GRPO sketch; do not use it for coding-agent offload.
+
 ## Running the Script
 
 Override the paths at the top of the launcher, then run from a long-lived shell on the Ray head node (do **not** wrap in `nohup` — Ray child processes get cleaned up with it):
@@ -125,6 +153,7 @@ contract (read inside `slime/agent/`); `SWE_*` are this SWE example's task knobs
 | `SLIME_AGENT_NODE_TARBALL` | — | Host path to Node 22 tarball uploaded into each sandbox. |
 | `SLIME_AGENT_CC_TARBALL` | — | Host path to the Claude Code CLI npm tarball. |
 | `SLIME_AGENT_CC_EXTRA_ARGS` | (see launcher) | Extra flags appended to the `claude` CLI invocation — registers the read-only `investigator` sub-agent, disables `WebFetch`/`WebSearch`, disables slash commands. |
+| `SLIME_AGENT_CC_APPEND_SYSTEM_PROMPT` | unset (offload sets default) | Passed as `claude --append-system-prompt ...` (appends to Claude Code's default system prompt; does not replace it). |
 | `SLIME_AGENT_CC_EXTRA_ENVS` | unset | JSON object of extra env vars exported into the `claude` process — escape hatch for env-only knobs (`MAX_THINKING_TOKENS`, `BASH_MAX_TIMEOUT_MS`, ...). Merged last, so it can also override the built-in defaults. |
 | `SWE_AGENT_TIME_BUDGET_SEC` | `1800` | Wallclock budget for the in-sandbox agent CLI itself (think/edit/run). |
 | `SWE_EVAL_TIMEOUT_SEC` | `600` | Wallclock cap on the evaluator sandbox. |

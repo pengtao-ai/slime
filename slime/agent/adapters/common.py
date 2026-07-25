@@ -35,11 +35,13 @@ class Session:
     """Per-sid adapter state: sampling defaults and context budget.
 
     Trajectory state lives in the shared TrajectoryManager (BaseAdapter.manager),
-    not here.
+    not here. ``offload_stats`` is an optional side channel for mid-turn LLM
+    offload accounting (filled by coding-agent adapters when enabled).
     """
 
     sampling_defaults: dict = dataclasses.field(default_factory=dict)
     max_context_tokens: int = 0
+    offload_stats: dict = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -194,6 +196,25 @@ class BaseAdapter:
         """Pack parsed model output into a Reply."""
         raise NotImplementedError
 
+    async def _postprocess_reply(
+        self,
+        reply: Reply,
+        *,
+        raw_output: str,
+        translated: list[dict],
+        tools_schema: list[dict] | None,
+        turn: TurnRecord,
+        session: Session,
+        sid: str,
+    ) -> Reply:
+        """Optional hook after ``_build_reply`` (e.g. mid-turn LLM offload).
+
+        Default is a no-op. Subclasses may mutate ``session.offload_stats`` and
+        amend ``reply`` (wire + manager_message) before the client flush.
+        Trainable tokens remain ``turn.output_ids`` from the local model only.
+        """
+        return reply
+
     async def _respond(
         self,
         request: web.Request,
@@ -316,11 +337,11 @@ class BaseAdapter:
             self.logger.exception("debug_callback failed (sid=%s)", sid)
 
     async def _run_turn(self, request: web.Request) -> web.StreamResponse:
-        """One full agent turn: translate -> sglang -> parse -> append -> respond.
+        """One agent round: translate -> SLM /generate -> parse -> postprocess -> respond.
 
-        The wire-specific steps are delegated to the subclass hooks; the rest
-        (sid resolution, closed/cap guards, inflight tracking, record_turn) is
-        shared across protocols.
+        ``_postprocess_reply`` runs before the client flush so coding-agent offload
+        can call a remote GLM and compose a *complete* assistant reply for this
+        round. Each subsequent agent tool/chat round repeats the same pipeline.
         """
         body = await request.json()
         self._preprocess_body(body)
@@ -341,6 +362,7 @@ class BaseAdapter:
             translated, tools_schema = self._translate(body)
             prompt_ids = _render_token_ids(translated, tok, tools=tools_schema, add_generation_prompt=True)
 
+            # 1) Always SLM first for this agent round.
             turn = await call_sglang_generate(prompt_ids, s, body, adapter=self, session_id=sid)
 
             raw_output = tok.decode(turn.output_ids, skip_special_tokens=False) if turn.output_ids else ""
@@ -352,6 +374,17 @@ class BaseAdapter:
             )
             reply = self._build_reply(parsed, turn.finish_reason, translated, tools_schema)
             turn = dataclasses.replace(turn, ill_formed=parsed.ill_formed)
+            # 2) Optional GLM offload + 3) compose complete output for the agent.
+            # Must finish before _respond so the agent never sees a partial SLM-only turn.
+            reply = await self._postprocess_reply(
+                reply,
+                raw_output=raw_output,
+                translated=translated,
+                tools_schema=tools_schema,
+                turn=turn,
+                session=s,
+                sid=sid,
+            )
 
             in_tok, out_tok = len(prompt_ids), len(turn.output_ids)
             stream = body.get("stream") is True or "text/event-stream" in request.headers.get("Accept", "")

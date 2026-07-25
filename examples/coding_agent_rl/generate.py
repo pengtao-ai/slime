@@ -30,26 +30,69 @@ from dataclasses import dataclass
 from typing import Any
 
 from slime.agent.adapters import AnthropicAdapter, OpenAIAdapter
+from slime.agent.adapters.common import Reply, Session
 from slime.agent.aiohttp_threaded import FilteredAccessLogger, run_app_in_thread
 from slime.agent.harness import ClaudeCodeHarness, CodexHarness
 from slime.agent.sandbox import make_sandbox
+from slime.agent.trajectory import TurnRecord
 from slime.utils.misc import SingletonMeta
 from slime.utils.processing_utils import load_tokenizer
 from slime.utils.types import Sample
 
-from . import swe
+from . import offload, swe
 
 logger = logging.getLogger(__name__)
 logging.getLogger("e2b").setLevel(logging.WARNING)
 
+
+class _OffloadMixin:
+    """Per-turn pipeline: agent -> SLM -> (optional GLM) -> complete reply -> agent.
+
+    Every Claude Code / Codex ``/v1/messages`` (or chat) round hits this hook
+    *before* the adapter flushes the response. Training still uses only SLM
+    ``output_ids``; the agent always sees the composed full assistant turn.
+    """
+
+    async def _postprocess_reply(
+        self,
+        reply: Reply,
+        *,
+        raw_output: str,
+        translated: list[dict],
+        tools_schema: list[dict] | None,
+        turn: TurnRecord,
+        session: Session,
+        sid: str,
+    ) -> Reply:
+        return await offload.apply_offload_if_needed(
+            reply,
+            raw_output=raw_output,
+            translated=translated,
+            turn=turn,
+            session=session,
+            sid=sid,
+        )
+
+
+class CodingAnthropicAdapter(_OffloadMixin, AnthropicAdapter):
+    pass
+
+
+class CodingOpenAIAdapter(_OffloadMixin, OpenAIAdapter):
+    pass
+
+
 _AGENTS = {
-    "claude_code": (ClaudeCodeHarness, AnthropicAdapter),
-    "codex": (CodexHarness, OpenAIAdapter),
+    "claude_code": (ClaudeCodeHarness, CodingAnthropicAdapter),
+    "codex": (CodexHarness, CodingOpenAIAdapter),
 }
 AGENT_NAME = os.environ.get("SWE_AGENT", "claude_code")
 if AGENT_NAME not in _AGENTS:
     raise ValueError(f"SWE_AGENT={AGENT_NAME!r} not in {sorted(_AGENTS)}")
 HARNESS_CLS, ADAPTER_CLS = _AGENTS[AGENT_NAME]
+
+# Offload tag instructions go on the black-box agent's system prompt, not SWE_PROMPT.
+offload.ensure_offload_system_prompt_append()
 
 
 @dataclass(frozen=True)
@@ -243,18 +286,34 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 diff_text=diff_text,
                 timeout_sec=CONFIG.eval_timeout_sec,
             )
+            solved = float(reward)
+            offload_stats = {}
+            session_obj = state.adapter.store.get(session_id)
+            if session_obj is not None and getattr(session_obj, "offload_stats", None):
+                offload_stats = dict(session_obj.offload_stats)
+            train_reward = solved
+            if offload.offload_enabled():
+                usage = md.get("usage") if isinstance(md.get("usage"), dict) else None
+                train_reward = offload.cost_aware_reward(solved, offload_stats, usage=usage)
+                logger.info(
+                    "[coding_agent_rl] %s: solved=%.1f train_reward=%.4f offload=%s",
+                    instance_id,
+                    solved,
+                    train_reward,
+                    offload_stats,
+                )
             if evaluation:
                 logger.info(
                     "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs (eval-only)",
                     instance_id,
-                    float(reward),
+                    solved,
                     bool(applied_cleanly),
                     agent_exit_code,
                     time.time() - t0,
                 )
                 return _eval_result(
                     base_sample,
-                    reward=float(reward),
+                    reward=solved,
                     applied_cleanly=bool(applied_cleanly),
                     agent_exit_code=agent_exit_code,
                     instance_id=instance_id,
@@ -263,10 +322,12 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             samples = await state.adapter.finish_session(
                 session_id,
                 base_sample=base_sample,
-                reward=float(reward),
+                reward=float(train_reward),
                 extra_metadata={
-                    "grading_solved": float(reward) == 1.0,
+                    "grading_solved": solved == 1.0,
                     "instance_id": instance_id,
+                    "solved": solved,
+                    "offload_stats": offload_stats,
                 },
             )
             if not samples:
@@ -293,7 +354,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             logger.info(
                 "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs segments=%d",
                 instance_id,
-                float(reward),
+                float(train_reward),
                 bool(applied_cleanly),
                 agent_exit_code,
                 time.time() - t0,

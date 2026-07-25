@@ -187,6 +187,15 @@ class _SampleBuilder:
         # (and is short); divergence anywhere earlier, or an empty builder, forks.
         start = self.last_response_start_idx
         if start is not None and realign_at >= start and len(turn.output_ids) < self._fork_threshold:
+            held_resp_len = len(self.tokens) - start
+            new_tail_len = len(turn.prompt_ids) - start
+            # Mid-turn LLM offload (and similar) returns a longer assistant echo than
+            # the local model actually generated. REALIGN would wipe those generated
+            # tokens to loss_mask=0; FORK instead so they stay trainable on their own
+            # sample while the continuation opens a new builder.
+            expand_slack = max(32, held_resp_len)
+            if new_tail_len > held_resp_len + expand_slack:
+                return DriftKind.FORK
             return DriftKind.REALIGN
         return DriftKind.FORK
 

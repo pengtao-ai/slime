@@ -98,6 +98,8 @@ RUN_ROOT="${RUN_ROOT:-${SLIME_DIR}/runs/${EXP_TAG}_${STAMP}}"
 SAVE_DIR="${SAVE_DIR:-${RUN_ROOT}/checkpoints}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-5}"
 UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-1}"
+# eos/pad; offload launchers append <|/llm_offload|> id (e.g. 248078).
+ROLLOUT_STOP_TOKEN_IDS="${ROLLOUT_STOP_TOKEN_IDS:-248046 248044}"
 
 # ============ logging ============
 LOG_DIR="${RUN_ROOT}"
@@ -130,7 +132,7 @@ ROLLOUT_ARGS=(
    --rollout-max-context-len ${MAX_CONTEXT_LEN}
    --rollout-max-response-len ${MAX_GEN_LEN}
    --rollout-temperature 1.0
-   --rollout-stop-token-ids 248046 248044
+   --rollout-stop-token-ids ${ROLLOUT_STOP_TOKEN_IDS}
    --num-steps-per-rollout 1
    --global-batch-size ${GLOBAL_BATCH_SIZE}
    --micro-batch-size 1
@@ -250,6 +252,7 @@ keys = (
     "ADAPTER_BIND_HOST", "ADAPTER_PORT",
     "SLIME_AGENT_CC_EXTRA_ARGS",
     "SLIME_AGENT_CC_EXTRA_ENVS",
+    "SLIME_AGENT_CC_APPEND_SYSTEM_PROMPT",
     "SWE_CC_PROMPT",
     "SWE_TRAIN_PROTOCOL",
     "SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY",
@@ -259,6 +262,13 @@ keys = (
     "SLIME_AGENT_DOCKER_ADD_HOST",
     "SLIME_AGENT_DOCKER_PULL",
     "SLIME_AGENT_DOCKER_RUN_TIMEOUT_SEC",
+    # coding-agent mid-turn offload
+    "SLIME_AGENT_OFFLOAD",
+    "DASHSCOPE_API_KEY", "OPENAI_API_KEY",
+    "DASHSCOPE_BASE_URL", "DASHSCOPE_MODEL",
+    "OFFLOAD_EFFICIENCY_LAMBDA", "OFFLOAD_MAX_TOKENS",
+    "OFFLOAD_STOP_TOKEN_ID", "ROLLOUT_STOP_TOKEN_IDS",
+    "SLIME_AGENT_OFFLOAD_SYSTEM_APPEND",
 )
 env = {k: os.environ[k] for k in keys if k in os.environ}
 env["MASTER_ADDR"] = os.environ["MASTER_ADDR"]
