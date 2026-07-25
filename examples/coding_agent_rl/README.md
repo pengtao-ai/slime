@@ -2,6 +2,8 @@
 
 This directory provides an example of running end-to-end **SWE (Software-Engineering) coding-agent RL** with slime: a real coding agent (claude-code CLI) drives `Read/Edit/Grep/Bash/Agent` tools inside a fresh sandbox per sample, the model produces a `git diff`, and the diff is graded against the dataset's test harness in a second clean sandbox (no test-cheating).
 
+**Qwen3.5-4B + public e2b.dev (1 node):** see [README_qwen35_4b_public_e2b.md](./README_qwen35_4b_public_e2b.md) for the local diff summary and runbook (template build, Cloudflare tunnel, smoke data).
+
 Two example files, the shared harness package, and one shared adapter implement the loop:
 
 - `generate.py` — per-sample `generate()` registered via `--custom-generate-function-path`. Boots the sandbox, prepares the SWE workspace, runs the coding harness (claude-code), captures the diff, scores it, and emits one or more `Sample`s back to slime.
@@ -187,14 +189,45 @@ prompt-base restarts.
 
 ## Porting to a New Sandbox Backend
 
-`slime.agent.sandbox.Sandbox` exposes the shared sandbox contract, and
-`slime.agent.sandbox.E2BSandbox` is the E2B implementation:
+`slime.agent.sandbox.Sandbox` exposes the shared sandbox contract.
+Shipped backends:
+
+- `E2BSandbox` — remote E2B / E2B-compatible gateway (default)
+- `DockerSandbox` — local Docker engine (`SLIME_AGENT_SANDBOX_BACKEND=docker`)
+
+Prefer `make_sandbox(image)` so examples switch backends via env:
 
 ```python
-await sb.exec(cmd, user=..., check=..., timeout=...)
-await sb.write_file(sandbox_path, content_or_host_path, user=...)
-await sb.read_file(sandbox_path, user=...)
-async with E2BSandbox(...) as sb: ...
+from slime.agent.sandbox import make_sandbox
+
+async with make_sandbox(image) as sb:
+    await sb.exec(cmd, user=..., check=..., timeout=...)
+    await sb.write_file(sandbox_path, content_or_host_path, user=...)
+    await sb.read_file(sandbox_path, user=...)
 ```
 
-Reimplement those on Docker / Modal / a local VM and everything in `generate.py` keeps working unchanged.
+Local Docker smoke (no E2B)::
+
+```bash
+python examples/coding_agent_rl/smoke_docker_sandbox.py
+# ScaleSWE image (must be pulled locally first):
+python examples/coding_agent_rl/smoke_docker_sandbox.py \
+  --image aweaiteam/scaleswe:arviz-devs_preliz_pr249 \
+  --workdir /workspace/preliz --pull
+```
+
+Training with local Docker (adapter must be reachable from containers;
+on Linux bridge networks prefer `ADAPTER_PUBLIC_HOST=host.docker.internal`)::
+
+```bash
+# Dedicated launcher (recommended):
+bash examples/coding_agent_rl/run_qwen35_4b_swe_1node_docker.sh
+
+# Or set env yourself then call the generic 1-node script:
+export SLIME_AGENT_SANDBOX_BACKEND=docker
+export ADAPTER_PUBLIC_HOST=host.docker.internal
+# metadata.image is a real Docker image name/tag
+bash examples/coding_agent_rl/run_qwen35_4b_swe_1node.sh
+```
+
+Reimplement the same methods on Modal / a local VM and everything in `generate.py` keeps working unchanged.

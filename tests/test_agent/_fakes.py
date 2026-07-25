@@ -229,8 +229,8 @@ class FakeSandbox:
     done-marker file so the next poll succeeds.
 
     Construct directly, or via :meth:`factory` to get a zero-arg callable that
-    ``examples...generate.E2BSandbox`` / ``swe.E2BSandbox`` can be monkeypatched
-    to (they call ``E2BSandbox(image)``).
+    ``examples...generate.make_sandbox`` / ``swe.make_sandbox`` can be monkeypatched
+    to (they call ``make_sandbox(image)``).
     """
 
     def __init__(
@@ -250,7 +250,7 @@ class FakeSandbox:
 
     @classmethod
     def factory(cls, **kwargs) -> Callable[..., FakeSandbox]:
-        """Return ``E2BSandbox(image)``-compatible constructor with kwargs baked in."""
+        """Return ``make_sandbox(image)``-compatible constructor with kwargs baked in."""
 
         def _make(image: str = "fake-image", **_ignored) -> FakeSandbox:
             return cls(image, **kwargs)
@@ -268,7 +268,13 @@ class FakeSandbox:
 
         # Detached launch (run_agent): drive the fake agent, then drop the marker.
         if "setsid" in cmd and self.on_launch is not None:
-            code = await self.on_launch(env or {})
+            launch_env = dict(env or {})
+            if not launch_env:
+                # Prefer env baked into the launcher (docker-rt-safe path).
+                m = re.search(r"setsid bash (\S+\.sh)\b", cmd)
+                if m:
+                    launch_env = _exports_from_launcher(_as_str(self.files.get(m.group(1), "")))
+            code = await self.on_launch(launch_env)
             done = _done_path_from_launch(cmd)
             if done:
                 self.files[done] = f"{code}\n"
@@ -296,6 +302,29 @@ class FakeSandbox:
 
 def _as_str(v: str | bytes) -> str:
     return v.decode() if isinstance(v, bytes) else v
+
+
+def _exports_from_launcher(body: str) -> dict[str, str]:
+    """Parse ``export K=...`` lines written by ``exec_and_wait`` into the launcher."""
+    import shlex
+
+    out: dict[str, str] = {}
+    for line in body.splitlines():
+        s = line.strip()
+        if not s.startswith("export "):
+            continue
+        rest = s[len("export ") :]
+        if "=" not in rest:
+            continue
+        key, _, raw = rest.partition("=")
+        key = key.strip()
+        if not key:
+            continue
+        try:
+            out[key] = shlex.split(raw)[0] if raw else ""
+        except ValueError:
+            out[key] = raw.strip().strip("'\"")
+    return out
 
 
 def _done_path_from_launch(cmd: str) -> str | None:

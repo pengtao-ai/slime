@@ -47,6 +47,13 @@ class TrainRayActor(RayActor):
         # os.environ["LOCAL_RANK"] = str(ray.get_gpu_ids()[0])
         os.environ["LOCAL_RANK"] = str(get_local_gpu_id())
 
+        # FLA / megatron ranks race on the shared Triton disk cache (missing
+        # *.cubin / *.ptx). Isolate before any CUDA/triton import path runs.
+        triton_base = os.environ.get("SLIME_TRITON_CACHE_BASE", os.path.expanduser("~/.triton/cache"))
+        triton_dir = os.path.join(triton_base, f"megatron_rank_{self._rank}")
+        os.makedirs(triton_dir, exist_ok=True)
+        os.environ["TRITON_CACHE_DIR"] = triton_dir
+
     def init(self, args, role, with_ref=False, with_opd_teacher=False):
         self.args = args
         self.role = role

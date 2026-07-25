@@ -32,7 +32,7 @@ from typing import Any
 from slime.agent.adapters import AnthropicAdapter, OpenAIAdapter
 from slime.agent.aiohttp_threaded import FilteredAccessLogger, run_app_in_thread
 from slime.agent.harness import ClaudeCodeHarness, CodexHarness
-from slime.agent.sandbox import E2BSandbox
+from slime.agent.sandbox import make_sandbox
 from slime.utils.misc import SingletonMeta
 from slime.utils.processing_utils import load_tokenizer
 from slime.utils.types import Sample
@@ -57,6 +57,7 @@ class SweConfig:
     eval_protocol: str  # eval-path schema/grader (SWE_EVAL_PROTOCOL)
     train_protocol: str  # train-path schema/grader (SWE_TRAIN_PROTOCOL)
     adapter_public_host: str | None
+    adapter_public_url: str | None
     adapter_bind_host: str
     adapter_port: int
     fork_merge_threshold: int | None
@@ -76,6 +77,7 @@ class SweConfig:
             eval_protocol=os.environ.get("SWE_EVAL_PROTOCOL", swe.PROTOCOL_SCALESWE),
             train_protocol=os.environ.get("SWE_TRAIN_PROTOCOL", swe.PROTOCOL_SCALESWE),
             adapter_public_host=os.environ.get("ADAPTER_PUBLIC_HOST"),
+            adapter_public_url=(os.environ.get("ADAPTER_PUBLIC_URL") or "").rstrip("/") or None,
             adapter_bind_host=os.environ.get("ADAPTER_BIND_HOST", "0.0.0.0"),
             adapter_port=int(os.environ.get("ADAPTER_PORT", "18001")),
             fork_merge_threshold=fork,
@@ -93,8 +95,8 @@ _BOOT_SEM = asyncio.Semaphore(CONFIG.boot_concurrency)
 
 
 @asynccontextmanager
-async def boot_agent_sandbox(image: str, instance_id: str) -> AsyncIterator[E2BSandbox]:
-    """Boot a fresh E2B sandbox and install the selected harness toolchain.
+async def boot_agent_sandbox(image: str, instance_id: str) -> AsyncIterator:
+    """Boot a fresh sandbox and install the selected harness toolchain.
 
     Create the sandbox from the dataset image, install Node 22 + the harness CLI
     from host tarballs, retry transient boot/install failures, and close the
@@ -103,10 +105,16 @@ async def boot_agent_sandbox(image: str, instance_id: str) -> AsyncIterator[E2BS
     sb = None
     last_err: Exception | None = None
     for attempt in range(CONFIG.boot_retries):
-        cand = E2BSandbox(image)
+        cand = make_sandbox(image)
         try:
             async with _BOOT_SEM:
                 await cand.__aenter__()
+                logger.info(
+                    "[coding_agent_rl] %s: sandbox_id=%s image=%s",
+                    instance_id,
+                    cand.sandbox_id,
+                    image,
+                )
                 try:
                     await HARNESS_CLS().install_cli(cand)
                 except BaseException:
@@ -141,11 +149,11 @@ class _AdapterService(metaclass=SingletonMeta):
         self.tool_parser = getattr(args, "sglang_tool_call_parser", None) or None
         self.reasoning_parser = getattr(args, "sglang_reasoning_parser", None) or None
         sglang_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
-        if not CONFIG.adapter_public_host:
+        if not CONFIG.adapter_public_url and not CONFIG.adapter_public_host:
             raise RuntimeError(
-                "ADAPTER_PUBLIC_HOST is not set. Export it to the host IP that "
-                "sandboxes can reach for reverse-connection to the adapter; "
-                "without it the sandbox cannot dial back and the rollout aborts."
+                "Set ADAPTER_PUBLIC_URL (full URL, e.g. a Cloudflare tunnel) or "
+                "ADAPTER_PUBLIC_HOST (host sandboxes can reach) so the coding "
+                "agent can dial back to the Anthropic adapter."
             )
         self.adapter = ADAPTER_CLS(
             tokenizer=self.tokenizer,
@@ -168,7 +176,12 @@ class _AdapterService(metaclass=SingletonMeta):
                 "access_log_class": FilteredAccessLogger,
             },
         )
-        self.adapter_url = f"http://{CONFIG.adapter_public_host}:{self.app_handle.port}"
+        # Prefer a full public URL (HTTPS reverse proxy / Cloudflare tunnel).
+        # Otherwise fall back to http://HOST:PORT for in-cluster / LAN gateways.
+        if CONFIG.adapter_public_url:
+            self.adapter_url = CONFIG.adapter_public_url
+        else:
+            self.adapter_url = f"http://{CONFIG.adapter_public_host}:{self.app_handle.port}"
         logger.info(
             "[coding_agent_rl] tokenizer=%s adapter=%s max_context_len=%s tool_parser=%s reasoning_parser=%s",
             args.hf_checkpoint,
@@ -211,6 +224,19 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     prompt=swe.SWE_PROMPT,
                 )
                 diff_text = await swe.git_diff(sb, md["workdir"])
+                # Best-effort diagnostics before the sandbox is torn down. Used when
+                # finish_session later returns no turns (adapter_session_empty).
+                diag = ""
+                try:
+                    _, diag, _ = await sb.exec(
+                        "echo '=== /tmp/.run.sh (env+cmd) ==='; "
+                        "head -n 30 /tmp/.run.sh 2>/dev/null; "
+                        f"echo '=== trajectory tail ==='; "
+                        f"tail -c 1200 {md['workdir']}/.harness/trajectory.jsonl 2>/dev/null || true",
+                        timeout=30,
+                    )
+                except Exception:
+                    diag = ""
 
             reward, applied_cleanly = await swe.run_evaluation(
                 md,
@@ -244,6 +270,14 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 },
             )
             if not samples:
+                logger.warning(
+                    "[coding_agent_rl] %s: adapter_session_empty "
+                    "(agent_exit_code=%s adapter=%s). sandbox diag:\n%s",
+                    instance_id,
+                    agent_exit_code,
+                    state.adapter_url,
+                    (diag or "<empty>")[:1500],
+                )
                 return _abort_result(base_sample, "adapter_session_empty", instance_id)
 
             for s in samples:

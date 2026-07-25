@@ -184,6 +184,13 @@ class SGLangEngine(RayActor):
 
     def _init_normal(self, server_args_dict):
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
+        # Parallel engines on one node race on the shared Triton disk cache
+        # (FileNotFoundError on *.ttir during health_generate / first decode).
+        # Give each engine its own cache directory before spawning the server.
+        triton_base = os.environ.get("SLIME_TRITON_CACHE_BASE", os.path.expanduser("~/.triton/cache"))
+        triton_dir = os.path.join(triton_base, f"sglang_engine_{self.rank}")
+        os.makedirs(triton_dir, exist_ok=True)
+        os.environ["TRITON_CACHE_DIR"] = triton_dir
         self.process = launch_server_process(ServerArgs(**server_args_dict))
         self._register_to_router(server_args_dict)
 

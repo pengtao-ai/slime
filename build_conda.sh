@@ -43,9 +43,24 @@ micromamba install -n slime \
   -c conda-forge \
   -y
 micromamba install -n slime -c conda-forge cudnn -y
-# sglang's editable install builds a Rust extension (sglang-grpc via
-# setuptools-rust), so the conda env needs a working rustc + cargo.
-micromamba install -n slime -c conda-forge rust -y
+# flashinfer JIT (e.g. gemma_rmsnorm during CUDA graph capture) links with
+# `-L$CONDA_PREFIX/lib64/stubs -lcuda`. Conda CUDA ships the stub under
+# lib/stubs and targets/.../lib/stubs, not lib64/stubs — create the path
+# the linker expects so ninja does not fail with `cannot find -lcuda`.
+_CONDA_PREFIX="${CONDA_PREFIX:-$CUDA_HOME}"
+mkdir -p "${_CONDA_PREFIX}/lib64/stubs"
+ln -sfn ../../targets/x86_64-linux/lib/stubs/libcuda.so "${_CONDA_PREFIX}/lib64/stubs/libcuda.so"
+# libnuma: sgl_kernel common_ops.*.so needs libnuma.so.1 at runtime.
+micromamba install -n slime -c conda-forge rust libprotobuf libnuma -y
+# Fallback: use a system/base protoc if the env one is missing.
+if ! command -v protoc >/dev/null 2>&1; then
+  if [ -x /workspace/.conda/bin/protoc ]; then
+    export PATH="/workspace/.conda/bin:${PATH}"
+  fi
+fi
+export PROTOC="${PROTOC:-$(command -v protoc)}"
+echo "Using PROTOC=${PROTOC}"
+test -n "${PROTOC}" && test -x "${PROTOC}"
 
 pip install cuda-python==12.9
 
@@ -64,8 +79,12 @@ fi
 cd $BASE_DIR/sglang
 git checkout ${SGLANG_COMMIT}
 pip install -e "python[all]" --extra-index-url https://download.pytorch.org/whl/cu129
+# torchvision 0.27+/0.28+cu129 wheels on download.pytorch.org were rebuilt
+# against a newer torch ABI (torch::headeronly::Tag) and fail to load against
+# torch==2.11.0 (at::Tag), causing: RuntimeError: operator torchvision::nms
+# does not exist. Pin 0.26.0 which still matches torch 2.11.0's ABI.
 pip install --force-reinstall --no-deps \
-  torch==2.11.0 torchvision torchaudio==2.11.0 \
+  torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
   --index-url https://download.pytorch.org/whl/cu129
 pip install --force-reinstall --no-deps \
   sglang-kernel==0.4.2.post2 sgl-deep-gemm==0.1.0 \
@@ -180,6 +199,9 @@ pip install . --no-build-isolation
 # https://github.com/pytorch/pytorch/issues/168167
 pip install nvidia-cudnn-cu12==9.16.0.29
 pip install "numpy<2"
+# Keep scipy on a numpy-1.x-compatible release; newer scipy (e.g. 1.18)
+# requires numpy>=2 and breaks `import sglang` via transformers→scipy.
+pip install "scipy<1.15"
 # kernels 0.15.x trips a ValueError("Either a revision or a version must be
 # specified") on `transformers.integrations.hub_kernels` import; pin to <0.15
 # so `import sglang` works at runtime.

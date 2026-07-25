@@ -102,12 +102,20 @@ async def exec_and_wait(
     ``_await_done_marker``) -- none of which depend on a stream staying alive,
     and the polling doubles as an idle-GC keepalive while the command runs.
     """
+    import shlex
+
     out_file = out_file or f"/tmp/.{tag}.out"
     done_file = f"/tmp/.{tag}.done"
     launcher = f"/tmp/.{tag}.sh"
     lock_dir = f"/tmp/.{tag}.spawned"
     prefix = f"cd {workdir}\nexport HOME=/home/{user}\n" if workdir else ""
-    launcher_body = f"#!/bin/bash\n{prefix}{cmd}\necho $? > {done_file}\n"
+    # Bake env into the launcher. Detached `setsid bash` must not rely on
+    # `docker exec -e` (docker-rt drops -e; Claude Code then never sees
+    # ANTHROPIC_BASE_URL and the host adapter gets adapter_session_empty).
+    exports = ""
+    if env:
+        exports = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in env.items())
+    launcher_body = f"#!/bin/bash\n{exports}{prefix}{cmd}\necho $? > {done_file}\n"
     await sb.write_file(launcher, launcher_body, user=user)
 
     await sb.exec(
@@ -116,7 +124,6 @@ async def exec_and_wait(
         f"rm -f {out_file} {done_file}; "
         f"setsid bash {launcher} < /dev/null > {out_file} 2>&1 &",
         user=user,
-        env=env,
         timeout=30,
         check=True,
         idempotent=True,
@@ -264,23 +271,41 @@ class E2BSandbox:
             logger.debug("[agent.sandbox] conn-pool reset skipped: %s", e)
 
     async def __aenter__(self) -> E2BSandbox:
-        if self.image_metadata_key is None:
-            raise RuntimeError(
-                "SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY is not set. Export it "
-                "to the metadata key your E2B gateway uses for image routing. "
-                "The legacy SWE_SANDBOX_IMAGE_METADATA_KEY name is also "
-                "accepted for coding-agent examples."
-            )
         from e2b import AsyncSandbox  # type: ignore
 
-        md = {self.image_metadata_key: self.image}
+        # Public e2b.dev selects the environment via ``template=`` (an E2B
+        # template name/alias). Internal gateways instead route on metadata
+        # (``SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY`` → Docker image).
+        use_template = (_getenv("SLIME_AGENT_E2B_USE_TEMPLATE", default="") or "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if use_template:
+            self._sb = await self._rpc_retry(
+                "create",
+                lambda: AsyncSandbox.create(template=self.image, timeout=self.timeout),
+            )
+        else:
+            if self.image_metadata_key is None:
+                raise RuntimeError(
+                    "SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY is not set. Export it "
+                    "to the metadata key your E2B gateway uses for image routing. "
+                    "The legacy SWE_SANDBOX_IMAGE_METADATA_KEY name is also "
+                    "accepted for coding-agent examples. For public e2b.dev, "
+                    "export SLIME_AGENT_E2B_USE_TEMPLATE=1 and pass an E2B "
+                    "template name as metadata.image instead."
+                )
+            md = {self.image_metadata_key: self.image}
 
-        if self.size:
-            prefix = self.image_metadata_key.rsplit("/", 1)[0] if "/" in self.image_metadata_key else ""
-            size_key = f"{prefix}/size" if prefix else "size"
-            md[size_key] = self.size
+            if self.size:
+                prefix = self.image_metadata_key.rsplit("/", 1)[0] if "/" in self.image_metadata_key else ""
+                size_key = f"{prefix}/size" if prefix else "size"
+                md[size_key] = self.size
 
-        self._sb = await self._rpc_retry("create", lambda: AsyncSandbox.create(timeout=self.timeout, metadata=md))
+            self._sb = await self._rpc_retry(
+                "create", lambda: AsyncSandbox.create(timeout=self.timeout, metadata=md)
+            )
         self.sandbox_id = self._sb.sandbox_id
         return self
 
@@ -374,6 +399,22 @@ class E2BSandbox:
 
 async def ensure_agent_user(sb: Sandbox, workdir: str) -> None:
     """Create the unprivileged 'agent' user that owns workdir + can git diff."""
+    # ScaleSWE / SWE images must ship ``workdir`` already (repo checkout).
+    # If it is missing, chown fails obscurely — surface image-routing issues.
+    ec, _, _ = await sb.exec(f"test -d {workdir}", user="root", check=False, timeout=30)
+    if ec != 0:
+        _, listing, _ = await sb.exec(
+            "ls -la /workspace 2>/dev/null || ls -la / 2>/dev/null | head -40",
+            user="root",
+            check=False,
+            timeout=30,
+        )
+        raise RuntimeError(
+            f"workdir {workdir!r} does not exist in the sandbox. "
+            "The E2B gateway likely did not boot the sample's Docker image "
+            f"(check SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY / metadata.image). "
+            f"Listing:\n{(listing or '').strip()[:500]}"
+        )
     await sb.exec(
         f"id agent >/dev/null 2>&1 || useradd -m -s /bin/bash agent && "
         f"chown -R agent:agent /home/agent {workdir} && "
@@ -382,3 +423,200 @@ async def ensure_agent_user(sb: Sandbox, workdir: str) -> None:
         check=True,
         timeout=60,
     )
+
+
+class DockerSandbox:
+    """Local Docker / docker-rt sandbox implementing the ``Sandbox`` protocol.
+
+    Env knobs:
+      * ``SLIME_AGENT_DOCKER_NETWORK`` (default ``bridge``)
+      * ``SLIME_AGENT_DOCKER_ADD_HOST`` (default ``host.docker.internal:host-gateway``)
+      * ``SLIME_AGENT_DOCKER_PULL`` (``1``/``true`` to pull before run)
+      * ``SLIME_AGENT_DOCKER_RUN_TIMEOUT_SEC`` (default ``300``)
+    """
+
+    image_metadata_key_env = E2BSandbox.image_metadata_key_env
+    lifetime_sec_env = E2BSandbox.lifetime_sec_env
+    default_lifetime_sec = E2BSandbox.default_lifetime_sec
+
+    def __init__(self, image: str, *, timeout: int | None = None) -> None:
+        self.image = image
+        self.timeout = int(timeout if timeout is not None else (_getenv(*self.lifetime_sec_env) or self.default_lifetime_sec))
+        self.network = (_getenv("SLIME_AGENT_DOCKER_NETWORK", default="bridge") or "bridge").lower()
+        self.pull = (_getenv("SLIME_AGENT_DOCKER_PULL", default="") or "").lower() in ("1", "true", "yes")
+        self.remove = True
+        self.sandbox_id = ""
+        self._container = ""
+
+    async def __aenter__(self) -> DockerSandbox:
+        import uuid
+
+        name = f"slime-sb-{uuid.uuid4().hex[:12]}"
+        if self.pull:
+            await self._run_host(["docker", "pull", self.image], timeout=600, check=True)
+
+        cmd = [
+            "docker",
+            "run",
+            "-d",
+            "--name",
+            name,
+            # Override image ENTRYPOINT so sleep works on SWE images.
+            "--entrypoint",
+            "sleep",
+            "--network",
+            self.network,
+        ]
+        if self.network != "host":
+            add_host = _getenv("SLIME_AGENT_DOCKER_ADD_HOST", default="host.docker.internal:host-gateway")
+            if add_host:
+                cmd.extend(["--add-host", add_host])
+        cmd.extend([self.image, "infinity"])
+
+        # docker-rt / k8s can take longer than a local daemon to schedule a pod.
+        run_timeout = int(_getenv("SLIME_AGENT_DOCKER_RUN_TIMEOUT_SEC", default="300") or "300")
+        try:
+            await self._run_host(cmd, timeout=run_timeout, check=True)
+        except Exception:
+            # Client timeout/failure does not mean the daemon failed: a container
+            # may already exist under ``name``. ``async with`` skips __aexit__ when
+            # __aenter__ raises, so best-effort rm here to avoid quota leaks.
+            try:
+                await self._run_host(["docker", "rm", "-f", name], timeout=60, check=False)
+            except Exception as cleanup_err:
+                logger.warning(
+                    "[agent.sandbox] orphan cleanup docker rm -f %s failed: %s",
+                    name,
+                    cleanup_err,
+                )
+            raise
+        self._container = name
+        self.sandbox_id = name
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        name = self._container
+        self._container = ""
+        if not name or not self.remove:
+            return
+        try:
+            await self._run_host(["docker", "rm", "-f", name], timeout=60, check=False)
+        except Exception as e:
+            logger.warning("[agent.sandbox] docker cleanup %s failed: %s", name, e)
+
+    async def exec(
+        self,
+        cmd: str,
+        *,
+        user: str = "root",
+        env: dict[str, str] | None = None,
+        timeout: int = 120,
+        check: bool = False,
+        idempotent: bool = True,
+    ) -> ExecResult:
+        import shlex
+
+        if not self._container:
+            raise RuntimeError("DockerSandbox is not started")
+
+        # Bake env into the shell (docker-rt often drops `docker exec -e`).
+        exports = "".join(f"export {shlex.quote(k)}={shlex.quote(v)}; " for k, v in (env or {}).items())
+        inner = exports + cmd
+
+        if user and user != "root":
+            # docker-rt often ignores `docker exec -u`; switch inside the container.
+            uq = shlex.quote(user)
+            cq = shlex.quote(inner)
+            launcher = (
+                f"if command -v runuser >/dev/null 2>&1; then runuser -u {uq} -- env HOME=/home/{user} sh -lc {cq}; "
+                f"else su -s /bin/bash {uq} -c {cq}; fi"
+            )
+            docker_cmd = ["docker", "exec", self._container, "sh", "-lc", launcher]
+        else:
+            docker_cmd = ["docker", "exec", "-u", "root", self._container, "sh", "-lc", inner]
+
+        code, out, err = await self._run_host(docker_cmd, timeout=timeout, check=False)
+        if check and code != 0:
+            raise RuntimeError(f"docker exec failed (exit={code}): {cmd[:120]}\n{err[:400]}")
+        return code, out, err
+
+    async def write_file(self, sandbox_path: str, content: FileContent, *, user: str = "root") -> None:
+        import shlex
+        import tempfile
+
+        if not self._container:
+            raise RuntimeError("DockerSandbox is not started")
+
+        parent = str(Path(sandbox_path).parent)
+        await self.exec(f"mkdir -p {shlex.quote(parent)}", user="root", check=True, timeout=60)
+
+        tmp_path: str | None = None
+        try:
+            if isinstance(content, Path):
+                host_src = str(content)
+            else:
+                data = content.encode() if isinstance(content, str) else content
+                with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                    tmp.write(data)
+                    tmp_path = tmp.name
+                host_src = tmp_path
+
+            await self._run_host(
+                ["docker", "cp", host_src, f"{self._container}:{sandbox_path}"],
+                timeout=600,
+                check=True,
+            )
+            if user and user != "root":
+                await self.exec(f"chown {shlex.quote(user)} {shlex.quote(sandbox_path)}", user="root", check=False)
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    async def read_file(self, sandbox_path: str, *, user: str = "root") -> str:
+        import shlex
+
+        try:
+            code, out, _ = await self.exec(f"cat {shlex.quote(sandbox_path)}", user=user, check=False)
+            return out if code == 0 else ""
+        except Exception:
+            return ""
+
+    async def _run_host(self, cmd: list[str], *, timeout: int, check: bool) -> ExecResult:
+        import subprocess
+
+        def _call() -> ExecResult:
+            try:
+                p = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired as e:
+                raise RuntimeError(f"host cmd timed out after {timeout}s: {cmd[:6]}...") from e
+            out = (p.stdout or b"").decode("utf-8", "replace")
+            err = (p.stderr or b"").decode("utf-8", "replace")
+            if check and p.returncode != 0:
+                raise RuntimeError(f"host cmd failed (exit={p.returncode}): {' '.join(cmd[:6])}...\n{err[:400]}")
+            return p.returncode, out, err
+
+        return await asyncio.to_thread(_call)
+
+
+def make_sandbox(image: str, *, timeout: int | None = None) -> Sandbox:
+    """Construct the configured sandbox backend (``E2BSandbox`` or ``DockerSandbox``).
+
+    ``SLIME_AGENT_SANDBOX_BACKEND``:
+
+    * ``e2b`` (default) — remote E2B / E2B-compatible gateway
+    * ``docker`` / ``local`` — local Docker engine
+    """
+    backend = (_getenv("SLIME_AGENT_SANDBOX_BACKEND", default="e2b") or "e2b").lower()
+    if backend in ("docker", "local"):
+        return DockerSandbox(image, timeout=timeout)
+    if backend in ("e2b", ""):
+        return E2BSandbox(image, timeout=timeout)
+    raise ValueError(f"Unknown SLIME_AGENT_SANDBOX_BACKEND={backend!r}; expected 'e2b' or 'docker'")
