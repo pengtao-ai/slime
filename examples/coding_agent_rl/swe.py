@@ -241,7 +241,15 @@ async def run_evaluation(md: dict, *, diff_text: str, timeout_sec: int) -> EvalR
 
     No-test-cheating guarantee (both grading protocols): the eval sandbox is built from
     the same image but starts CLEAN, so only the model-produced diff affects
-    reward."""
+    reward.
+
+    Empty / whitespace-only patches never count as solved: some ScaleSWE images are
+    already green at baseline, which previously let no-op EOS episodes score 1.0 and
+    collapse the policy under cost-aware GRPO.
+    """
+    if not (diff_text or "").strip():
+        logger.info("[swe] empty patch → reward=0 (no free solves on already-green baselines)")
+        return EvalResult(0.0, True)
     if md.get("protocol") == PROTOCOL_SWEBENCH:
         return await _grade_swebench(md, diff_text, timeout_sec)
     return await _grade_scaleswe(md, diff_text, timeout_sec)

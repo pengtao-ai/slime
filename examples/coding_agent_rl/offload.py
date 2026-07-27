@@ -3,16 +3,18 @@
 Per agent round (every Claude Code / Codex request):
 
 1. Adapter always calls the local SLM first.
-2. If the SLM emits ``<|llm_offload|>N<|/llm_offload|>``, call remote GLM with
-   thinking selected by ``N`` (0=off, 1-5=high, 6-9=max).
+2. If the SLM emits ``<|llm_offload|>N<|/llm_offload|>`` *inside thinking*
+   (before ``</think>``; Qwen often omits the opening ``<think>`` from output_ids),
+   call remote GLM with thinking selected by ``N`` (0=off, 1-5=high, 6-9=max).
+   Spans after ``</think>`` do not call GLM and incur a think-format reward penalty.
 3. Compose SLM prefix + GLM continuation into one complete assistant reply and
    only then flush it to the agent.
 
 System-prompt contract:
-  - SLM / Claude Code: agent system + ``OFFLOAD_SYSTEM_PROMPT_APPEND``
-    (via ``--append-system-prompt``)
+  - SLM: Claude Code's full system (incl. ``gitStatus``) + ``OFFLOAD_SYSTEM_PROMPT_APPEND``
+    injected by the coding adapter on each request
   - GLM: agent system + ``CODING_HANDOFF_PROMPT``
-    (``OFFLOAD_SYSTEM_PROMPT_APPEND`` is stripped if the agent echoed it)
+    (``OFFLOAD_SYSTEM_PROMPT_APPEND`` is stripped if present)
 
 Only local-model ``output_ids`` are trained; GLM tokens are never loss-masked in.
 
@@ -71,29 +73,76 @@ CODING_HANDOFF_PROMPT = (
     "- <part_think> is an internal marker, not user input."
 )
 
-# Appended to the black-box agent's *system* prompt (Claude Code:
-# ``--append-system-prompt``), not the task user prompt (``SWE_PROMPT``).
+# Appended to the *SLM* system after Claude Code's full system (incl. gitStatus).
+# Injected by the coding adapter on each request.
 OFFLOAD_SYSTEM_PROMPT_APPEND = (
-    f"For very difficult steps, you can output {OFFLOAD_OPEN}N{OFFLOAD_CLOSE} to request help "
-    "from a more capable model. N is a single digit: 0 = no remote thinking, "
-    "1-5 = high reasoning effort, 6-9 = max reasoning effort."
+    "For very difficult steps, you can output "
+    f"{OFFLOAD_OPEN}N{OFFLOAD_CLOSE} where N is 0-9 indicating the thinking "
+    "level for a more capable model. Emit the span inside your thinking "
+    "(before </think>), not in the visible reply or tool calls."
 )
 # Back-compat alias.
 DEFAULT_OFFLOAD_SWE_PROMPT = OFFLOAD_SYSTEM_PROMPT_APPEND
 
+# Train reward: subtract this once if any offload span appeared outside <think>.
+DEFAULT_OFFLOAD_THINK_FORMAT_PENALTY = 0.25
 
-def ensure_offload_system_prompt_append() -> None:
-    """Wire offload instructions into Claude Code's system prompt when enabled.
 
-    Sets ``SLIME_AGENT_CC_APPEND_SYSTEM_PROMPT`` (consumed by
-    ``ClaudeCodeHarness``) unless the caller already provided one. Does **not**
-    modify ``SWE_PROMPT`` / the ``claude -p`` task text.
+def offload_system_append_text() -> str:
+    """Effective SLM-only offload instructions (env override or default)."""
+    return (os.environ.get("SLIME_AGENT_OFFLOAD_SYSTEM_APPEND") or OFFLOAD_SYSTEM_PROMPT_APPEND).strip()
+
+
+def inject_offload_into_request_body(body: dict) -> None:
+    """Append offload instructions to the request system field (in-place).
+
+    Runs on each adapter turn so the SLM sees: CC system (… gitStatus) + append.
+    Idempotent if the append text is already present. No-op when offload is off.
     """
     if not offload_enabled():
         return
-    key = "SLIME_AGENT_CC_APPEND_SYSTEM_PROMPT"
-    if not (os.environ.get(key) or "").strip():
-        os.environ[key] = os.environ.get("SLIME_AGENT_OFFLOAD_SYSTEM_APPEND") or OFFLOAD_SYSTEM_PROMPT_APPEND
+    text = offload_system_append_text()
+    if not text:
+        return
+
+    if "system" in body and body.get("system") is not None:
+        body["system"] = _append_to_anthropic_system(body.get("system"), text)
+        return
+
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        _append_to_openai_messages(messages, text)
+
+
+def _append_to_anthropic_system(system: Any, text: str) -> Any:
+    flat = flatten_content(system) if system else ""
+    if text in flat:
+        return system
+    if system is None or system == "":
+        return text
+    if isinstance(system, str):
+        return system.rstrip() + "\n\n" + text
+    if isinstance(system, list):
+        out = [b for b in system if isinstance(b, dict)]
+        out.append({"type": "text", "text": "\n\n" + text})
+        return out if out else text
+    return flat.rstrip() + "\n\n" + text
+
+
+def _append_to_openai_messages(messages: list, text: str) -> None:
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "system":
+            continue
+        content = msg.get("content")
+        flat = content if isinstance(content, str) else flatten_content(content)
+        if text in (flat or ""):
+            return
+        if isinstance(content, str):
+            msg["content"] = content.rstrip() + "\n\n" + text
+        else:
+            msg["content"] = (flat or "").rstrip() + "\n\n" + text
+        return
+    messages.insert(0, {"role": "system", "content": text})
 
 
 def offload_enabled() -> bool:
@@ -102,6 +151,10 @@ def offload_enabled() -> bool:
 
 def efficiency_lambda() -> float:
     return float(os.environ.get("OFFLOAD_EFFICIENCY_LAMBDA", "0.6"))
+
+
+def think_format_penalty() -> float:
+    return float(os.environ.get("OFFLOAD_THINK_FORMAT_PENALTY", str(DEFAULT_OFFLOAD_THINK_FORMAT_PENALTY)))
 
 
 def _api_key() -> str:
@@ -121,11 +174,54 @@ def _max_tokens() -> int:
 
 
 def parse_offload_directive(raw: str) -> tuple[int, str] | None:
-    """Return ``(N, text_before_span)`` for the first complete offload span, else None."""
+    """Return ``(N, text_before_span)`` for the first complete offload span, else None.
+
+    Does not require the span to be inside ``<think>``; use
+    :func:`offload_span_inside_think` / :func:`parse_valid_offload_directive`
+    for the protocol that only fires GLM when the span is in-think.
+    """
     match = _OFFLOAD_SPAN_RE.search(raw)
     if match is None:
         return None
     return int(match.group(1)), raw[: match.start()]
+
+
+def offload_span_inside_think(raw: str) -> bool:
+    """True iff the first complete offload span is still in the thinking region.
+
+    Qwen / PyroDash note: the opening ``<think>`` is usually injected by the chat
+    template into the *prompt*, so ``output_ids`` often start with think text and
+    only emit ``</think>`` (see rollout dumps). Mid-turn offload that stops on the
+    close token may have neither tag yet — that still counts as in-think.
+
+    Rules (first complete offload span at ``pos``):
+      1. Inside an explicit ``<think>`` … (unclosed) region → in-think
+      2. ``pos`` before the first ``</think>`` → in-think
+      3. No ``</think>`` in ``raw`` → in-think (stopped during initial think)
+      4. Else → outside think (visible / tool body after think ended)
+    """
+    match = _OFFLOAD_SPAN_RE.search(raw)
+    if match is None:
+        return False
+    pos = match.start()
+    before = raw[:pos]
+
+    last_open = before.rfind("<think>")
+    if last_open >= 0 and "</think>" not in before[last_open:]:
+        return True
+
+    first_close = raw.find("</think>")
+    if first_close < 0:
+        return True
+    return pos < first_close
+
+
+def parse_valid_offload_directive(raw: str) -> tuple[int, str] | None:
+    """Like :func:`parse_offload_directive`, but only if the span is inside think."""
+    parsed = parse_offload_directive(raw)
+    if parsed is None or not offload_span_inside_think(raw):
+        return None
+    return parsed
 
 
 def reasoning_from_n(n: int) -> tuple[bool, str | None]:
@@ -143,6 +239,7 @@ def _ensure_stats(session: Session) -> dict[str, Any]:
         stats.update(
             {
                 "offload_count": 0,
+                "offload_outside_think_count": 0,
                 "small_prompt_tokens": 0,
                 "small_output_tokens": 0,
                 "glm_input_tokens": 0,
@@ -218,36 +315,38 @@ def _message_text(msg: dict[str, Any]) -> str:
 
 
 def _offload_system_append_variants() -> list[str]:
-    """Text that belongs on the *SLM/agent* system prompt only (not GLM)."""
-    variants = [
-        OFFLOAD_SYSTEM_PROMPT_APPEND,
-        (os.environ.get("SLIME_AGENT_OFFLOAD_SYSTEM_APPEND") or "").strip(),
-        (os.environ.get("SLIME_AGENT_CC_APPEND_SYSTEM_PROMPT") or "").strip(),
-    ]
-    return [v for v in variants if v]
+    """Text that belongs on the *SLM* system prompt only (not GLM)."""
+    variants = [OFFLOAD_SYSTEM_PROMPT_APPEND, offload_system_append_text()]
+    # Preserve order, drop empties/dupes.
+    out: list[str] = []
+    for v in variants:
+        if v and v not in out:
+            out.append(v)
+    return out
 
 
 def strip_offload_system_append(text: str) -> str:
-    """Remove SLM-only offload instructions from agent system text before GLM.
+    """Delete SLM-only offload instructions from system text before calling GLM.
 
     Contract:
-      SLM  <- agent system + OFFLOAD_SYSTEM_PROMPT_APPEND
-      GLM  <- agent system + CODING_HANDOFF_PROMPT  (no OFFLOAD_SYSTEM_PROMPT_APPEND)
+      SLM / CC request  <- CC system (… gitStatus) + OFFLOAD_SYSTEM_PROMPT_APPEND
+      GLM               <- agent system (offload text removed) + CODING_HANDOFF_PROMPT
     """
     out = text
     for variant in _offload_system_append_variants():
-        if variant in out:
+        if variant and variant in out:
             out = out.replace(variant, "")
-    # Collapse whitespace left by removals.
     out = re.sub(r"\n{3,}", "\n\n", out).strip()
     return out
 
 
 def build_offload_messages(translated: list[dict], raw_output: str) -> list[dict[str, str]]:
-    """Build GLM chat messages: agent system + handoff append, then history, then part_think.
+    """Build GLM chat messages: cleaned agent system + handoff, history, part_think.
 
-    Strips ``OFFLOAD_SYSTEM_PROMPT_APPEND`` (SLM-only) from any agent system text
-    that Claude Code / Codex echoed into the request.
+    Removes SLM-only bits that must not reach GLM:
+      - ``OFFLOAD_SYSTEM_PROMPT_APPEND`` from system text
+      - ``<|llm_offload|>N<|/llm_offload|>`` spans from history / prefix
+    Those markers are kept on the CC reply path (see ``compose_complete_assistant``).
     """
     agent_system_parts: list[str] = []
     rest: list[dict[str, str]] = []
@@ -261,6 +360,10 @@ def build_offload_messages(translated: list[dict], raw_output: str) -> list[dict
             if cleaned_system:
                 agent_system_parts.append(cleaned_system)
             continue
+        # History may re-echo prior composed replies that still contain offload tags.
+        text = _strip_offload_tag_from_text(text)
+        if not text:
+            continue
         if role == "tool":
             rest.append({"role": "user", "content": text})
         elif role in ("user", "assistant"):
@@ -272,6 +375,7 @@ def build_offload_messages(translated: list[dict], raw_output: str) -> list[dict
     messages: list[dict[str, str]] = [{"role": "system", "content": system}]
     messages.extend(rest)
 
+    # Prefix only (no offload span) -> <part_think>; never send the tag to GLM.
     partial = _offload_prefix(raw_output)
     cleaned = partial.replace("<think>", "").replace("</think>", "").strip()
     if cleaned:
@@ -354,18 +458,21 @@ def _join_nonempty(*parts: str, sep: str = "\n") -> str:
 
 def compose_complete_assistant(
     *,
-    slm_text: str,
-    slm_think: str,
+    slm_content: str,
     glm_content: str,
     glm_think: str,
 ) -> tuple[str, str]:
-    """Merge SLM prefix + GLM continuation into one assistant (text, think) pair."""
-    text = _join_nonempty(_strip_offload_tag_from_text(slm_text), glm_content)
-    think = _join_nonempty(slm_think, glm_think, sep="")
+    """Merge SLM prefix + GLM continuation into one assistant (text, think) pair.
+
+    Keeps ``<|llm_offload|>N<|/llm_offload|>`` in the text returned to CC.
+    GLM never sees that span (stripped in ``build_offload_messages``).
+    """
+    text = _join_nonempty("", glm_content)
+    think = _join_nonempty(slm_content, glm_think, sep="")
     return text, think
 
 
-def amend_reply_with_offload(reply: Reply, *, glm_content: str, glm_think: str) -> Reply:
+def amend_reply_with_offload(reply: Reply, *, raw_output: str, glm_content: str, glm_think: str) -> Reply:
     """Replace the SLM-only reply with the composed complete assistant turn for the agent.
 
     Training still recorded ``turn.output_ids`` from the SLM only; this amends what
@@ -373,8 +480,7 @@ def amend_reply_with_offload(reply: Reply, *, glm_content: str, glm_think: str) 
     """
     mm = dict(reply.manager_message)
     text, think = compose_complete_assistant(
-        slm_text=str(mm.get("content") or ""),
-        slm_think=str(mm.get("reasoning_content") or ""),
+        slm_content=raw_output,
         glm_content=glm_content,
         glm_think=glm_think,
     )
@@ -427,18 +533,28 @@ async def apply_offload_if_needed(
     session: Session,
     sid: str,
 ) -> Reply:
-    """Per agent round: account SLM tokens; if offload span, call GLM and compose full reply.
+    """Per agent round: account SLM tokens; if in-think offload span, call GLM.
 
-    No offload span -> return SLM reply unchanged (still the complete output for
-    this round). With a span -> wait for GLM, then return SLM+GLM as one reply
-    *before* the adapter responds to the agent.
+    Protocol: ``<|llm_offload|>N<|/llm_offload|>`` must sit inside ``<think>``.
+    A complete span outside think does not call GLM; it increments
+    ``offload_outside_think_count`` for the think-format reward penalty.
     """
     if not offload_enabled():
         return reply
 
     record_local_turn_tokens(session, turn)
-    parsed = parse_offload_directive(raw_output)
+    parsed = parse_valid_offload_directive(raw_output)
     if parsed is None:
+        # Complete span exists but not in <think> → format violation, no GLM.
+        if parse_offload_directive(raw_output) is not None:
+            stats = _ensure_stats(session)
+            stats["offload_outside_think_count"] = int(stats.get("offload_outside_think_count", 0)) + 1
+            logger.info(
+                "[coding_agent_offload] sid=%s skip GLM: offload span outside <think> "
+                "(outside_think#%d)",
+                sid,
+                stats["offload_outside_think_count"],
+            )
         return reply
 
     n, _prefix = parsed
@@ -480,7 +596,7 @@ async def apply_offload_if_needed(
     # N=0: no remote think channel; drop any accidental reasoning payload.
     if not enable_thinking:
         think = ""
-    return amend_reply_with_offload(reply, glm_content=content, glm_think=think)
+    return amend_reply_with_offload(reply, raw_output=raw_output, glm_content=content, glm_think=think)
 
 
 def actual_cost(stats: dict[str, Any]) -> float:
@@ -515,9 +631,22 @@ def cost_aware_reward(
     *,
     usage: dict[str, Any] | None = None,
     lam: float | None = None,
+    format_penalty: float | None = None,
 ) -> float:
-    """``reward = solved - λ * cost_ratio`` (no math format bonuses)."""
+    """Efficiency-shaped train reward with in-think offload format gate.
+
+    - unsolved: ``0``
+    - solved: ``1 - λ * cost_ratio``, then subtract think-format penalty once if
+      any offload span appeared outside ``<think>`` (clamped at 0).
+    """
+    if float(solved) <= 0.0:
+        return 0.0
     if not stats:
         return float(solved)
     ratio = cost_ratio(stats, usage)
-    return float(solved) - float(lam if lam is not None else efficiency_lambda()) * ratio
+    reward = float(solved) - float(lam if lam is not None else efficiency_lambda()) * ratio
+    outside = int(stats.get("offload_outside_think_count", 0) or 0)
+    if outside > 0:
+        pen = float(format_penalty if format_penalty is not None else think_format_penalty())
+        reward -= pen
+    return max(0.0, reward)

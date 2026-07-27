@@ -39,7 +39,9 @@ from slime.utils.types import Sample  # noqa: E402
 from tests.test_agent._fakes import FakeSGLangServer, ScriptedTokenizer  # noqa: E402
 
 
-OFFLOAD_TEXT = f"partial plan {offload.OFFLOAD_OPEN}7{offload.OFFLOAD_CLOSE}"
+OFFLOAD_TEXT = (
+    f"<think>\npartial plan {offload.OFFLOAD_OPEN}7{offload.OFFLOAD_CLOSE}\n"
+)
 TURN1_IDS = (9001, 9002, 9003)
 TURN2_IDS = (9101, 9102)
 
@@ -122,12 +124,20 @@ async def _run() -> None:
                 body1 = {
                     "model": "slime",
                     "max_tokens": 64,
-                    # Mimic Claude Code: agent system already includes the SLM-only append.
-                    "system": f"You are Claude Code agent.\n{offload.OFFLOAD_SYSTEM_PROMPT_APPEND}",
+                    # Mimic Claude Code: system ends with gitStatus; adapter appends offload after it.
+                    "system": (
+                        "You are Claude Code agent.\n"
+                        "gitStatus: This is the git status at the start of the conversation.\n"
+                        "Current branch: main"
+                    ),
                     "messages": [{"role": "user", "content": "Fix the bug in foo.py"}],
                 }
                 resp1 = await client.post("/v1/messages", json=body1, headers=headers)
                 assert resp1.status == 200, await resp1.text()
+                # Adapter inject must place offload text after gitStatus (not via CC append).
+                assert body1["system"].index("gitStatus:") < body1["system"].index(
+                    offload.OFFLOAD_SYSTEM_PROMPT_APPEND
+                ), body1["system"][-400:]
                 data1 = await resp1.json()
                 blocks1 = data1["content"]
                 texts1 = [b.get("text", "") for b in blocks1 if b.get("type") == "text"]
@@ -135,9 +145,13 @@ async def _run() -> None:
                 joined_text = "\n".join(texts1)
                 joined_think = "".join(thinks1)
                 assert "GLM next step" in joined_text, data1
-                assert offload.OFFLOAD_OPEN not in joined_text
+                # Protocol: span was in <think>; CC reply keeps it (may sit in text
+                # when smoke adapter has no reasoning_parser).
+                assert f"{offload.OFFLOAD_OPEN}7{offload.OFFLOAD_CLOSE}" in (
+                    joined_text + joined_think
+                )
                 assert "remote-why" in joined_think
-                assert "partial plan" in joined_text
+                assert "partial plan" in (joined_text + joined_think)
                 assert len(glm.requests) == 1
                 glm_msgs = glm.requests[0]["messages"]
                 assert glm_msgs[0]["role"] == "system"
@@ -145,6 +159,7 @@ async def _run() -> None:
                 assert offload.CODING_HANDOFF_PROMPT in glm_msgs[0]["content"]
                 # SLM-only append must not leak into the GLM system prompt.
                 assert offload.OFFLOAD_SYSTEM_PROMPT_APPEND not in glm_msgs[0]["content"]
+                assert all(offload.OFFLOAD_OPEN not in m.get("content", "") for m in glm_msgs)
                 assert any("<part_think>" in m.get("content", "") for m in glm_msgs)
                 # budget = OFFLOAD_MAX_TOKENS - len(SLM output ids)
                 assert glm.requests[0]["max_tokens"] == 100 - len(TURN1_IDS)
@@ -185,6 +200,31 @@ async def _run() -> None:
 
                 reward = offload.cost_aware_reward(1.0, stats, usage=None)
                 assert reward < 1.0, reward
+                assert int(stats.get("offload_outside_think_count", 0)) == 0
+                # Outside-think span: no GLM, but solved reward takes format penalty.
+                bad = {
+                    "offload_outside_think_count": 1,
+                    "small_prompt_tokens": 0,
+                    "small_output_tokens": 0,
+                    "glm_input_tokens": 0,
+                    "glm_output_tokens": 0,
+                }
+                assert offload.cost_aware_reward(1.0, bad, usage=None, format_penalty=0.25) == 0.75
+                # Failures must not get a length/cost gradient (EOS-collapse fix).
+                assert offload.cost_aware_reward(0.0, stats, usage=None) == 0.0
+                assert (
+                    offload.cost_aware_reward(
+                        0.0,
+                        {
+                            "small_prompt_tokens": 10_000_000,
+                            "small_output_tokens": 50_000,
+                            "glm_input_tokens": 0,
+                            "glm_output_tokens": 0,
+                        },
+                        usage=None,
+                    )
+                    == 0.0
+                )
 
                 samples = await adapter.finish_session(
                     sid, base_sample=Sample(index=0, prompt="x"), reward=reward

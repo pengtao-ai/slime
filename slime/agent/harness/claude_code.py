@@ -56,11 +56,6 @@ class ClaudeCodeHarness(BaseHarness):
 
     async def launch_and_wait(self, sb: Sandbox, ctx: HarnessContext, prompt: str, time_budget_sec: int) -> int:
         cmd = f"/usr/local/bin/claude -p {shlex.quote(prompt)} {self.launch_flags}"
-        # Append-only system text (keeps Claude Code's default system prompt).
-        # Used e.g. by coding-agent offload to teach <|llm_offload|>N<|/llm_offload|>.
-        append_system = os.environ.get("SLIME_AGENT_CC_APPEND_SYSTEM_PROMPT", "").strip()
-        if append_system:
-            cmd = f"{cmd} --append-system-prompt {shlex.quote(append_system)}"
         extra = os.environ.get(self.extra_args_env, "").strip()
         if extra:
             cmd = f"{cmd} {extra}"

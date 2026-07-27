@@ -89,7 +89,9 @@ async def main() -> None:
         "I found `from_preliz` but the truncated-dist edge case is ambiguous; "
         "handing off for a careful fix."
     )
-    raw_output = f"{slm_prefix} {offload.OFFLOAD_OPEN}{n}{offload.OFFLOAD_CLOSE}"
+    raw_output = (
+        f"<think>\n{slm_prefix} {offload.OFFLOAD_OPEN}{n}{offload.OFFLOAD_CLOSE}\n"
+    )
     # Fake SLM token ids — only used for max_tokens budget / stats.
     slm_output_ids = [101, 102, 103, 104, 105, 248077, n + 48, 248078]
 
@@ -192,8 +194,12 @@ async def main() -> None:
 
     ok = (
         not str(content).startswith("[Error:")
-        and offload.OFFLOAD_OPEN not in str(composed.manager_message.get("content") or "")
+        and offload.OFFLOAD_OPEN in (
+            str(composed.manager_message.get("content") or "")
+            + str(composed.manager_message.get("reasoning_content") or "")
+        )
         and "part_think" not in str(composed.manager_message.get("content") or "")
+        and all(offload.OFFLOAD_OPEN not in m.get("content", "") for m in messages)
     )
     _banner("6) Verdict")
     print(json.dumps({"ok": ok, "offload_count": 1}, indent=2))

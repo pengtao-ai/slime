@@ -30,73 +30,27 @@ from dataclasses import dataclass
 from typing import Any
 
 from slime.agent.adapters import AnthropicAdapter, OpenAIAdapter
-from slime.agent.adapters.common import Reply, Session
 from slime.agent.aiohttp_threaded import FilteredAccessLogger, run_app_in_thread
 from slime.agent.harness import ClaudeCodeHarness, CodexHarness
-from slime.agent.sandbox import make_sandbox
-from slime.agent.trajectory import TurnRecord
+from slime.agent.sandbox import E2BSandbox
 from slime.utils.misc import SingletonMeta
 from slime.utils.processing_utils import load_tokenizer
 from slime.utils.types import Sample
 
-from . import offload, swe
+from . import swe
 
 logger = logging.getLogger(__name__)
 logging.getLogger("e2b").setLevel(logging.WARNING)
 
-
-class _OffloadMixin:
-    """Per-turn pipeline: agent -> SLM -> (optional GLM) -> complete reply -> agent.
-
-    Every Claude Code / Codex ``/v1/messages`` (or chat) round hits this hook
-    *before* the adapter flushes the response. Training still uses only SLM
-    ``output_ids``; the agent always sees the composed full assistant turn.
-
-    Offload instructions are appended to the request ``system`` after Claude
-    Code's full system (incl. ``gitStatus``).
-    """
-
-    def _preprocess_body(self, body: dict) -> None:
-        super()._preprocess_body(body)
-        offload.inject_offload_into_request_body(body)
-
-    async def _postprocess_reply(
-        self,
-        reply: Reply,
-        *,
-        raw_output: str,
-        translated: list[dict],
-        tools_schema: list[dict] | None,
-        turn: TurnRecord,
-        session: Session,
-        sid: str,
-    ) -> Reply:
-        return await offload.apply_offload_if_needed(
-            reply,
-            raw_output=raw_output,
-            translated=translated,
-            turn=turn,
-            session=session,
-            sid=sid,
-        )
-
-
-class CodingAnthropicAdapter(_OffloadMixin, AnthropicAdapter):
-    pass
-
-
-class CodingOpenAIAdapter(_OffloadMixin, OpenAIAdapter):
-    pass
-
-
 _AGENTS = {
-    "claude_code": (ClaudeCodeHarness, CodingAnthropicAdapter),
-    "codex": (CodexHarness, CodingOpenAIAdapter),
+    "claude_code": (ClaudeCodeHarness, AnthropicAdapter),
+    "codex": (CodexHarness, OpenAIAdapter),
 }
 AGENT_NAME = os.environ.get("SWE_AGENT", "claude_code")
 if AGENT_NAME not in _AGENTS:
     raise ValueError(f"SWE_AGENT={AGENT_NAME!r} not in {sorted(_AGENTS)}")
 HARNESS_CLS, ADAPTER_CLS = _AGENTS[AGENT_NAME]
+
 
 @dataclass(frozen=True)
 class SweConfig:
@@ -141,8 +95,8 @@ _BOOT_SEM = asyncio.Semaphore(CONFIG.boot_concurrency)
 
 
 @asynccontextmanager
-async def boot_agent_sandbox(image: str, instance_id: str) -> AsyncIterator:
-    """Boot a fresh sandbox and install the selected harness toolchain.
+async def boot_agent_sandbox(image: str, instance_id: str) -> AsyncIterator[E2BSandbox]:
+    """Boot a fresh E2B sandbox and install the selected harness toolchain.
 
     Create the sandbox from the dataset image, install Node 22 + the harness CLI
     from host tarballs, retry transient boot/install failures, and close the
@@ -151,16 +105,10 @@ async def boot_agent_sandbox(image: str, instance_id: str) -> AsyncIterator:
     sb = None
     last_err: Exception | None = None
     for attempt in range(CONFIG.boot_retries):
-        cand = make_sandbox(image)
+        cand = E2BSandbox(image)
         try:
             async with _BOOT_SEM:
                 await cand.__aenter__()
-                logger.info(
-                    "[coding_agent_rl] %s: sandbox_id=%s image=%s",
-                    instance_id,
-                    cand.sandbox_id,
-                    image,
-                )
                 try:
                     await HARNESS_CLS().install_cli(cand)
                 except BaseException:
@@ -270,62 +218,24 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     prompt=swe.SWE_PROMPT,
                 )
                 diff_text = await swe.git_diff(sb, md["workdir"])
-                # Best-effort diagnostics before the sandbox is torn down. Used when
-                # finish_session later returns no turns (adapter_session_empty).
-                diag = ""
-                try:
-                    _, diag, _ = await sb.exec(
-                        "echo '=== /tmp/.run.sh (env+cmd) ==='; "
-                        "head -n 30 /tmp/.run.sh 2>/dev/null; "
-                        f"echo '=== trajectory tail ==='; "
-                        f"tail -c 1200 {md['workdir']}/.harness/trajectory.jsonl 2>/dev/null || true",
-                        timeout=30,
-                    )
-                except Exception:
-                    diag = ""
 
             reward, applied_cleanly = await swe.run_evaluation(
                 md,
                 diff_text=diff_text,
                 timeout_sec=CONFIG.eval_timeout_sec,
             )
-            solved = float(reward)
-            empty_patch = not (diff_text or "").strip()
-            # Belt-and-suspenders: never train on "solved" with no repo change.
-            if empty_patch and solved == 1.0:
-                logger.warning(
-                    "[coding_agent_rl] %s: grader returned solved with empty patch; forcing solved=0",
-                    instance_id,
-                )
-                solved = 0.0
-            offload_stats = {}
-            session_obj = state.adapter.store.get(session_id)
-            if session_obj is not None and getattr(session_obj, "offload_stats", None):
-                offload_stats = dict(session_obj.offload_stats)
-            train_reward = solved
-            if offload.offload_enabled():
-                usage = md.get("usage") if isinstance(md.get("usage"), dict) else None
-                train_reward = offload.cost_aware_reward(solved, offload_stats, usage=usage)
-                logger.info(
-                    "[coding_agent_rl] %s: solved=%.1f train_reward=%.4f empty_patch=%s offload=%s",
-                    instance_id,
-                    solved,
-                    train_reward,
-                    empty_patch,
-                    offload_stats,
-                )
             if evaluation:
                 logger.info(
                     "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs (eval-only)",
                     instance_id,
-                    solved,
+                    float(reward),
                     bool(applied_cleanly),
                     agent_exit_code,
                     time.time() - t0,
                 )
                 return _eval_result(
                     base_sample,
-                    reward=solved,
+                    reward=float(reward),
                     applied_cleanly=bool(applied_cleanly),
                     agent_exit_code=agent_exit_code,
                     instance_id=instance_id,
@@ -334,24 +244,13 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             samples = await state.adapter.finish_session(
                 session_id,
                 base_sample=base_sample,
-                reward=float(train_reward),
+                reward=float(reward),
                 extra_metadata={
-                    "grading_solved": solved == 1.0,
+                    "grading_solved": float(reward) == 1.0,
                     "instance_id": instance_id,
-                    "solved": solved,
-                    "empty_patch": empty_patch,
-                    "offload_stats": offload_stats,
                 },
             )
             if not samples:
-                logger.warning(
-                    "[coding_agent_rl] %s: adapter_session_empty "
-                    "(agent_exit_code=%s adapter=%s). sandbox diag:\n%s",
-                    instance_id,
-                    agent_exit_code,
-                    state.adapter_url,
-                    (diag or "<empty>")[:1500],
-                )
                 return _abort_result(base_sample, "adapter_session_empty", instance_id)
 
             for s in samples:
@@ -367,7 +266,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             logger.info(
                 "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs segments=%d",
                 instance_id,
-                float(train_reward),
+                float(reward),
                 bool(applied_cleanly),
                 agent_exit_code,
                 time.time() - t0,

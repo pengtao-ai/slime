@@ -49,8 +49,8 @@ TURN3_IDS = (8301, 8302)
 
 TURN0_TEXT = "I'll inspect the repo layout and locate from_preliz."
 TURN1_TEXT = (
-    f"Found the helper but truncated-dist handling is ambiguous; "
-    f"requesting help {offload.OFFLOAD_OPEN}3{offload.OFFLOAD_CLOSE}"
+    f"<think>\nFound the helper but truncated-dist handling is ambiguous; "
+    f"requesting help {offload.OFFLOAD_OPEN}3{offload.OFFLOAD_CLOSE}\n"
 )
 TURN2_TEXT = "Applying the suggested patch to distributions.py."
 TURN3_TEXT = "Done. Added Truncated* unwrap and a regression test."
@@ -212,7 +212,12 @@ async def _run(out_dir: Path) -> dict:
                     )
                     glm_payload = glm.requests[-1] if did_offload else None
                     if did_offload:
-                        assert offload.OFFLOAD_OPEN not in text
+                        # CC keeps the offload span; GLM request must strip it.
+                        assert offload.OFFLOAD_OPEN in (text + think)
+                        assert all(
+                            offload.OFFLOAD_OPEN not in m.get("content", "")
+                            for m in glm_payload["messages"]
+                        )
                         assert offload.CODING_HANDOFF_PROMPT in glm_payload["messages"][0]["content"]
                         assert (
                             offload.OFFLOAD_SYSTEM_PROMPT_APPEND

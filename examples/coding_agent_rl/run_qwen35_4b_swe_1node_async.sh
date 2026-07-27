@@ -111,6 +111,7 @@ echo "RUN_ROOT=${RUN_ROOT}"
 echo "SAVE_DIR=${SAVE_DIR}  SAVE_INTERVAL=${SAVE_INTERVAL}"
 echo "ACTOR_GPUS=${ACTOR_GPUS} ROLLOUT_GPUS=${ROLLOUT_GPUS} (TP=${TP_SIZE} CP=${CP_SIZE} seq=${SEQ_LENGTH} max_tokens/gpu=${MAX_TOKENS_PER_GPU})"
 echo "ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE} N_SAMPLES=${N_SAMPLES_PER_PROMPT} GLOBAL_BATCH=${GLOBAL_BATCH_SIZE}"
+echo "SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS=${SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS:-8192}"
 echo "======================================================================"
 
 CKPT_ARGS=(
@@ -217,6 +218,8 @@ export ADAPTER_PORT="${ADAPTER_PORT:-18001}"
 export SWE_AGENT_TIME_BUDGET_SEC="${SWE_AGENT_TIME_BUDGET_SEC:-900}"
 export SWE_EVAL_TIMEOUT_SEC="${SWE_EVAL_TIMEOUT_SEC:-300}"
 export SWE_BOOT_CONCURRENCY
+# Higher = fewer TOKEN_FORK segments (more REALIGN / rewrite-merge); default was 1024.
+export SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS="${SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS:-8192}"
 
 SETTINGS_JSON='{"permissions":{"defaultMode":"bypassPermissions"},"autoCompactEnabled":true,"autoCompactWindow":80000}'
 AGENTS_JSON='{"investigator":{"description":"Searches the repo for relevant files before any edit","prompt":"You are an investigator sub-agent. Use Grep/Read/Glob to find every file relevant to the user task, then return a short bulleted summary. Do NOT edit anything.","tools":["Grep","Read","Glob"]}}'
@@ -252,7 +255,6 @@ keys = (
     "ADAPTER_BIND_HOST", "ADAPTER_PORT",
     "SLIME_AGENT_CC_EXTRA_ARGS",
     "SLIME_AGENT_CC_EXTRA_ENVS",
-    "SLIME_AGENT_CC_APPEND_SYSTEM_PROMPT",
     "SWE_CC_PROMPT",
     "SWE_TRAIN_PROTOCOL",
     "SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY",
@@ -267,8 +269,10 @@ keys = (
     "DASHSCOPE_API_KEY", "OPENAI_API_KEY",
     "DASHSCOPE_BASE_URL", "DASHSCOPE_MODEL",
     "OFFLOAD_EFFICIENCY_LAMBDA", "OFFLOAD_MAX_TOKENS",
+    "OFFLOAD_THINK_FORMAT_PENALTY",
     "OFFLOAD_STOP_TOKEN_ID", "ROLLOUT_STOP_TOKEN_IDS",
     "SLIME_AGENT_OFFLOAD_SYSTEM_APPEND",
+    "SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS",
 )
 env = {k: os.environ[k] for k in keys if k in os.environ}
 env["MASTER_ADDR"] = os.environ["MASTER_ADDR"]

@@ -55,11 +55,11 @@ Wire it up with `--input-key prompt --label-key label --metadata-key metadata`.
 Offload is implemented **on this black-box agent path**, not as post-hoc math custom-rm.
 **Every agent round** is: agent → SLM → (if offload span) GLM → **complete** reply → agent.
 
-1. Offload usage is appended to Claude Code's **system** prompt via `--append-system-prompt` (`SLIME_AGENT_CC_APPEND_SYSTEM_PROMPT` / `offload.OFFLOAD_SYSTEM_PROMPT_APPEND`); the task user prompt (`SWE_PROMPT`) is unchanged.
-2. Actor may emit `<|llm_offload|>N<|/llm_offload|>` mid-turn (`N`: `0`=no think, `1–5`=`high`, `6–9`=`max`). PyroDash: open **248077**, close **248078** (stop on close).
+1. Offload usage is appended by the coding **adapter** to the request `system` **after** Claude Code's full system (including `gitStatus`). Override text with `SLIME_AGENT_OFFLOAD_SYSTEM_APPEND`; `SWE_PROMPT` is unchanged.
+2. Actor may emit `<|llm_offload|>N<|/llm_offload|>` **inside thinking** mid-turn (`N`: `0`=no think, `1–5`=`high`, `6–9`=`max`) — before `</think>` (Qwen often omits the opening `<think>` from `output_ids`). Outside think: no GLM call + think-format penalty on solved reward. PyroDash: open **248077**, close **248078** (stop on close).
 3. Adapter waits for GLM (when needed), merges SLM prefix + GLM into one assistant message, then responds to Claude Code / Codex.
 4. Only local-model `output_ids` are trained; GLM text lands in history with `loss_mask=0` on later turns.
-5. Train reward: `solved - λ * cost_ratio` (`offload.py`), using session token accounting + optional `metadata.usage` baseline.
+5. Train reward: if solved, `1 - λ * cost_ratio`, then subtract `OFFLOAD_THINK_FORMAT_PENALTY` (default `0.25`) once if any offload span was outside thinking (after `</think>`); else `0`. Empty patches are never solved.
 
 ```bash
 # CPU plumbing smoke (mock GLM, 2 adapter turns; no GPU/Docker)
@@ -74,7 +74,7 @@ bash examples/coding_agent_rl/run_pyrodash4b_swe_offload_smoke.sh
 bash examples/coding_agent_rl/run_pyrodash4b_swe_offload_1node_docker_async.sh
 ```
 
-Key env: `SLIME_AGENT_OFFLOAD=1`, `OFFLOAD_EFFICIENCY_LAMBDA`, `ROLLOUT_STOP_TOKEN_IDS` (includes offload id), `DASHSCOPE_*`.
+Key env: `SLIME_AGENT_OFFLOAD=1`, `OFFLOAD_EFFICIENCY_LAMBDA`, `OFFLOAD_THINK_FORMAT_PENALTY`, `ROLLOUT_STOP_TOKEN_IDS` (includes offload id), `DASHSCOPE_*`.
 
 > `examples/llm_offload/` is a separate **math** GRPO sketch; do not use it for coding-agent offload.
 
@@ -153,13 +153,14 @@ contract (read inside `slime/agent/`); `SWE_*` are this SWE example's task knobs
 | `SLIME_AGENT_NODE_TARBALL` | — | Host path to Node 22 tarball uploaded into each sandbox. |
 | `SLIME_AGENT_CC_TARBALL` | — | Host path to the Claude Code CLI npm tarball. |
 | `SLIME_AGENT_CC_EXTRA_ARGS` | (see launcher) | Extra flags appended to the `claude` CLI invocation — registers the read-only `investigator` sub-agent, disables `WebFetch`/`WebSearch`, disables slash commands. |
-| `SLIME_AGENT_CC_APPEND_SYSTEM_PROMPT` | unset (offload sets default) | Passed as `claude --append-system-prompt ...` (appends to Claude Code's default system prompt; does not replace it). |
+| `SLIME_AGENT_OFFLOAD_SYSTEM_APPEND` | `OFFLOAD_SYSTEM_PROMPT_APPEND` | SLM-only offload instructions; adapter appends after full CC system (incl. `gitStatus`). |
 | `SLIME_AGENT_CC_EXTRA_ENVS` | unset | JSON object of extra env vars exported into the `claude` process — escape hatch for env-only knobs (`MAX_THINKING_TOKENS`, `BASH_MAX_TIMEOUT_MS`, ...). Merged last, so it can also override the built-in defaults. |
 | `SWE_AGENT_TIME_BUDGET_SEC` | `1800` | Wallclock budget for the in-sandbox agent CLI itself (think/edit/run). |
 | `SWE_EVAL_TIMEOUT_SEC` | `600` | Wallclock cap on the evaluator sandbox. |
 | `SWE_ROLLOUT_GUARD_SEC` | `agent+eval+180` | Outer safety net wrapping the whole rollout (boot + workspace + agent + diff + eval). Auto-derived if unset. |
 | `SWE_BOOT_CONCURRENCY` | `16` | Cap on simultaneous sandbox boots (eases h2/SSL long-tail). |
 | `SWE_CC_PROMPT` | unset | Optional override for the user-turn prompt. Setting this to require sub-agent dispatch is the most reliable way to maximize fan-out. |
+| `SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS` | `8192` | Trajectory fork/merge threshold (tokens). Higher → fewer `TOKEN_FORK` segments (more REALIGN / assistant-rewrite merge), longer Samples, and more wipe risk (`loss_mask=0`). Does not collapse subagent `TREE_LEAF` branches. Unset falls back to manager default `1024`. |
 
 `--rollout-max-response-len` is the per-turn generation cap passed to each
 SGLang `/generate` call as `max_new_tokens`. `--rollout-max-context-len` is the
