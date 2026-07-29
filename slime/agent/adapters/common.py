@@ -23,6 +23,7 @@ from typing import Any
 import aiohttp
 from aiohttp import web
 
+from slime.agent.chrome_trace import chrome_span, session_trace_ctx
 from slime.agent.parsing import parse_model_output
 from slime.agent.trajectory import TrajectoryManager, TurnRecord
 
@@ -37,11 +38,14 @@ class Session:
     Trajectory state lives in the shared TrajectoryManager (BaseAdapter.manager),
     not here. ``offload_stats`` is an optional side channel for mid-turn LLM
     offload accounting (filled by coding-agent adapters when enabled).
+    ``timing`` holds optional Chrome Trace event state (``trace_events``, ``tid``,
+    ``n_turns``, ``n_offloads``) when the caller enables rollout timelines.
     """
 
     sampling_defaults: dict = dataclasses.field(default_factory=dict)
     max_context_tokens: int = 0
     offload_stats: dict = dataclasses.field(default_factory=dict)
+    timing: dict = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -358,70 +362,82 @@ class BaseAdapter:
         task = asyncio.current_task()
         self.inflight.setdefault(sid, set()).add(task)
         t0 = time.monotonic()
+        events, tid, timing = session_trace_ctx(s)
+        turn_idx = int((timing or {}).get("n_turns", 0) or 0)
+        if timing is not None:
+            timing["n_turns"] = turn_idx + 1
+            timing["current_turn"] = turn_idx
         try:
-            translated, tools_schema = self._translate(body)
-            prompt_ids = _render_token_ids(translated, tok, tools=tools_schema, add_generation_prompt=True)
+            with chrome_span(
+                events,
+                "adapter_turn",
+                cat="adapter",
+                tid=tid,
+                args={"turn": turn_idx, "session_id": sid},
+            ):
+                translated, tools_schema = self._translate(body)
+                prompt_ids = _render_token_ids(translated, tok, tools=tools_schema, add_generation_prompt=True)
 
-            # 1) Always SLM first for this agent round.
-            turn = await call_sglang_generate(prompt_ids, s, body, adapter=self, session_id=sid)
+                # 1) Always SLM first for this agent round.
+                turn = await call_sglang_generate(prompt_ids, s, body, adapter=self, session_id=sid)
 
-            raw_output = tok.decode(turn.output_ids, skip_special_tokens=False) if turn.output_ids else ""
-            parsed = parse_model_output(
-                raw_output,
-                tools_schema=tools_schema,
-                tool_parser_name=self.tool_parser,
-                reasoning_parser_name=self.reasoning_parser,
-            )
-            reply = self._build_reply(parsed, turn.finish_reason, translated, tools_schema)
-            turn = dataclasses.replace(turn, ill_formed=parsed.ill_formed)
-            # 2) Optional GLM offload + 3) compose complete output for the agent.
-            # Must finish before _respond so the agent never sees a partial SLM-only turn.
-            reply = await self._postprocess_reply(
-                reply,
-                raw_output=raw_output,
-                translated=translated,
-                tools_schema=tools_schema,
-                turn=turn,
-                session=s,
-                sid=sid,
-            )
-
-            in_tok, out_tok = len(prompt_ids), len(turn.output_ids)
-            stream = body.get("stream") is True or "text/event-stream" in request.headers.get("Accept", "")
-
-            # Flush the response before recording the trajectory: a client that
-            # disconnected during generation makes _respond raise here, and we
-            # must not record a turn the client never received.
-            try:
-                response = await self._respond(request, body, reply, in_tok, out_tok, stream)
-            except (ConnectionResetError, asyncio.CancelledError) as e:
-                self.logger.warning(
-                    "[%s] sid=%s client disconnected before response flush: %s after %.1fs",
-                    self.log_prefix,
-                    sid,
-                    type(e).__name__,
-                    time.monotonic() - t0,
+                raw_output = tok.decode(turn.output_ids, skip_special_tokens=False) if turn.output_ids else ""
+                parsed = parse_model_output(
+                    raw_output,
+                    tools_schema=tools_schema,
+                    tool_parser_name=self.tool_parser,
+                    reasoning_parser_name=self.reasoning_parser,
                 )
-                if isinstance(e, asyncio.CancelledError):
-                    raise
-                return web.Response(status=499, text="client disconnected")
+                reply = self._build_reply(parsed, turn.finish_reason, translated, tools_schema)
+                turn = dataclasses.replace(turn, ill_formed=parsed.ill_formed)
+                # 2) Optional GLM offload + 3) compose complete output for the agent.
+                # Must finish before _respond so the agent never sees a partial SLM-only turn.
+                reply = await self._postprocess_reply(
+                    reply,
+                    raw_output=raw_output,
+                    translated=translated,
+                    tools_schema=tools_schema,
+                    turn=turn,
+                    session=s,
+                    sid=sid,
+                )
 
-            self._run_debug_callback(
-                sid,
-                translated,
-                tools_schema,
-                reply.manager_message,
-                turn,
-            )
+                in_tok, out_tok = len(prompt_ids), len(turn.output_ids)
+                stream = body.get("stream") is True or "text/event-stream" in request.headers.get("Accept", "")
 
-            self.manager.record_turn(
-                sid,
-                turn=turn,
-                prompt_messages=translated,
-                response_message=reply.manager_message,
-                metadata={"sid": sid},
-            )
-            return response
+                # Flush the response before recording the trajectory: a client that
+                # disconnected during generation makes _respond raise here, and we
+                # must not record a turn the client never received.
+                try:
+                    response = await self._respond(request, body, reply, in_tok, out_tok, stream)
+                except (ConnectionResetError, asyncio.CancelledError) as e:
+                    self.logger.warning(
+                        "[%s] sid=%s client disconnected before response flush: %s after %.1fs",
+                        self.log_prefix,
+                        sid,
+                        type(e).__name__,
+                        time.monotonic() - t0,
+                    )
+                    if isinstance(e, asyncio.CancelledError):
+                        raise
+                    return web.Response(status=499, text="client disconnected")
+
+                self._run_debug_callback(
+                    sid,
+                    translated,
+                    tools_schema,
+                    reply.manager_message,
+                    turn,
+                )
+
+                self.manager.record_turn(
+                    sid,
+                    turn=turn,
+                    prompt_messages=translated,
+                    response_message=reply.manager_message,
+                    metadata={"sid": sid},
+                )
+                return response
         finally:
             self.inflight.get(sid, set()).discard(task)
 
@@ -504,44 +520,54 @@ async def call_sglang_generate(
     rid = uuid.uuid4().hex
     headers = {"X-SMG-Routing-Key": session_id} if session_id and session_id != "default" else None
     timeout = aiohttp.ClientTimeout(total=None, sock_read=900)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as sess, sess.post(
-            f"{sglang_url}/generate",
-            json={
-                "rid": rid,
-                "input_ids": prompt_ids,
-                "sampling_params": sp,
-                "return_logprob": True,
-            },
-            headers=headers,
-        ) as r:
-            if r.status >= 400:
-                text = await r.text()
-                logger.warning(
-                    "[%s] sid=%s rid=%s sglang upstream %d: %.200s",
-                    adapter.log_prefix,
-                    session_id,
-                    rid,
-                    r.status,
-                    text,
-                )
-                raise RuntimeError(f"sglang upstream {r.status}: {text[:400]}")
-            data = await r.json(content_type=None)
-        meta = data.get("meta_info") or {}
-        output_token_logprobs = meta.get("output_token_logprobs") or []
-        output_ids = [x[1] for x in output_token_logprobs]
-        output_log_probs = [float(x[0]) for x in output_token_logprobs]
-        finish = (meta.get("finish_reason") or {}).get("type", "stop") or "stop"
-    except (asyncio.CancelledError, aiohttp.ClientError, asyncio.TimeoutError) as e:
-        # free the sglang slot eagerly on client cancel/timeout, else the
-        # orphaned generation keeps occupying KV until its own length cap
-        logger.debug("[%s] sid=%s rid=%s turn aborted: %s", adapter.log_prefix, session_id, rid, type(e).__name__)
+    events, tid, timing = session_trace_ctx(session)
+    turn_idx = int((timing or {}).get("current_turn", 0) or 0)
+    post_offload = int((timing or {}).get("n_offloads", 0) or 0) > 0
+    with chrome_span(
+        events,
+        "sglang_generate",
+        cat="llm",
+        tid=tid,
+        args={"turn": turn_idx, "post_offload": post_offload, "session_id": session_id},
+    ):
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as s2:
-                await s2.post(f"{sglang_url}/abort_request", json={"rid": rid})
-        except Exception:
-            pass
-        raise
+            async with aiohttp.ClientSession(timeout=timeout) as sess, sess.post(
+                f"{sglang_url}/generate",
+                json={
+                    "rid": rid,
+                    "input_ids": prompt_ids,
+                    "sampling_params": sp,
+                    "return_logprob": True,
+                },
+                headers=headers,
+            ) as r:
+                if r.status >= 400:
+                    text = await r.text()
+                    logger.warning(
+                        "[%s] sid=%s rid=%s sglang upstream %d: %.200s",
+                        adapter.log_prefix,
+                        session_id,
+                        rid,
+                        r.status,
+                        text,
+                    )
+                    raise RuntimeError(f"sglang upstream {r.status}: {text[:400]}")
+                data = await r.json(content_type=None)
+            meta = data.get("meta_info") or {}
+            output_token_logprobs = meta.get("output_token_logprobs") or []
+            output_ids = [x[1] for x in output_token_logprobs]
+            output_log_probs = [float(x[0]) for x in output_token_logprobs]
+            finish = (meta.get("finish_reason") or {}).get("type", "stop") or "stop"
+        except (asyncio.CancelledError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+            # free the sglang slot eagerly on client cancel/timeout, else the
+            # orphaned generation keeps occupying KV until its own length cap
+            logger.debug("[%s] sid=%s rid=%s turn aborted: %s", adapter.log_prefix, session_id, rid, type(e).__name__)
+            try:
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as s2:
+                    await s2.post(f"{sglang_url}/abort_request", json={"rid": rid})
+            except Exception:
+                pass
+            raise
 
     return TurnRecord(
         prompt_ids=list(prompt_ids),

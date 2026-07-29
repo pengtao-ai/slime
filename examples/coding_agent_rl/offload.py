@@ -40,6 +40,7 @@ from typing import Any
 import requests
 
 from slime.agent.adapters.common import Reply, Session, flatten_content, tool_call_dict
+from slime.agent.chrome_trace import chrome_span, session_trace_ctx
 from slime.agent.trajectory import TurnRecord
 
 logger = logging.getLogger(__name__)
@@ -924,15 +925,31 @@ async def apply_offload_if_needed(
     small_out = len(turn.output_ids or [])
     glm_budget = max(0, _max_tokens() - small_out)
     messages = build_offload_messages(translated, raw_output)
-    content, think, usage, glm_tool_calls = await call_remote_chat(
-        messages,
-        max_tokens=glm_budget,
-        enable_thinking=enable_thinking,
-        reasoning_effort=reasoning_effort,
-        tools=tools_schema,
-    )
+    events, tid, timing = session_trace_ctx(session)
+    turn_idx = int((timing or {}).get("current_turn", 0) or 0)
+    with chrome_span(
+        events,
+        "glm_offload",
+        cat="llm",
+        tid=tid,
+        args={
+            "turn": turn_idx,
+            "n": n,
+            "reasoning_effort": reasoning_effort,
+            "session_id": sid,
+        },
+    ):
+        content, think, usage, glm_tool_calls = await call_remote_chat(
+            messages,
+            max_tokens=glm_budget,
+            enable_thinking=enable_thinking,
+            reasoning_effort=reasoning_effort,
+            tools=tools_schema,
+        )
 
     stats["offload_count"] = int(stats.get("offload_count", 0)) + 1
+    if timing is not None:
+        timing["n_offloads"] = int(timing.get("n_offloads", 0) or 0) + 1
     stats["last_offload_n"] = n
     stats["last_reasoning_effort"] = reasoning_effort
     _record_glm_usage(stats, usage, messages=messages, content=content, think=think)

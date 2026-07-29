@@ -5,7 +5,8 @@
 # Differences vs run_qwen35_4b_swe_1node_docker.sh:
 #   * train_async.py (next rollout overlaps Megatron train)
 #   * no --colocate: default 6 actor + 2 rollout GPUs (train is the wall-clock bottleneck)
-#   * default fan-out 8×8=64 (128 made actor_train ~73min/step; sync~6min at ~32 samples)
+#   * default TP=1 CP=2 → DP=3; fan-out 3×8=24 (divisible by DP)
+#   * default --qwen-gdn-backend flashqla
 #   * Megatron --save every SAVE_INTERVAL steps (default 5)
 #
 # After warmup, wall clock ≈ max(rollout, train). Keep train <= rollout or async helps little.
@@ -16,11 +17,15 @@
 #   bash examples/coding_agent_rl/run_qwen35_4b_swe_1node_docker_async.sh
 #
 # Faster train (closer to sync):
-#   ROLLOUT_BATCH_SIZE=4 N_SAMPLES_PER_PROMPT=8 \
+#   ROLLOUT_BATCH_SIZE=2 N_SAMPLES_PER_PROMPT=8 \
 #     bash examples/coding_agent_rl/run_qwen35_4b_swe_1node_docker_async.sh
 #
-# Higher fan-out if you accept longer train (quota≈720):
-#   ROLLOUT_BATCH_SIZE=16 N_SAMPLES_PER_PROMPT=8 ACTOR_GPUS=6 ROLLOUT_GPUS=2 \
+# Higher fan-out if you accept longer train:
+#   ROLLOUT_BATCH_SIZE=6 N_SAMPLES_PER_PROMPT=8 \
+#     bash examples/coding_agent_rl/run_qwen35_4b_swe_1node_docker_async.sh
+#
+# Fall back to FLA GDN / max CP:
+#   QWEN_GDN_BACKEND=fla CP_SIZE=6 ROLLOUT_BATCH_SIZE=8 \
 #     bash examples/coding_agent_rl/run_qwen35_4b_swe_1node_docker_async.sh
 
 set -euo pipefail
@@ -51,20 +56,23 @@ export PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/data/swe_train_scaleswe_200.jso
 export EXP_TAG="${EXP_TAG:-agent_only_qwen35_4b_docker_async_scaleswe200}"
 
 # Concurrent agents ≈ ROLLOUT_BATCH_SIZE * N_SAMPLES.
-# Train FLOPs ≈ GBS * avg_seqlen; 128×~43k on 4 GPUs → ~73min/step. Default 64.
-export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-8}"
+# Train FLOPs ≈ GBS * avg_seqlen; GBS must be divisible by DP.
+# Default CP=2 → DP=3 on ACTOR_GPUS=6; N_SAMPLES=8 → ROLLOUT_BATCH_SIZE=3 so GBS=24 % 3 == 0.
+export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-4}"
 export N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"
 export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))}"
 export SWE_BOOT_CONCURRENCY="${SWE_BOOT_CONCURRENCY:-32}"
-# 200 prompts / batch=8 ≈ 25 steps/epoch.
+# 200 prompts / batch=3 ≈ 67 steps/epoch.
 export NUM_ROLLOUT="${NUM_ROLLOUT:-50}"
 
 # Prefer actor GPUs: agents are sandbox-bound; train was the bottleneck on 4+4.
-# TP=1 / CP=ACTOR keeps long-seq memory safe (see async script).
+# TP=1 CP=2 → DP=3 on 6 actor GPUs (GDN still all-gathers full seq per CP group).
 export NUM_GPUS="${NUM_GPUS:-8}"
 export ACTOR_GPUS="${ACTOR_GPUS:-6}"
 export ROLLOUT_GPUS="${ROLLOUT_GPUS:-$((NUM_GPUS - ACTOR_GPUS))}"
 export TP_SIZE="${TP_SIZE:-1}"
+export CP_SIZE="${CP_SIZE:-6}"
+export QWEN_GDN_BACKEND="${QWEN_GDN_BACKEND:-flashqla}"
 
 # Checkpointing.
 export SAVE_INTERVAL="${SAVE_INTERVAL:-5}"
@@ -91,7 +99,8 @@ echo "  PROMPT_DATA=${PROMPT_DATA}"
 echo "  NUM_ROLLOUT=${NUM_ROLLOUT}"
 echo "  ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE} N_SAMPLES=${N_SAMPLES_PER_PROMPT} GLOBAL_BATCH=${GLOBAL_BATCH_SIZE}"
 echo "  SWE_BOOT_CONCURRENCY=${SWE_BOOT_CONCURRENCY}"
-echo "  ACTOR_GPUS=${ACTOR_GPUS} ROLLOUT_GPUS=${ROLLOUT_GPUS} TP_SIZE=${TP_SIZE}"
+echo "  ACTOR_GPUS=${ACTOR_GPUS} ROLLOUT_GPUS=${ROLLOUT_GPUS} TP_SIZE=${TP_SIZE} CP_SIZE=${CP_SIZE}"
+echo "  QWEN_GDN_BACKEND=${QWEN_GDN_BACKEND}"
 echo "  SAVE_INTERVAL=${SAVE_INTERVAL}"
 echo "  SWE_AGENT_TIME_BUDGET_SEC=${SWE_AGENT_TIME_BUDGET_SEC} SWE_EVAL_TIMEOUT_SEC=${SWE_EVAL_TIMEOUT_SEC}"
 echo "  SLIME_AGENT_DOCKER_RUN_TIMEOUT_SEC=${SLIME_AGENT_DOCKER_RUN_TIMEOUT_SEC}"

@@ -13,11 +13,23 @@
 #   DASHSCOPE_API_KEY / DASHSCOPE_BASE_URL pointing at an OpenAI-compatible GLM
 #   docker sandboxes + pod IP (same as run_qwen35_4b_swe_1node_docker_async.sh)
 #
+# Precision: Megatron train + SGLang rollout both use BF16 (padded HF / torch_dist).
+# Optional: SGLANG_KV_CACHE_DTYPE=fp8_e4m3 for longer agent contexts.
+#
 #   export DASHSCOPE_API_KEY=...
 #   export DASHSCOPE_BASE_URL=http://host:8000/v1
 #   bash examples/coding_agent_rl/run_pyrodash4b_swe_offload_1node_docker_async.sh
 
 set -euo pipefail
+
+# NCCL runtime env (passed through to downstream exec' d script).
+export NCCL_DEBUG=INFO
+export NCCL_CUMEM_ENABLE=0
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# TF32 (Ampere+): enable via env var so it overrides any internal PyTorch default.
+# This targets cuBLAS matmul; for cuDNN, prefer torch.backends.cudnn.allow_tf32 in code if needed.
+export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE="${TORCH_ALLOW_TF32_CUBLAS_OVERRIDE:-1}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 
@@ -39,7 +51,7 @@ export OFFLOAD_MAX_TOKENS="${OFFLOAD_MAX_TOKENS:-32768}"
 export OFFLOAD_STOP_TOKEN_ID="${OFFLOAD_STOP_TOKEN_ID:-248078}"
 export ROLLOUT_STOP_TOKEN_IDS="${ROLLOUT_STOP_TOKEN_IDS:-248046 248044 ${OFFLOAD_STOP_TOKEN_ID}}"
 # Fewer TOKEN_FORK segments via REALIGN / rewrite-merge (passed through to Ray workers).
-export SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS="${SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS:-4096}"
+export SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS="${SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS:-100000}"
 # Embed GLM continuation into Sample.tokens with loss_mask=0 (default on).
 export SLIME_OFFLOAD_EMBED_IN_TRAJECTORY="${SLIME_OFFLOAD_EMBED_IN_TRAJECTORY:-1}"
 # export SLIME_OFFLOAD_EMBED_MAX_TOKENS="${SLIME_OFFLOAD_EMBED_MAX_TOKENS:-8192}"
@@ -48,18 +60,20 @@ if [[ -z "${DASHSCOPE_API_KEY:-}" && -z "${OPENAI_API_KEY:-}" ]]; then
   echo "WARNING: DASHSCOPE_API_KEY (or OPENAI_API_KEY) is unset; offload calls will fail at runtime." >&2
 fi
 
-# ---- PyroDash checkpoints ----
-# SGLang loads HF vocab rows; Megatron torch_dist is padded to 248320. Use the
-# padded HF copy so initial weight sync matches (see *_pad248320).
+# ---- PyroDash checkpoints (BF16 train + BF16 rollout) ----
+# SGLang loads padded HF vocab rows; Megatron torch_dist is padded to 248320.
 export HF_CHECKPOINT="${HF_CHECKPOINT:-/workspace/models/pyromind/PyroDash-4B-SFT-0728_pad248320}"
 export REF_MODEL_PATH="${REF_MODEL_PATH:-/workspace/models/pyromind/PyroDash-4B-SFT-0728_torch_dist}"
 export EXP_TAG="${EXP_TAG:-agent_offload_pyrodash4b_docker_async}"
+# FP8 KV cache for longer agent decode contexts (rollout only; weights stay BF16).
+export SGLANG_KV_CACHE_DTYPE="${SGLANG_KV_CACHE_DTYPE:-fp8_e4m3}"
 
 echo "======================================================================"
-echo "PyroDash coding-agent OFFLOAD (async docker)"
+echo "PyroDash coding-agent OFFLOAD (async docker, BF16 train + BF16 rollout)"
 echo "  SLIME_AGENT_OFFLOAD=${SLIME_AGENT_OFFLOAD}"
 echo "  HF_CHECKPOINT=${HF_CHECKPOINT}"
 echo "  REF_MODEL_PATH=${REF_MODEL_PATH}"
+echo "  SGLANG_KV_CACHE_DTYPE=${SGLANG_KV_CACHE_DTYPE:-<unset>}"
 echo "  ROLLOUT_STOP_TOKEN_IDS=${ROLLOUT_STOP_TOKEN_IDS}"
 echo "  DASHSCOPE_BASE_URL=${DASHSCOPE_BASE_URL}"
 echo "  DASHSCOPE_MODEL=${DASHSCOPE_MODEL}"
@@ -67,6 +81,9 @@ echo "  OFFLOAD_EFFICIENCY_LAMBDA=${OFFLOAD_EFFICIENCY_LAMBDA}"
 echo "  OFFLOAD_REWARD_MODE=${OFFLOAD_REWARD_MODE}"
 echo "  OFFLOAD_SEEK_ALPHA=${OFFLOAD_SEEK_ALPHA}"
 echo "  SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS=${SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS}"
+echo "  TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=${TORCH_ALLOW_TF32_CUBLAS_OVERRIDE}"
 echo "======================================================================"
+
+docker ps -aq --filter name=slime-sb- | xargs -r docker rm -f
 
 exec bash "${SCRIPT_DIR}/run_qwen35_4b_swe_1node_docker_async.sh"

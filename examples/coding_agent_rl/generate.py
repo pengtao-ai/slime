@@ -13,6 +13,10 @@ dataset parsing, workspace prep, diff, eval). LLM plumbing (Anthropic / OpenAI
 <-> SGLang /generate, token capture, segment split) is the matching
 slime.agent.adapters adapter. swe.get_metadata documents the dataset row schema
 and produces the md dict consumed below.
+
+Chrome Trace timestamps (ph=B/E) are recorded on each sample under
+``metadata["timeline"]`` and exported per rollout by
+``examples.coding_agent_rl.log_rollout_timeline``.
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ import random
 import secrets
 import time
 import traceback
+import zlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -32,6 +37,7 @@ from typing import Any
 from slime.agent.adapters import AnthropicAdapter, OpenAIAdapter
 from slime.agent.adapters.common import Reply, Session
 from slime.agent.aiohttp_threaded import FilteredAccessLogger, run_app_in_thread
+from slime.agent.chrome_trace import chrome_span, ensure_session_timing
 from slime.agent.harness import ClaudeCodeHarness, CodexHarness
 from slime.agent.sandbox import make_sandbox
 from slime.agent.trajectory import TurnRecord
@@ -142,32 +148,80 @@ CONFIG = SweConfig.from_env()
 _BOOT_SEM = asyncio.Semaphore(CONFIG.boot_concurrency)
 
 
+def _sample_tid(sample: Sample, session_id: str) -> int:
+    if sample.index is not None:
+        return int(sample.index) + 1
+    return (zlib.crc32(session_id.encode("utf-8")) & 0x7FFFFFFF) or 1
+
+
+def _timeline_payload(
+    *,
+    tid: int,
+    session_id: str,
+    instance_id: str,
+    events: list[dict[str, Any]],
+    thread_name: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "tid": tid,
+        "session_id": session_id,
+        "instance_id": instance_id,
+        "thread_name": thread_name or f"{instance_id}",
+        "trace_events": events,
+    }
+
+
+def _attach_timeline(samples: list[Sample], timeline: dict[str, Any]) -> None:
+    for s in samples:
+        s.metadata = {**(s.metadata or {}), "timeline": timeline}
+
+
 @asynccontextmanager
-async def boot_agent_sandbox(image: str, instance_id: str) -> AsyncIterator:
+async def boot_agent_sandbox(
+    image: str,
+    instance_id: str,
+    *,
+    events: list[dict[str, Any]],
+    tid: int,
+) -> AsyncIterator:
     """Boot a fresh sandbox and install the selected harness toolchain.
 
     Create the sandbox from the dataset image, install Node 22 + the harness CLI
     from host tarballs, retry transient boot/install failures, and close the
     sandbox when the caller leaves the context.
+
+    Records ``boot_wait`` (semaphore queue) and ``boot_sandbox`` (create+install)
+    as separate Chrome Trace spans.
     """
     sb = None
     last_err: Exception | None = None
     for attempt in range(CONFIG.boot_retries):
         cand = make_sandbox(image)
         try:
-            async with _BOOT_SEM:
-                await cand.__aenter__()
-                logger.info(
-                    "[coding_agent_rl] %s: sandbox_id=%s image=%s",
-                    instance_id,
-                    cand.sandbox_id,
-                    image,
-                )
-                try:
-                    await HARNESS_CLS().install_cli(cand)
-                except BaseException:
-                    await cand.__aexit__(None, None, None)
-                    raise
+            with chrome_span(events, "boot_wait", cat="outer", tid=tid, args={"instance_id": instance_id}):
+                await _BOOT_SEM.acquire()
+            try:
+                with chrome_span(
+                    events,
+                    "boot_sandbox",
+                    cat="outer",
+                    tid=tid,
+                    args={"instance_id": instance_id, "attempt": attempt + 1},
+                ):
+                    await cand.__aenter__()
+                    logger.info(
+                        "[coding_agent_rl] %s: sandbox_id=%s image=%s",
+                        instance_id,
+                        cand.sandbox_id,
+                        image,
+                    )
+                    try:
+                        await HARNESS_CLS().install_cli(cand)
+                    except BaseException:
+                        await cand.__aexit__(None, None, None)
+                        raise
+            finally:
+                _BOOT_SEM.release()
             sb = cand
             break
         except Exception as e:
@@ -253,25 +307,62 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         return _abort_result(base_sample, f"unevaluatable:{reason}", instance_id)
 
     session_id = base_sample.session_id = _session_id(base_sample, instance_id)
+    tid = _sample_tid(base_sample, session_id)
+    group_index = base_sample.group_index
+    thread_name = f"{instance_id}" + (f"#{group_index}" if group_index is not None else "")
+    trace_events: list[dict[str, Any]] = []
+    timeline = _timeline_payload(
+        tid=tid,
+        session_id=session_id,
+        instance_id=instance_id,
+        events=trace_events,
+        thread_name=thread_name,
+    )
+
     state.adapter.open_session(
         session_id,
         sampling_defaults=sampling_params,
         max_context_tokens=state.max_context_len,
     )
+    session_obj = state.adapter.store[session_id]
+    ensure_session_timing(session_obj, tid=tid, events=trace_events)
+
     t0 = time.time()
+    result_samples: list[Sample] | None = None
     try:
         async with asyncio.timeout(CONFIG.rollout_guard_sec):
-            async with boot_agent_sandbox(md["image"], instance_id) as sb:
-                await swe.prepare_workspace(sb, md["workdir"], md)
-                agent_exit_code = await HARNESS_CLS().run(
-                    sb,
-                    workdir=md["workdir"],
-                    session_id=session_id,
-                    adapter_url=state.adapter_url,
-                    time_budget_sec=CONFIG.agent_time_budget_sec,
-                    prompt=swe.SWE_PROMPT,
-                )
-                diff_text = await swe.git_diff(sb, md["workdir"])
+            async with boot_agent_sandbox(md["image"], instance_id, events=trace_events, tid=tid) as sb:
+                with chrome_span(
+                    trace_events,
+                    "prepare_workspace",
+                    cat="outer",
+                    tid=tid,
+                    args={"instance_id": instance_id},
+                ):
+                    await swe.prepare_workspace(sb, md["workdir"], md)
+                with chrome_span(
+                    trace_events,
+                    "agent_run",
+                    cat="outer",
+                    tid=tid,
+                    args={"instance_id": instance_id, "session_id": session_id},
+                ):
+                    agent_exit_code = await HARNESS_CLS().run(
+                        sb,
+                        workdir=md["workdir"],
+                        session_id=session_id,
+                        adapter_url=state.adapter_url,
+                        time_budget_sec=CONFIG.agent_time_budget_sec,
+                        prompt=swe.SWE_PROMPT,
+                    )
+                with chrome_span(
+                    trace_events,
+                    "git_diff",
+                    cat="outer",
+                    tid=tid,
+                    args={"instance_id": instance_id},
+                ):
+                    diff_text = await swe.git_diff(sb, md["workdir"])
                 # Best-effort diagnostics before the sandbox is torn down. Used when
                 # finish_session later returns no turns (adapter_session_empty).
                 diag = ""
@@ -286,11 +377,18 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 except Exception:
                     diag = ""
 
-            reward, applied_cleanly = await swe.run_evaluation(
-                md,
-                diff_text=diff_text,
-                timeout_sec=CONFIG.eval_timeout_sec,
-            )
+            with chrome_span(
+                trace_events,
+                "eval",
+                cat="outer",
+                tid=tid,
+                args={"instance_id": instance_id},
+            ):
+                reward, applied_cleanly = await swe.run_evaluation(
+                    md,
+                    diff_text=diff_text,
+                    timeout_sec=CONFIG.eval_timeout_sec,
+                )
             solved = float(reward)
             empty_patch = not (diff_text or "").strip()
             # Belt-and-suspenders: never train on "solved" with no repo change.
@@ -328,33 +426,45 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 )
             if evaluation:
                 logger.info(
-                    "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs (eval-only)",
+                    "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs "
+                    "timeline_events=%d (eval-only)",
                     instance_id,
                     solved,
                     bool(applied_cleanly),
                     agent_exit_code,
                     time.time() - t0,
+                    len(trace_events),
                 )
-                return _eval_result(
+                result_samples = _eval_result(
                     base_sample,
                     reward=solved,
                     applied_cleanly=bool(applied_cleanly),
                     agent_exit_code=agent_exit_code,
                     instance_id=instance_id,
                 )
+                _attach_timeline(result_samples, timeline)
+                return result_samples
 
-            samples = await state.adapter.finish_session(
-                session_id,
-                base_sample=base_sample,
-                reward=float(train_reward),
-                extra_metadata={
-                    "grading_solved": solved == 1.0,
-                    "instance_id": instance_id,
-                    "solved": solved,
-                    "empty_patch": empty_patch,
-                    "offload_stats": offload_stats,
-                },
-            )
+            with chrome_span(
+                trace_events,
+                "finish_session",
+                cat="outer",
+                tid=tid,
+                args={"instance_id": instance_id, "session_id": session_id},
+            ):
+                samples = await state.adapter.finish_session(
+                    session_id,
+                    base_sample=base_sample,
+                    reward=float(train_reward),
+                    extra_metadata={
+                        "grading_solved": solved == 1.0,
+                        "instance_id": instance_id,
+                        "solved": solved,
+                        "empty_patch": empty_patch,
+                        "offload_stats": offload_stats,
+                        "timeline": timeline,
+                    },
+                )
             if not samples:
                 logger.warning(
                     "[coding_agent_rl] %s: adapter_session_empty "
@@ -364,10 +474,12 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     state.adapter_url,
                     (diag or "<empty>")[:1500],
                 )
-                return _abort_result(base_sample, "adapter_session_empty", instance_id)
+                result_samples = _abort_result(base_sample, "adapter_session_empty", instance_id)
+                _attach_timeline(result_samples, timeline)
+                return result_samples
 
             for s in samples:
-                s.metadata = {**(s.metadata or {}), "agent_exit_code": agent_exit_code}
+                s.metadata = {**(s.metadata or {}), "agent_exit_code": agent_exit_code, "timeline": timeline}
             if agent_exit_code != 0:
                 reason = "time budget exceeded" if agent_exit_code < 0 else f"CLI error (exit {agent_exit_code})"
                 logger.warning(
@@ -377,19 +489,24 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     reason,
                 )
             logger.info(
-                "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs segments=%d",
+                "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs "
+                "segments=%d timeline_events=%d",
                 instance_id,
                 float(train_reward),
                 bool(applied_cleanly),
                 agent_exit_code,
                 time.time() - t0,
                 len(samples),
+                len(trace_events),
             )
-            return samples
+            result_samples = samples
+            return result_samples
 
     except asyncio.TimeoutError:
         _log_timeout_diagnostic(t0, instance_id)
-        return _abort_result(base_sample, "wall_clock_timeout", instance_id)
+        result_samples = _abort_result(base_sample, "wall_clock_timeout", instance_id)
+        _attach_timeline(result_samples, timeline)
+        return result_samples
     except Exception as e:
         logger.warning(
             "[coding_agent_rl] %s: rollout failed: %s\n%s",
@@ -397,10 +514,21 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             e,
             traceback.format_exc(),
         )
-        return _abort_result(base_sample, f"exception:{type(e).__name__}", instance_id)
+        result_samples = _abort_result(base_sample, f"exception:{type(e).__name__}", instance_id)
+        _attach_timeline(result_samples, timeline)
+        return result_samples
     finally:
         await state.adapter.drop_session(session_id, wait_timeout=30)  # cleanup only, idempotent
-        await asyncio.sleep(10)
+        with chrome_span(
+            trace_events,
+            "cleanup_sleep",
+            cat="outer",
+            tid=tid,
+            args={"instance_id": instance_id},
+        ):
+            await asyncio.sleep(10)
+        if result_samples is not None:
+            _attach_timeline(result_samples, timeline)
 
 
 def _log_timeout_diagnostic(t0: float, instance_id: str) -> None:

@@ -433,6 +433,8 @@ class DockerSandbox:
       * ``SLIME_AGENT_DOCKER_ADD_HOST`` (default ``host.docker.internal:host-gateway``)
       * ``SLIME_AGENT_DOCKER_PULL`` (``1``/``true`` to pull before run)
       * ``SLIME_AGENT_DOCKER_RUN_TIMEOUT_SEC`` (default ``300``)
+      * ``SLIME_AGENT_DOCKER_NAME_PREFIX`` (default ``slime-sb``; container name
+        is ``{prefix}-{12-hex}``, trailing ``-`` on the prefix is optional)
     """
 
     image_metadata_key_env = E2BSandbox.image_metadata_key_env
@@ -444,6 +446,7 @@ class DockerSandbox:
         self.timeout = int(timeout if timeout is not None else (_getenv(*self.lifetime_sec_env) or self.default_lifetime_sec))
         self.network = (_getenv("SLIME_AGENT_DOCKER_NETWORK", default="bridge") or "bridge").lower()
         self.pull = (_getenv("SLIME_AGENT_DOCKER_PULL", default="") or "").lower() in ("1", "true", "yes")
+        self.name_prefix = (_getenv("SLIME_AGENT_DOCKER_NAME_PREFIX", default="slime-sb") or "slime-sb").rstrip("-")
         self.remove = True
         self.sandbox_id = ""
         self._container = ""
@@ -451,7 +454,7 @@ class DockerSandbox:
     async def __aenter__(self) -> DockerSandbox:
         import uuid
 
-        name = f"slime-sb-{uuid.uuid4().hex[:12]}"
+        name = f"{self.name_prefix}-{uuid.uuid4().hex[:12]}"
         if self.pull:
             await self._run_host(["docker", "pull", self.image], timeout=600, check=True)
 

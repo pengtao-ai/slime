@@ -8,7 +8,8 @@
 #
 # Default GPU split on 8 devices: 6 train + 2 rollout.
 # SWE agents are usually sandbox-bound; actor_train dominated wall clock at 4+4 / GBS=128.
-# Long trajectories need large CP: with ACTOR_GPUS=6 default TP=1 → CP=6.
+# Parallelism: DP = ACTOR_GPUS / (TP * PP * CP). Unset CP → max CP / DP=1.
+# Docker wrapper defaults: CP=2 → DP=3 with ACTOR_GPUS=6.
 #
 # Run from a long-lived shell / tmux:
 #   bash examples/coding_agent_rl/run_qwen35_4b_swe_1node_docker_async.sh
@@ -40,15 +41,19 @@ if (( ACTOR_GPUS < 1 || ROLLOUT_GPUS < 1 )); then
   exit 1
 fi
 
-# Train parallelism must fit on ACTOR_GPUS (TP * PP * CP == ACTOR_GPUS for 1 DP).
-# Prefer CP for long agent trajectories (override TP_SIZE=2 if you shorten context).
+# Train parallelism: TP * PP * CP must divide ACTOR_GPUS; remainder is DP.
+# Prefer larger CP for long agent trajectories; set CP_SIZE=2 for DP=3 on 6 GPUs.
 export TP_SIZE="${TP_SIZE:-1}"
 export PP_SIZE="${PP_SIZE:-1}"
 export CP_SIZE="${CP_SIZE:-$((ACTOR_GPUS / TP_SIZE / PP_SIZE))}"
-if (( TP_SIZE * PP_SIZE * CP_SIZE != ACTOR_GPUS )); then
-  echo "ERROR: TP(${TP_SIZE})*PP(${PP_SIZE})*CP(${CP_SIZE}) != ACTOR_GPUS(${ACTOR_GPUS})" >&2
+_MODEL_PARALLEL=$((TP_SIZE * PP_SIZE * CP_SIZE))
+if (( _MODEL_PARALLEL < 1 || ACTOR_GPUS % _MODEL_PARALLEL != 0 )); then
+  echo "ERROR: ACTOR_GPUS(${ACTOR_GPUS}) must be divisible by TP(${TP_SIZE})*PP(${PP_SIZE})*CP(${CP_SIZE})=${_MODEL_PARALLEL}" >&2
   exit 1
 fi
+DP_SIZE=$((ACTOR_GPUS / _MODEL_PARALLEL))
+# Qwen3.5/Next GDN kernel: fla (default) or flashqla (SM90+).
+export QWEN_GDN_BACKEND="${QWEN_GDN_BACKEND:-fla}"
 
 # ============ rollout engine ============
 ROLLOUT_TP_SIZE="${ROLLOUT_TP_SIZE:-1}"
@@ -59,12 +64,12 @@ if (( ROLLOUT_GPUS % ROLLOUT_TP_SIZE != 0 )); then
 fi
 
 # ============ context length ============
-MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-96000}"
-MAX_GEN_LEN="${MAX_GEN_LEN:-32768}"
+MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-100000}"
+MAX_GEN_LEN="${MAX_GEN_LEN:-100000}"
 # Per-GPU token budget after CP split. Sync uses MAX/4 with CP=4.
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-$((MAX_CONTEXT_LEN / CP_SIZE))}"
-# Megatron asserts seq_length % (2 * CP) == 0. The slime default 4096 fails for CP=6
-# (4096 % 12 != 0). Align to max context (96000 % 12 == 0).
+# Megatron asserts seq_length % (2 * CP) == 0. Align up when needed
+# (e.g. CP=6 → 100000 % 12 != 0 → 200004).
 SEQ_LENGTH="${SEQ_LENGTH:-${MAX_CONTEXT_LEN}}"
 if (( CP_SIZE > 1 )); then
   _cp_align=$((CP_SIZE * 2))
@@ -103,16 +108,21 @@ ROLLOUT_STOP_TOKEN_IDS="${ROLLOUT_STOP_TOKEN_IDS:-248046 248044}"
 
 # ============ logging ============
 LOG_DIR="${RUN_ROOT}"
-mkdir -p "${LOG_DIR}/rollout_dumps" "${SAVE_DIR}"
+mkdir -p "${LOG_DIR}/rollout_dumps" "${LOG_DIR}/timelines" "${SAVE_DIR}"
 LOG_FILE="${LOG_DIR}/run.log"
 echo "======================================================================"
 echo "Async training log: ${LOG_FILE}"
 echo "RUN_ROOT=${RUN_ROOT}"
 echo "SAVE_DIR=${SAVE_DIR}  SAVE_INTERVAL=${SAVE_INTERVAL}"
-echo "ACTOR_GPUS=${ACTOR_GPUS} ROLLOUT_GPUS=${ROLLOUT_GPUS} (TP=${TP_SIZE} CP=${CP_SIZE} seq=${SEQ_LENGTH} max_tokens/gpu=${MAX_TOKENS_PER_GPU})"
+echo "ACTOR_GPUS=${ACTOR_GPUS} ROLLOUT_GPUS=${ROLLOUT_GPUS} (TP=${TP_SIZE} PP=${PP_SIZE} CP=${CP_SIZE} DP=${DP_SIZE} seq=${SEQ_LENGTH} max_tokens/gpu=${MAX_TOKENS_PER_GPU})"
 echo "ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE} N_SAMPLES=${N_SAMPLES_PER_PROMPT} GLOBAL_BATCH=${GLOBAL_BATCH_SIZE}"
-echo "SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS=${SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS:-8192}"
+echo "QWEN_GDN_BACKEND=${QWEN_GDN_BACKEND}"
+echo "SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS=${SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS:-100000}"
 echo "======================================================================"
+if (( GLOBAL_BATCH_SIZE % DP_SIZE != 0 )); then
+  echo "ERROR: GLOBAL_BATCH_SIZE(${GLOBAL_BATCH_SIZE}) must be divisible by DP(${DP_SIZE})" >&2
+  exit 1
+fi
 
 CKPT_ARGS=(
    --hf-checkpoint "${HF_CHECKPOINT}"
@@ -123,6 +133,7 @@ CKPT_ARGS=(
 
 ROLLOUT_ARGS=(
    --custom-generate-function-path examples.coding_agent_rl.generate.generate
+   --custom-rollout-log-function-path examples.coding_agent_rl.log_rollout_timeline.log_rollout_timeline
    --prompt-data "${PROMPT_DATA}"
    --input-key prompt
    --label-key label
@@ -153,6 +164,7 @@ PERF_ARGS=(
    --max-tokens-per-gpu ${MAX_TOKENS_PER_GPU}
    --log-probs-chunk-size 1024
    --use-dynamic-batch-size
+   --qwen-gdn-backend ${QWEN_GDN_BACKEND}
 )
 # Megatron sequence-parallel requires TP>1.
 if (( TP_SIZE > 1 )); then
@@ -184,7 +196,12 @@ SGLANG_ARGS=(
    --sglang-mem-fraction-static ${ROLLOUT_MEM_UTILIZATION}
    --sglang-tool-call-parser qwen3_coder
    --sglang-reasoning-parser qwen3
+   --sglang-cuda-graph-max-bs 64
 )
+# Optional FP8 KV cache for long agent contexts (rollout only; does not affect Megatron BF16).
+if [[ -n "${SGLANG_KV_CACHE_DTYPE:-}" ]]; then
+  SGLANG_ARGS+=(--sglang-kv-cache-dtype "${SGLANG_KV_CACHE_DTYPE}")
+fi
 
 # No --colocate: train_async.py asserts against it.
 MISC_ARGS=(
@@ -219,9 +236,9 @@ export SWE_AGENT_TIME_BUDGET_SEC="${SWE_AGENT_TIME_BUDGET_SEC:-900}"
 export SWE_EVAL_TIMEOUT_SEC="${SWE_EVAL_TIMEOUT_SEC:-300}"
 export SWE_BOOT_CONCURRENCY
 # Higher = fewer TOKEN_FORK segments (more REALIGN / rewrite-merge); default was 1024.
-export SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS="${SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS:-8192}"
+export SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS="${SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS:-100000}"
 
-SETTINGS_JSON='{"permissions":{"defaultMode":"bypassPermissions"},"autoCompactEnabled":true,"autoCompactWindow":80000}'
+SETTINGS_JSON='{"permissions":{"defaultMode":"bypassPermissions"},"autoCompactEnabled":true,"autoCompactWindow":100000}'
 AGENTS_JSON='{"investigator":{"description":"Searches the repo for relevant files before any edit","prompt":"You are an investigator sub-agent. Use Grep/Read/Glob to find every file relevant to the user task, then return a short bulleted summary. Do NOT edit anything.","tools":["Grep","Read","Glob"]}}'
 export SLIME_AGENT_CC_EXTRA_ARGS="--settings '${SETTINGS_JSON}' --disable-slash-commands --agents '${AGENTS_JSON}' --disallowedTools WebFetch WebSearch"
 if [[ -z "${SLIME_AGENT_CC_EXTRA_ENVS:-}" ]]; then
