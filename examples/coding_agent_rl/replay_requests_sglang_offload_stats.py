@@ -116,9 +116,9 @@ def _call_one(
         "no_stop_trim": no_stop_trim,
         "skip_special_tokens": skip_special_tokens,
     }
-    tools = payload.get("tools")
-    if tools:
-        body["tools"] = tools
+    # tools = payload.get("tools")
+    # if tools:
+    #     body["tools"] = tools
     t0 = time.monotonic()
     err = None
     data: dict[str, Any] | None = None
