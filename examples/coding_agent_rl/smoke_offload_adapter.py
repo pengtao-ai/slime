@@ -159,8 +159,8 @@ async def _run() -> None:
                 assert offload.CODING_HANDOFF_PROMPT in glm_msgs[0]["content"]
                 # SLM-only append must not leak into the GLM system prompt.
                 assert offload.OFFLOAD_SYSTEM_PROMPT_APPEND not in glm_msgs[0]["content"]
-                assert all(offload.OFFLOAD_OPEN not in m.get("content", "") for m in glm_msgs)
-                assert any("<part_think>" in m.get("content", "") for m in glm_msgs)
+                assert all(offload.OFFLOAD_OPEN not in (m.get("content") or "") for m in glm_msgs)
+                assert any("<part_think>" in (m.get("content") or "") for m in glm_msgs)
                 # budget = OFFLOAD_MAX_TOKENS - len(SLM output ids)
                 assert glm.requests[0]["max_tokens"] == 100 - len(TURN1_IDS)
                 assert glm.requests[0].get("reasoning_effort") == "max"  # N=7

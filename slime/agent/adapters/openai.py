@@ -104,14 +104,15 @@ def _translate_messages(messages: list[dict]) -> list[dict]:
 
     Mirrors anthropic._translate_messages so a replayed assistant turn compares
     equal (dict equality) to the leaf the manager appended on the previous
-    request. Two invariants must hold:
+    request:
 
       * tool_calls[i].function.arguments is a dict (not a JSON string): the chat
         template needs a mapping, and the manager matches history by dict
         equality regardless of key order.
-      * Wire-only correlation ids are dropped (tool_call_id on tool messages,
-        tool_calls[i].id on echoed assistant messages). Fresh ids are minted on
-        each response, so keeping the wire ids would diverge the replay match.
+      * Manager-emitted leaves still omit wire ids (see ``tool_call_dict``).
+        History from the client may carry ``tool_calls[i].id`` /
+        ``tool_call_id``; those are kept so mid-turn offload can rebuild a
+        standard OpenAI tool-protocol payload for the remote GLM.
     """
     translated: list[dict] = []
     for msg in messages:
@@ -125,8 +126,13 @@ def _translate_messages(messages: list[dict]) -> list[dict]:
         if role in {"system", "user"}:
             translated.append({"role": role, "content": flatten_content(content)})
         elif role == "tool":
-            # drop tool_call_id -- wire-only correlation field; see docstring
-            translated.append({"role": "tool", "content": flatten_content(content)})
+            tool_msg: dict[str, Any] = {"role": "tool", "content": flatten_content(content)}
+            # Keep wire id for OpenAI-protocol offload; templates ignore unknown fields.
+            # Manager reply leaves still omit ids (see tool_call_dict).
+            tool_call_id = msg.get("tool_call_id")
+            if tool_call_id:
+                tool_msg["tool_call_id"] = tool_call_id
+            translated.append(tool_msg)
         elif role == "assistant":
             assistant: dict[str, Any] = {
                 "role": "assistant",
@@ -145,17 +151,18 @@ def _translate_messages(messages: list[dict]) -> list[dict]:
                 arguments = function.get("arguments")
                 if arguments is None:
                     arguments = call.get("arguments", {})
-                # NB: arguments stays a dict (not a JSON string), and the
-                # wire-only id is dropped. See docstring above.
-                normalized.append(
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": _arguments_as_dict(arguments),
-                        },
-                    }
-                )
+                # arguments stays a dict for chat-template / manager match.
+                # Preserve wire id when present for offload OpenAI tool protocol.
+                entry: dict[str, Any] = {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": _arguments_as_dict(arguments),
+                    },
+                }
+                if call.get("id"):
+                    entry["id"] = call["id"]
+                normalized.append(entry)
             if normalized:
                 assistant["tool_calls"] = normalized
             translated.append(assistant)

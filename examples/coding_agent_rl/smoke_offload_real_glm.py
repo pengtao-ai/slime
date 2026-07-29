@@ -127,7 +127,7 @@ async def main() -> None:
         )
     )
 
-    content, think, usage = await offload.call_remote_chat(
+    content, think, usage, _tool_calls = await offload.call_remote_chat(
         messages,
         max_tokens=glm_budget,
         enable_thinking=enable_thinking,

@@ -13,10 +13,16 @@ Per agent round (every Claude Code / Codex request):
 System-prompt contract:
   - SLM: Claude Code's full system (incl. ``gitStatus``) + ``OFFLOAD_SYSTEM_PROMPT_APPEND``
     injected by the coding adapter on each request
-  - GLM: agent system + ``CODING_HANDOFF_PROMPT``
-    (``OFFLOAD_SYSTEM_PROMPT_APPEND`` is stripped if present)
+  - GLM: agent system + ``CODING_HANDOFF_PROMPT`` in OpenAI chat.completions form
+    (``OFFLOAD_SYSTEM_PROMPT_APPEND`` is stripped if present; history keeps
+    structured ``tool_calls`` / ``role: tool`` + ``tool_call_id``; the agent's
+    ``tools`` schema is forwarded as a top-level ``tools`` field, same split as
+    Claude Code → slime)
 
-Only local-model ``output_ids`` are trained; GLM tokens are never loss-masked in.
+Only local-model ``output_ids`` are trained by default. After a successful GLM
+call, the continuation may be tokenized and appended to ``turn.output_ids``
+with ``output_loss_mask=0`` so rollout dumps contain the full assistant turn
+without contributing to the policy loss (``SLIME_OFFLOAD_EMBED_IN_TRAJECTORY``).
 
 Enable with ``SLIME_AGENT_OFFLOAD=1`` (see ``generate.py`` Offload* adapters).
 """
@@ -28,11 +34,12 @@ import json
 import logging
 import os
 import re
+import secrets
 from typing import Any
 
 import requests
 
-from slime.agent.adapters.common import Reply, Session, flatten_content
+from slime.agent.adapters.common import Reply, Session, flatten_content, tool_call_dict
 from slime.agent.trajectory import TurnRecord
 
 logger = logging.getLogger(__name__)
@@ -53,8 +60,8 @@ COST_GLM_INPUT = float(os.environ.get("OFFLOAD_COST_GLM_INPUT", "0.315"))
 COST_GLM_OUTPUT = float(os.environ.get("OFFLOAD_COST_GLM_OUTPUT", "1.0"))
 
 # Fallback baseline when dataset metadata has no ``usage`` (GLM-only tokens).
-_DEFAULT_BASELINE_PROMPT_TOKENS = int(os.environ.get("OFFLOAD_BASELINE_PROMPT_TOKENS", "2000"))
-_DEFAULT_BASELINE_COMPLETION_TOKENS = int(os.environ.get("OFFLOAD_BASELINE_COMPLETION_TOKENS", "8000"))
+_DEFAULT_BASELINE_PROMPT_TOKENS = int(os.environ.get("OFFLOAD_BASELINE_PROMPT_TOKENS", "1093525"))
+_DEFAULT_BASELINE_COMPLETION_TOKENS = int(os.environ.get("OFFLOAD_BASELINE_COMPLETION_TOKENS", "15207"))
 
 # Appended after the black-box agent's system text when calling remote GLM.
 CODING_HANDOFF_PROMPT = (
@@ -78,14 +85,17 @@ CODING_HANDOFF_PROMPT = (
 OFFLOAD_SYSTEM_PROMPT_APPEND = (
     "For very difficult steps, you can output "
     f"{OFFLOAD_OPEN}N{OFFLOAD_CLOSE} where N is 0-9 indicating the thinking "
-    "level for a more capable model. Emit the span inside your thinking "
-    "(before </think>), not in the visible reply or tool calls."
+    "level for a more capable model."
 )
 # Back-compat alias.
 DEFAULT_OFFLOAD_SWE_PROMPT = OFFLOAD_SYSTEM_PROMPT_APPEND
 
 # Train reward: subtract this once if any offload span appeared outside <think>.
 DEFAULT_OFFLOAD_THINK_FORMAT_PENALTY = 0.25
+# help_seeking_reward: partial credit when unsolved but the SLM asked for help in-think.
+DEFAULT_OFFLOAD_SEEK_ALPHA = 0.1
+DEFAULT_OFFLOAD_SEEK_EMPTY_SCALE = 0.5
+DEFAULT_OFFLOAD_UNIQUE_SOLVER_BONUS = 0.15
 
 
 def offload_system_append_text() -> str:
@@ -155,6 +165,26 @@ def efficiency_lambda() -> float:
 
 def think_format_penalty() -> float:
     return float(os.environ.get("OFFLOAD_THINK_FORMAT_PENALTY", str(DEFAULT_OFFLOAD_THINK_FORMAT_PENALTY)))
+
+
+def reward_mode() -> str:
+    """``cost_aware`` (default) or ``help_seeking`` — see :func:`help_seeking_reward`."""
+    mode = (os.environ.get("OFFLOAD_REWARD_MODE") or "cost_aware").strip().lower()
+    if mode in ("help_seeking", "help-seeking", "seek"):
+        return "help_seeking"
+    return "cost_aware"
+
+
+def seek_alpha() -> float:
+    return float(os.environ.get("OFFLOAD_SEEK_ALPHA", str(DEFAULT_OFFLOAD_SEEK_ALPHA)))
+
+
+def seek_empty_scale() -> float:
+    return float(os.environ.get("OFFLOAD_SEEK_EMPTY_SCALE", str(DEFAULT_OFFLOAD_SEEK_EMPTY_SCALE)))
+
+
+def unique_solver_bonus() -> float:
+    return float(os.environ.get("OFFLOAD_UNIQUE_SOLVER_BONUS", str(DEFAULT_OFFLOAD_UNIQUE_SOLVER_BONUS)))
 
 
 def _api_key() -> str:
@@ -267,7 +297,7 @@ def _record_glm_usage(
     stats: dict[str, Any],
     usage: dict[str, Any] | None,
     *,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     content: str,
     think: str,
 ) -> None:
@@ -275,7 +305,14 @@ def _record_glm_usage(
         inp = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
         out = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
     else:
-        inp = _estimate_tokens("\n".join(m.get("content", "") for m in messages))
+        chunks: list[str] = []
+        for m in messages:
+            c = m.get("content")
+            if isinstance(c, str) and c:
+                chunks.append(c)
+            for tc in m.get("tool_calls") or []:
+                chunks.append(json.dumps(tc, ensure_ascii=False))
+        inp = _estimate_tokens("\n".join(chunks))
         out = _estimate_tokens(f"{think}{content}")
         logger.warning(
             "[coding_agent_offload] remote usage missing; estimated glm_in=%d glm_out=%d",
@@ -297,21 +334,55 @@ def _offload_prefix(raw: str) -> str:
     return _strip_offload_tag_from_text(prefix).strip()
 
 
-def _message_text(msg: dict[str, Any]) -> str:
+def _assistant_content_for_openai(msg: dict[str, Any]) -> str:
+    """Visible assistant text for GLM: optional ``<think>`` + content (no tool_calls)."""
     parts: list[str] = []
     reasoning = msg.get("reasoning_content")
-    if reasoning:
-        parts.append(f"<think>{reasoning}</think>")
+    if isinstance(reasoning, str) and reasoning.strip():
+        parts.append(f"<think>\n{reasoning.strip()}\n</think>")
     content = flatten_content(msg.get("content"))
     if content:
         parts.append(content)
-    tool_calls = msg.get("tool_calls")
-    if tool_calls:
-        parts.append(f"[tool_calls] {json.dumps(tool_calls, ensure_ascii=False)}")
-    name = msg.get("name")
-    if name and msg.get("role") == "tool":
-        parts.insert(0, f"[tool:{name}]")
-    return "\n".join(parts).strip()
+    return _strip_offload_tag_from_text("\n\n".join(parts)).strip()
+
+
+def _arguments_as_openai_json(arguments: Any) -> str:
+    """OpenAI chat.completions expects ``function.arguments`` as a JSON string."""
+    if isinstance(arguments, str):
+        return arguments
+    try:
+        return json.dumps(arguments if arguments is not None else {}, ensure_ascii=False)
+    except TypeError:
+        return json.dumps({"_raw": str(arguments)}, ensure_ascii=False)
+
+
+def _normalize_openai_tool_calls(
+    tool_calls: list[Any] | None,
+    *,
+    id_prefix: str,
+) -> list[dict[str, Any]]:
+    """Translate adapter ``tool_calls`` into OpenAI wire shape (with ids)."""
+    out: list[dict[str, Any]] = []
+    for i, call in enumerate(tool_calls or []):
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function") if isinstance(call.get("function"), dict) else {}
+        name = function.get("name") or call.get("name") or "tool"
+        arguments = function.get("arguments")
+        if arguments is None:
+            arguments = call.get("arguments", {})
+        call_id = call.get("id") or f"{id_prefix}-{i}"
+        out.append(
+            {
+                "id": str(call_id),
+                "type": "function",
+                "function": {
+                    "name": str(name),
+                    "arguments": _arguments_as_openai_json(arguments),
+                },
+            }
+        )
+    return out
 
 
 def _offload_system_append_variants() -> list[str]:
@@ -340,8 +411,12 @@ def strip_offload_system_append(text: str) -> str:
     return out
 
 
-def build_offload_messages(translated: list[dict], raw_output: str) -> list[dict[str, str]]:
-    """Build GLM chat messages: cleaned agent system + handoff, history, part_think.
+def build_offload_messages(translated: list[dict], raw_output: str) -> list[dict[str, Any]]:
+    """Build GLM chat messages in OpenAI ``chat.completions`` tool protocol.
+
+    Emits ``system`` / ``user`` / ``assistant`` (+ structured ``tool_calls``) /
+    ``tool`` (+ ``tool_call_id``), then a final ``assistant`` ``<part_think>``
+    handoff turn.
 
     Removes SLM-only bits that must not reach GLM:
       - ``OFFLOAD_SYSTEM_PROMPT_APPEND`` from system text
@@ -349,30 +424,67 @@ def build_offload_messages(translated: list[dict], raw_output: str) -> list[dict
     Those markers are kept on the CC reply path (see ``compose_complete_assistant``).
     """
     agent_system_parts: list[str] = []
-    rest: list[dict[str, str]] = []
+    rest: list[dict[str, Any]] = []
+    pending_tool_ids: list[str] = []
+    synth_i = 0
+
     for msg in translated:
         role = str(msg.get("role") or "user")
-        text = _message_text(msg)
-        if not text:
-            continue
         if role == "system":
-            cleaned_system = strip_offload_system_append(text)
+            text = flatten_content(msg.get("content"))
+            cleaned_system = strip_offload_system_append(text) if text else ""
             if cleaned_system:
                 agent_system_parts.append(cleaned_system)
             continue
-        # History may re-echo prior composed replies that still contain offload tags.
-        text = _strip_offload_tag_from_text(text)
-        if not text:
+
+        if role == "user":
+            text = _strip_offload_tag_from_text(flatten_content(msg.get("content")))
+            if text:
+                rest.append({"role": "user", "content": text})
             continue
+
+        if role == "assistant":
+            content = _assistant_content_for_openai(msg)
+            tool_calls = _normalize_openai_tool_calls(
+                msg.get("tool_calls"),
+                id_prefix=f"chatcmpl-tool-offload{synth_i}",
+            )
+            synth_i += 1
+            if not content and not tool_calls:
+                continue
+            out_msg: dict[str, Any] = {"role": "assistant", "content": content or None}
+            if tool_calls:
+                out_msg["tool_calls"] = tool_calls
+                pending_tool_ids = [tc["id"] for tc in tool_calls]
+            else:
+                pending_tool_ids = []
+            rest.append(out_msg)
+            continue
+
         if role == "tool":
-            rest.append({"role": "user", "content": text})
-        elif role in ("user", "assistant"):
-            rest.append({"role": role, "content": text})
-        else:
+            text = _strip_offload_tag_from_text(flatten_content(msg.get("content")))
+            tool_call_id = msg.get("tool_call_id") or msg.get("tool_use_id")
+            if not tool_call_id and pending_tool_ids:
+                tool_call_id = pending_tool_ids.pop(0)
+            if not tool_call_id:
+                tool_call_id = f"chatcmpl-tool-orphan-{synth_i}"
+                synth_i += 1
+            rest.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": str(tool_call_id),
+                    "content": text if text else "",
+                }
+            )
+            continue
+
+        # Unknown roles -> user text fallback.
+        text = _strip_offload_tag_from_text(flatten_content(msg.get("content")))
+        if text:
             rest.append({"role": "user", "content": text})
 
     system = "\n\n".join([*agent_system_parts, CODING_HANDOFF_PROMPT]).strip()
-    messages: list[dict[str, str]] = [{"role": "system", "content": system}]
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
     messages.extend(rest)
 
     # Prefix only (no offload span) -> <part_think>; never send the tag to GLM.
@@ -383,19 +495,116 @@ def build_offload_messages(translated: list[dict], raw_output: str) -> list[dict
     return messages
 
 
+def _normalize_openai_tools(tools_schema: list[dict] | None) -> list[dict[str, Any]] | None:
+    """Pass-through / light-normalize chat-template tools into OpenAI ``tools``."""
+    if not tools_schema:
+        return None
+    out: list[dict[str, Any]] = []
+    for tool in tools_schema:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else None
+        if function is not None:
+            name = function.get("name")
+            if not name:
+                continue
+            out.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": function.get("description", ""),
+                        "parameters": function.get("parameters")
+                        or {"type": "object", "properties": {}},
+                    },
+                }
+            )
+            continue
+        name = tool.get("name")
+        if not name:
+            continue
+        out.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("input_schema")
+                    or tool.get("parameters")
+                    or {"type": "object", "properties": {}},
+                },
+            }
+        )
+    return out or None
+
+
+def _parse_openai_tool_calls(raw_tool_calls: Any) -> list[dict[str, Any]]:
+    """Normalize ``message.tool_calls`` from a chat.completions response."""
+    if not isinstance(raw_tool_calls, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for i, call in enumerate(raw_tool_calls):
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function") if isinstance(call.get("function"), dict) else {}
+        name = function.get("name") or call.get("name")
+        if not name:
+            continue
+        arguments = function.get("arguments")
+        if arguments is None:
+            arguments = call.get("arguments", {})
+        out.append(
+            {
+                "id": str(call.get("id") or f"chatcmpl-tool-glm-{i}"),
+                "type": "function",
+                "function": {
+                    "name": str(name),
+                    "arguments": _arguments_as_openai_json(arguments),
+                },
+            }
+        )
+    return out
+
+
+def _openai_tool_calls_to_anthropic_blocks(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = []
+    for tc in tool_calls:
+        function = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+        args_raw = function.get("arguments")
+        if isinstance(args_raw, str):
+            try:
+                args_obj = json.loads(args_raw)
+            except json.JSONDecodeError:
+                args_obj = {"_raw": args_raw}
+        elif isinstance(args_raw, dict):
+            args_obj = args_raw
+        else:
+            args_obj = {}
+        blocks.append(
+            {
+                "type": "tool_use",
+                "id": str(tc.get("id") or f"toolu_{secrets.token_hex(8)}"),
+                "name": str(function.get("name") or "tool"),
+                "input": args_obj,
+            }
+        )
+    return blocks
+
+
 def _call_remote_chat_sync(
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     *,
     max_tokens: int,
     enable_thinking: bool,
     reasoning_effort: str | None,
+    tools: list[dict[str, Any]] | None = None,
     timeout: float = 600.0,
-) -> tuple[str, str, dict[str, Any] | None]:
+) -> tuple[str, str, dict[str, Any] | None, list[dict[str, Any]]]:
     api_key = _api_key()
     if not api_key:
-        return "[Error: DASHSCOPE_API_KEY not set]", "", None
+        return "[Error: DASHSCOPE_API_KEY not set]", "", None, []
     if max_tokens <= 0:
-        return "[Error: no remaining offload token budget]", "", None
+        return "[Error: no remaining offload token budget]", "", None, []
 
     url = f"{_base_url()}/chat/completions"
     headers = {
@@ -414,35 +623,43 @@ def _call_remote_chat_sync(
     if enable_thinking and reasoning_effort:
         # Some OpenAI-compatible gateways read this at the top level.
         body["reasoning_effort"] = reasoning_effort
+    openai_tools = _normalize_openai_tools(tools)
+    if openai_tools:
+        # Same split as Claude Code → slime: tools schema is request-level, not
+        # only baked into system text.
+        body["tools"] = openai_tools
     try:
         response = requests.post(url, headers=headers, json=body, timeout=timeout)
         if response.status_code != 200:
-            return f"[Error: status {response.status_code}: {response.text[:400]}]", "", None
+            return f"[Error: status {response.status_code}: {response.text[:400]}]", "", None, []
         data = response.json()
         message = data["choices"][0].get("message", {})
         think = str(message.get("reasoning") or message.get("reasoning_content") or "")
         content = str(message.get("content") or "")
+        tool_calls = _parse_openai_tool_calls(message.get("tool_calls"))
         usage = data.get("usage")
         if usage is not None and not isinstance(usage, dict):
             usage = None
-        return content, think, usage
+        return content, think, usage, tool_calls
     except Exception as exc:
-        return f"[Error: remote call failed: {exc}]", "", None
+        return f"[Error: remote call failed: {exc}]", "", None, []
 
 
 async def call_remote_chat(
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     *,
     max_tokens: int,
     enable_thinking: bool,
     reasoning_effort: str | None,
-) -> tuple[str, str, dict[str, Any] | None]:
+    tools: list[dict[str, Any]] | None = None,
+) -> tuple[str, str, dict[str, Any] | None, list[dict[str, Any]]]:
     return await asyncio.to_thread(
         _call_remote_chat_sync,
         messages,
         max_tokens=max_tokens,
         enable_thinking=enable_thinking,
         reasoning_effort=reasoning_effort,
+        tools=tools,
     )
 
 
@@ -472,11 +689,119 @@ def compose_complete_assistant(
     return text, think
 
 
-def amend_reply_with_offload(reply: Reply, *, raw_output: str, glm_content: str, glm_think: str) -> Reply:
+def embed_offload_in_trajectory_enabled() -> bool:
+    """Whether to append GLM tokens into ``turn.output_ids`` with loss_mask=0."""
+    return (os.environ.get("SLIME_OFFLOAD_EMBED_IN_TRAJECTORY") or "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _embed_max_tokens() -> int | None:
+    raw = (os.environ.get("SLIME_OFFLOAD_EMBED_MAX_TOKENS") or "").strip()
+    if not raw or raw == "0":
+        return None
+    try:
+        n = int(raw)
+    except ValueError:
+        return None
+    return n if n > 0 else None
+
+
+def build_glm_trajectory_suffix(*, raw_output: str, glm_content: str, glm_think: str) -> str:
+    """Text to tokenize after SLM ``output_ids`` so the dump mirrors the agent turn.
+
+    SLM generation usually stops at ``<|/llm_offload|>`` mid-think (no ``</think>``).
+    Agent-facing compose uses ``think = raw_output + glm_think`` and
+    ``content = glm_content``. We append the GLM pieces plus a closing think tag
+    when needed so decoded trajectories stay readable.
+    """
+    parts: list[str] = []
+    if glm_think:
+        parts.append(glm_think)
+    if "</think>" not in raw_output:
+        parts.append("\n</think>\n")
+    if glm_content:
+        parts.append(glm_content if not parts else f"\n{glm_content}")
+    return "".join(parts)
+
+
+def append_glm_tokens_to_turn(
+    turn: TurnRecord,
+    *,
+    tokenizer: Any,
+    raw_output: str,
+    glm_content: str,
+    glm_think: str,
+) -> None:
+    """Extend ``turn.output_ids`` with tokenized GLM text; mark those tokens mask=0.
+
+    Mutates the turn's list fields in place (``TurnRecord`` is frozen but lists
+    are mutable). SLM tokens keep loss_mask=1; GLM suffix is loss_mask=0.
+    """
+    if not embed_offload_in_trajectory_enabled():
+        return
+    if tokenizer is None:
+        logger.warning("[coding_agent_offload] tokenizer missing; skip GLM trajectory embed")
+        return
+    suffix = build_glm_trajectory_suffix(
+        raw_output=raw_output, glm_content=glm_content, glm_think=glm_think
+    )
+    if not suffix:
+        return
+    try:
+        glm_ids = list(tokenizer.encode(suffix, add_special_tokens=False))
+    except Exception:
+        logger.exception("[coding_agent_offload] failed to tokenize GLM suffix; skip embed")
+        return
+    max_toks = _embed_max_tokens()
+    if max_toks is not None and len(glm_ids) > max_toks:
+        glm_ids = glm_ids[:max_toks]
+    if not glm_ids:
+        return
+
+    slm_n = len(turn.output_ids or [])
+    mask = turn.output_loss_mask
+    if not mask:
+        mask.extend([1] * slm_n)
+    elif len(mask) != slm_n:
+        raise ValueError(
+            f"output_loss_mask length {len(mask)} != output_ids length {slm_n} before GLM embed"
+        )
+
+    # Keep logprobs aligned when present; pad with 0.0 for the GLM suffix.
+    lps = turn.output_log_probs
+    if lps:
+        if len(lps) < slm_n:
+            lps.extend([0.0] * (slm_n - len(lps)))
+        elif len(lps) > slm_n:
+            del lps[slm_n:]
+    else:
+        # No SLM logprobs recorded; leave empty unless we already started a mask
+        # (then pad zeros for the whole sequence so lengths stay consistent).
+        if mask:
+            lps.extend([0.0] * slm_n)
+
+    turn.output_ids.extend(glm_ids)
+    mask.extend([0] * len(glm_ids))
+    if lps:
+        lps.extend([0.0] * len(glm_ids))
+
+
+def amend_reply_with_offload(
+    reply: Reply,
+    *,
+    raw_output: str,
+    glm_content: str,
+    glm_think: str,
+    glm_tool_calls: list[dict[str, Any]] | None = None,
+) -> Reply:
     """Replace the SLM-only reply with the composed complete assistant turn for the agent.
 
-    Training still recorded ``turn.output_ids`` from the SLM only; this amends what
-    the coding agent receives / echoes on the next round.
+    Also see ``append_glm_tokens_to_turn``: GLM text may be embedded into
+    ``turn.output_ids`` with ``loss_mask=0`` for dumps; trainable tokens remain SLM.
     """
     mm = dict(reply.manager_message)
     text, think = compose_complete_assistant(
@@ -490,10 +815,33 @@ def amend_reply_with_offload(reply: Reply, *, raw_output: str, glm_content: str,
     else:
         mm.pop("reasoning_content", None)
 
+    glm_tool_calls = list(glm_tool_calls or [])
+    if glm_tool_calls:
+        manager_tcs: list[dict[str, Any]] = []
+        for tc in glm_tool_calls:
+            function = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            args_raw = function.get("arguments")
+            if isinstance(args_raw, str):
+                try:
+                    args_obj = json.loads(args_raw)
+                except json.JSONDecodeError:
+                    args_obj = {"_raw": args_raw}
+            elif isinstance(args_raw, dict):
+                args_obj = args_raw
+            else:
+                args_obj = {}
+            manager_tcs.append(tool_call_dict(str(function.get("name") or "tool"), args_obj))
+        mm["tool_calls"] = manager_tcs
+    else:
+        mm.pop("tool_calls", None)
+
     wire = reply.wire
     if isinstance(wire, tuple) and len(wire) == 2 and isinstance(wire[0], list):
-        # Anthropic: rebuild as one thinking + one text (+ any tool_use from SLM).
-        tool_blocks = [b for b in wire[0] if b.get("type") == "tool_use"]
+        # Anthropic: thinking + text + tool_use (prefer GLM tool_calls when present).
+        slm_tool_blocks = [b for b in wire[0] if b.get("type") == "tool_use"]
+        tool_blocks = (
+            _openai_tool_calls_to_anthropic_blocks(glm_tool_calls) if glm_tool_calls else slm_tool_blocks
+        )
         blocks: list[dict] = []
         if think:
             blocks.append({"type": "thinking", "thinking": think})
@@ -501,12 +849,19 @@ def amend_reply_with_offload(reply: Reply, *, raw_output: str, glm_content: str,
             blocks.append({"type": "text", "text": text})
         blocks.extend(tool_blocks)
         stop_reason = "tool_use" if tool_blocks else "end_turn"
-        wire = (blocks, stop_reason)
-    elif isinstance(wire, tuple) and len(wire) == 2 and isinstance(wire[0], dict):
-        # OpenAI: one message with merged content / reasoning.
+        finish = "tool_calls" if tool_blocks else reply.finish_reason
+        return Reply(manager_message=mm, finish_reason=finish, wire=(blocks, stop_reason))
+
+    if isinstance(wire, tuple) and len(wire) == 2 and isinstance(wire[0], dict):
+        # OpenAI: one message with merged content / reasoning / tool_calls.
         wm = dict(wire[0])
-        if wm.get("tool_calls"):
-            # Keep SLM tool calls; still attach merged reasoning when present.
+        if glm_tool_calls:
+            wm["tool_calls"] = glm_tool_calls
+            if think:
+                wm["reasoning_content"] = think
+            wm["content"] = text or None
+            finish = "tool_calls"
+        elif wm.get("tool_calls"):
             if think:
                 wm["reasoning_content"] = think
             if text:
@@ -519,7 +874,7 @@ def amend_reply_with_offload(reply: Reply, *, raw_output: str, glm_content: str,
             else:
                 wm.pop("reasoning_content", None)
             finish = "stop"
-        wire = (wm, finish)
+        return Reply(manager_message=mm, finish_reason=finish, wire=(wm, finish))
 
     return Reply(manager_message=mm, finish_reason=reply.finish_reason, wire=wire)
 
@@ -532,12 +887,17 @@ async def apply_offload_if_needed(
     turn: TurnRecord,
     session: Session,
     sid: str,
+    tokenizer: Any | None = None,
+    tools_schema: list[dict] | None = None,
 ) -> Reply:
     """Per agent round: account SLM tokens; if in-think offload span, call GLM.
 
     Protocol: ``<|llm_offload|>N<|/llm_offload|>`` must sit inside ``<think>``.
     A complete span outside think does not call GLM; it increments
     ``offload_outside_think_count`` for the think-format reward penalty.
+
+    On success, optionally appends tokenized GLM text to ``turn.output_ids`` with
+    ``output_loss_mask=0`` (see ``SLIME_OFFLOAD_EMBED_IN_TRAJECTORY``).
     """
     if not offload_enabled():
         return reply
@@ -564,11 +924,12 @@ async def apply_offload_if_needed(
     small_out = len(turn.output_ids or [])
     glm_budget = max(0, _max_tokens() - small_out)
     messages = build_offload_messages(translated, raw_output)
-    content, think, usage = await call_remote_chat(
+    content, think, usage, glm_tool_calls = await call_remote_chat(
         messages,
         max_tokens=glm_budget,
         enable_thinking=enable_thinking,
         reasoning_effort=reasoning_effort,
+        tools=tools_schema,
     )
 
     stats["offload_count"] = int(stats.get("offload_count", 0)) + 1
@@ -578,7 +939,7 @@ async def apply_offload_if_needed(
 
     logger.info(
         "[coding_agent_offload] sid=%s offload#%d N=%d thinking=%s effort=%s "
-        "glm_budget=%d content_len=%d think_len=%d "
+        "glm_budget=%d content_len=%d think_len=%d tool_calls=%d "
         "cum_slm=(%d,%d) cum_glm=(%d,%d)",
         sid,
         stats["offload_count"],
@@ -588,6 +949,7 @@ async def apply_offload_if_needed(
         glm_budget,
         len(content),
         len(think),
+        len(glm_tool_calls),
         int(stats.get("small_prompt_tokens", 0)),
         int(stats.get("small_output_tokens", 0)),
         int(stats.get("glm_input_tokens", 0)),
@@ -596,7 +958,20 @@ async def apply_offload_if_needed(
     # N=0: no remote think channel; drop any accidental reasoning payload.
     if not enable_thinking:
         think = ""
-    return amend_reply_with_offload(reply, raw_output=raw_output, glm_content=content, glm_think=think)
+    append_glm_tokens_to_turn(
+        turn,
+        tokenizer=tokenizer,
+        raw_output=raw_output,
+        glm_content=content,
+        glm_think=think,
+    )
+    return amend_reply_with_offload(
+        reply,
+        raw_output=raw_output,
+        glm_content=content,
+        glm_think=think,
+        glm_tool_calls=glm_tool_calls,
+    )
 
 
 def actual_cost(stats: dict[str, Any]) -> float:
@@ -649,4 +1024,64 @@ def cost_aware_reward(
     if outside > 0:
         pen = float(format_penalty if format_penalty is not None else think_format_penalty())
         reward -= pen
+    return max(0.0, reward)
+
+
+def help_seeking_reward(
+    solved: float,
+    stats: dict[str, Any] | None,
+    *,
+    usage: dict[str, Any] | None = None,
+    lam: float | None = None,
+    format_penalty: float | None = None,
+    alpha: float | None = None,
+    empty_patch: bool = False,
+    empty_scale: float | None = None,
+    unique_solver: bool = False,
+    unique_bonus: float | None = None,
+) -> float:
+    """Train reward that keeps a gradient toward offloading when stuck.
+
+    Compared to :func:`cost_aware_reward` (which gives ``0`` on all failures),
+    this credits legitimate in-think help-seeking even when grading fails, so
+    GRPO does not extinguish ``<|llm_offload|>`` as soon as the SLM can solve
+    some siblings alone.
+
+    - unsolved, no in-think offload: ``0``
+    - unsolved, ``offload_count>0`` and no outside-think spans: ``α``
+      (scaled by ``empty_scale`` when ``empty_patch``)
+    - unsolved with only outside-think offload: ``0`` (format still discouraged)
+    - solved: ``1 - λ * cost_ratio`` (− format penalty if outside-think), then
+      optional ``unique_bonus`` when this traj is the sole solver in its group
+      (caller must set ``unique_solver``; default unused at per-sample finish)
+
+    Enable via ``OFFLOAD_REWARD_MODE=help_seeking``. Knobs:
+    ``OFFLOAD_SEEK_ALPHA``, ``OFFLOAD_SEEK_EMPTY_SCALE``,
+    ``OFFLOAD_UNIQUE_SOLVER_BONUS``, plus the usual λ / format-penalty envs.
+    """
+    st = stats or {}
+    oc = int(st.get("offload_count", 0) or 0)
+    outside = int(st.get("offload_outside_think_count", 0) or 0)
+    alpha_v = float(alpha if alpha is not None else seek_alpha())
+    emp_scale = float(empty_scale if empty_scale is not None else seek_empty_scale())
+
+    if float(solved) <= 0.0:
+        if oc < 1 or outside > 0:
+            return 0.0
+        credit = alpha_v
+        if empty_patch:
+            credit *= emp_scale
+        return max(0.0, credit)
+
+    # Solved path: same efficiency / format shaping as cost_aware_reward.
+    reward = cost_aware_reward(
+        solved,
+        st,
+        usage=usage,
+        lam=lam,
+        format_penalty=format_penalty,
+    )
+    if unique_solver:
+        bonus = float(unique_bonus if unique_bonus is not None else unique_solver_bonus())
+        reward += bonus
     return max(0.0, reward)

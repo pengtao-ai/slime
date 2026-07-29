@@ -135,12 +135,22 @@ def _local_ips() -> list[str]:
     return ips
 
 
-async def _pick_adapter_host(sb, *, port: int, preferred: str | None) -> str:
+async def _pick_adapter_host(
+    sb,
+    *,
+    port: int,
+    preferred: str | None,
+    attempts: int = 3,
+    retry_delay_sec: float = 2.0,
+) -> str:
     """From inside the sandbox, find a host that accepts TCP to the adapter port.
 
     docker-rt ``--network host`` often attaches to the *node* netns, so
     127.0.0.1 inside the sandbox is NOT the pod where the adapter listens.
     Bridge + host.docker.internal (host-gateway) or the pod IP usually works.
+
+    Raises ``RuntimeError`` (not ``SystemExit``) so concurrent batch runners can
+    fail one sample without tearing down the whole event loop.
     """
     candidates: list[str] = []
     if preferred:
@@ -175,18 +185,28 @@ for h in hosts:
 sys.exit(2)
 """
     await sb.write_file("/tmp/smoke_adapter_probe.py", probe)
-    code, out, err = await sb.exec("python3 /tmp/smoke_adapter_probe.py", timeout=60)
-    print(f"[smoke] adapter reachability probe exit={code}\n{(err or '').strip()[:800]}", flush=True)
-    host = (out or "").strip().splitlines()[-1] if (out or "").strip() else ""
-    if code != 0 or not host or host.startswith("FAIL"):
-        raise SystemExit(
-            f"FAIL: sandbox cannot TCP-connect to adapter :{port} via any of {ordered}. "
-            f"Adapter must bind 0.0.0.0 (not only 127.0.0.1). "
-            f"Try --network bridge (default) and ensure SLIME_AGENT_DOCKER_ADD_HOST="
-            f"host.docker.internal:host-gateway."
+    last_err = ""
+    for attempt in range(1, max(1, attempts) + 1):
+        code, out, err = await sb.exec("python3 /tmp/smoke_adapter_probe.py", timeout=60)
+        last_err = (err or "").strip()[:800]
+        print(
+            f"[smoke] adapter reachability probe attempt={attempt}/{attempts} "
+            f"exit={code}\n{last_err}",
+            flush=True,
         )
-    print(f"[smoke] sandbox reaches adapter via host={host!r}", flush=True)
-    return host
+        host = (out or "").strip().splitlines()[-1] if (out or "").strip() else ""
+        if code == 0 and host and not host.startswith("FAIL"):
+            print(f"[smoke] sandbox reaches adapter via host={host!r}", flush=True)
+            return host
+        if attempt < max(1, attempts):
+            await asyncio.sleep(retry_delay_sec)
+
+    raise RuntimeError(
+        f"sandbox cannot TCP-connect to adapter :{port} via any of {ordered}. "
+        f"Adapter must bind 0.0.0.0 (not only 127.0.0.1). "
+        f"Try --network bridge (default) and ensure SLIME_AGENT_DOCKER_ADD_HOST="
+        f"host.docker.internal:host-gateway. last_probe_err={last_err!r}"
+    )
 
 
 def _setup_docker_env(*, network: str) -> None:
@@ -284,9 +304,12 @@ async def run_smoke(args: argparse.Namespace) -> None:
                     f"(docker-rt -u / runuser bug?). out={out!r} err={err!r}"
                 )
 
-            adapter_host = await _pick_adapter_host(
-                sb, port=handle.port, preferred=(args.public_host or None)
-            )
+            try:
+                adapter_host = await _pick_adapter_host(
+                    sb, port=handle.port, preferred=(args.public_host or None)
+                )
+            except RuntimeError as exc:
+                raise SystemExit(f"FAIL: {exc}") from exc
             adapter_url = f"http://{adapter_host}:{handle.port}"
             print(f"[smoke] ANTHROPIC_BASE_URL will be {adapter_url}", flush=True)
 

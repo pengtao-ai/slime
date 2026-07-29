@@ -91,7 +91,16 @@ def _translate_messages(msgs: list[dict], system: Any) -> list[dict]:
             blocks = content if isinstance(content, list) else [{"type": "text", "text": flatten_content(content)}]
             for b in blocks:
                 if isinstance(b, dict) and b.get("type") == "tool_result":
-                    translated.append({"role": "tool", "content": flatten_content(b.get("content"))})
+                    tool_msg: dict[str, Any] = {
+                        "role": "tool",
+                        "content": flatten_content(b.get("content")),
+                    }
+                    # Keep wire id for OpenAI-protocol offload handoff; chat
+                    # templates ignore unknown fields.
+                    tool_use_id = b.get("tool_use_id")
+                    if tool_use_id:
+                        tool_msg["tool_call_id"] = tool_use_id
+                    translated.append(tool_msg)
                 elif isinstance(b, dict) and b.get("type") == "text":
                     translated.append({"role": "user", "content": b.get("text", "")})
                 else:
@@ -107,8 +116,12 @@ def _translate_messages(msgs: list[dict], system: Any) -> list[dict]:
                 elif b.get("type") == "thinking":
                     thinkings.append(b.get("thinking", ""))
                 elif b.get("type") == "tool_use":
-                    # drop the wire-only id; tool_call_dict keeps arguments a dict
-                    tcs.append(tool_call_dict(b.get("name", "tool"), b.get("input")))
+                    # Canonical args stay a dict for chat-template / manager match.
+                    # Preserve wire id when present so offload can emit OpenAI tool protocol.
+                    tc = tool_call_dict(b.get("name", "tool"), b.get("input"))
+                    if b.get("id"):
+                        tc = {**tc, "id": b["id"]}
+                    tcs.append(tc)
             mo: dict[str, Any] = {"role": "assistant", "content": "".join(texts)}
             if thinkings:
                 mo["reasoning_content"] = "".join(thinkings)

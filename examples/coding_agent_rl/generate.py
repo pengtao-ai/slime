@@ -78,6 +78,8 @@ class _OffloadMixin:
             turn=turn,
             session=session,
             sid=sid,
+            tokenizer=self.tokenizer,
+            tools_schema=tools_schema,
         )
 
 
@@ -305,13 +307,23 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             train_reward = solved
             if offload.offload_enabled():
                 usage = md.get("usage") if isinstance(md.get("usage"), dict) else None
-                train_reward = offload.cost_aware_reward(solved, offload_stats, usage=usage)
+                if offload.reward_mode() == "help_seeking":
+                    train_reward = offload.help_seeking_reward(
+                        solved,
+                        offload_stats,
+                        usage=usage,
+                        empty_patch=empty_patch,
+                    )
+                else:
+                    train_reward = offload.cost_aware_reward(solved, offload_stats, usage=usage)
                 logger.info(
-                    "[coding_agent_rl] %s: solved=%.1f train_reward=%.4f empty_patch=%s offload=%s",
+                    "[coding_agent_rl] %s: solved=%.1f train_reward=%.4f empty_patch=%s "
+                    "reward_mode=%s offload=%s",
                     instance_id,
                     solved,
                     train_reward,
                     empty_patch,
+                    offload.reward_mode(),
                     offload_stats,
                 )
             if evaluation:

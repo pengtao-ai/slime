@@ -29,13 +29,20 @@ logger = logging.getLogger(__name__)
 class TurnRecord:
     """One sglang ``/generate`` snapshot: the contract between an adapter and the
     manager. Adapters build it from a turn's prompt/output token ids; ``record_turn``
-    consumes it."""
+    consumes it.
+
+    ``output_loss_mask`` is optional and aligned 1:1 with ``output_ids`` when
+    non-empty. Use it to keep non-trainable suffixes (e.g. mid-turn GLM offload
+    text) inside the trajectory while excluding them from the loss. An empty
+    list means "all output tokens are trainable" (legacy default).
+    """
 
     prompt_ids: list[int]
     output_ids: list[int]
     finish_reason: str
     output_log_probs: list[float] = dataclasses.field(default_factory=list)
     ill_formed: bool = False
+    output_loss_mask: list[int] = dataclasses.field(default_factory=list)
 
 
 # ===========================================================================
@@ -215,9 +222,7 @@ class _SampleBuilder:
 
         # --- append this turn's generated response (loss_mask=1 unless re-emitted as context) ---
         self.last_response_start_idx = len(self.tokens)
-        self._append_tokens(
-            turn.output_ids, loss_mask=int(trained), logprobs=turn.output_log_probs if trained else None
-        )
+        self._append_output_tokens(turn, trained=trained)
 
         if is_first_turn:
             self.leading_prompt_len = len(turn.prompt_ids)
@@ -232,7 +237,51 @@ class _SampleBuilder:
         self.loss_mask[response_start:] = [0] * len(tail)
         self.logprobs[response_start:] = [0.0] * len(tail)
 
-    def _append_tokens(self, ids: list[int], *, loss_mask: int, logprobs: list[float] | None = None) -> None:
+    def _append_output_tokens(self, turn: TurnRecord, *, trained: bool) -> None:
+        """Append ``turn.output_ids`` with optional per-token ``output_loss_mask``."""
+        ids = turn.output_ids
+        n = len(ids)
+        if not n:
+            return
+        per_token = turn.output_loss_mask
+        if per_token and len(per_token) != n:
+            raise ValueError(
+                f"turn.output_loss_mask length {len(per_token)} != output_ids length {n}"
+            )
+        if not trained:
+            self._append_tokens(ids, loss_mask=0, logprobs=[0.0] * n)
+            return
+        if not per_token:
+            self._append_tokens(
+                ids, loss_mask=1, logprobs=turn.output_log_probs if turn.output_log_probs else None
+            )
+            return
+        masks = list(per_token)
+        raw_lps = list(turn.output_log_probs or [])
+        if len(raw_lps) == n:
+            logprobs = [float(lp) if m else 0.0 for lp, m in zip(raw_lps, masks)]
+        else:
+            logprobs = [
+                (float(raw_lps[i]) if i < len(raw_lps) and masks[i] else 0.0) for i in range(n)
+            ]
+        self._append_tokens(ids, loss_masks=masks, logprobs=logprobs)
+
+    def _append_tokens(
+        self,
+        ids: list[int],
+        *,
+        loss_mask: int | None = None,
+        loss_masks: list[int] | None = None,
+        logprobs: list[float] | None = None,
+    ) -> None:
+        if loss_masks is not None:
+            if len(loss_masks) != len(ids):
+                raise ValueError(f"loss_masks length {len(loss_masks)} != ids length {len(ids)}")
+            self.tokens.extend(ids)
+            self.loss_mask.extend(loss_masks)
+            self.logprobs.extend(logprobs if logprobs is not None else [0.0] * len(ids))
+            return
+        assert loss_mask is not None
         self.tokens.extend(ids)
         self.loss_mask.extend([loss_mask] * len(ids))
         self.logprobs.extend(logprobs if logprobs else [0.0] * len(ids))
@@ -303,6 +352,10 @@ class TrajectoryManager:
             return
         assert not turn.output_log_probs or len(turn.output_log_probs) == len(turn.output_ids), (
             f"turn.output_log_probs length {len(turn.output_log_probs)} != "
+            f"turn.output_ids length {len(turn.output_ids)}"
+        )
+        assert not turn.output_loss_mask or len(turn.output_loss_mask) == len(turn.output_ids), (
+            f"turn.output_loss_mask length {len(turn.output_loss_mask)} != "
             f"turn.output_ids length {len(turn.output_ids)}"
         )
 

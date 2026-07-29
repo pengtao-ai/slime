@@ -209,9 +209,9 @@ class BaseAdapter:
     ) -> Reply:
         """Optional hook after ``_build_reply`` (e.g. mid-turn LLM offload).
 
-        Default is a no-op. Subclasses may mutate ``session.offload_stats`` and
-        amend ``reply`` (wire + manager_message) before the client flush.
-        Trainable tokens remain ``turn.output_ids`` from the local model only.
+        Default is a no-op. Subclasses may mutate ``session.offload_stats``,
+        amend ``reply``, and/or extend ``turn.output_ids`` in place (e.g. GLM
+        offload text with ``output_loss_mask=0``) before the client flush.
         """
         return reply
 
