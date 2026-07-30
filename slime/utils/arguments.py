@@ -111,7 +111,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 choices=["fla", "flashqla"],
                 default="fla",
-                help="GDN implementation backend for Qwen linear-attention layers.",
+                help=(
+                    "GDN implementation backend for Qwen linear-attention layers. "
+                    "With context_parallel_size>1, hybrid GDN CP (fla.ops.cp, requires "
+                    "flash-linear-attention>=0.4.2) is used regardless of this setting."
+                ),
             )
             parser.add_argument(
                 "--train-env-vars",

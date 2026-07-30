@@ -17,6 +17,7 @@ try:
 except ImportError:
     pass
 
+from .gdn_cp import build_gdn_cp_context
 from .hf_attention import HuggingfaceAttention
 from .qwen_gdn_backend import get_chunk_gated_delta_rule
 
@@ -110,6 +111,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         cu_seqlens: torch.Tensor = None,
     ):
+        cp_context = build_gdn_cp_context(self, cu_seqlens, hidden_states.device)
+
         projected_states_qkvz = self.in_proj_qkvz(hidden_states)
         projected_states_ba = self.in_proj_ba(hidden_states)
         query, key, value, z, b, a = self.fix_query_key_value_ordering(projected_states_qkvz, projected_states_ba)
@@ -117,9 +120,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
         mixed_qkv = torch.cat((query, key, value), dim=-1)
 
+        conv_cu_seqlens = cp_context.cu_seqlens if cp_context is not None else cu_seqlens
         mixed_qkv, _ = self.conv1d(
             x=mixed_qkv,
-            cu_seqlens=cu_seqlens,
+            cu_seqlens=conv_cu_seqlens,
+            cp_context=cp_context,
         )
 
         query, key, value = torch.split(
@@ -142,24 +147,38 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
             key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
 
-        if self.gdn_backend == "flashqla":
-            query = query.contiguous()
-            key = key.contiguous()
-            value = value.contiguous()
-            g = g.contiguous()
-            beta = beta.contiguous()
+        if cp_context is not None:
+            from fla.ops.gated_delta_rule import chunk_gated_delta_rule as fla_chunk_gated_delta_rule
 
-        core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=True,
-            cu_seqlens=cu_seqlens,
-        )
+            core_attn_out, last_recurrent_state = fla_chunk_gated_delta_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=cp_context.cu_seqlens,
+                cp_context=cp_context,
+            )
+        else:
+            if self.gdn_backend == "flashqla":
+                query = query.contiguous()
+                key = key.contiguous()
+                value = value.contiguous()
+                g = g.contiguous()
+                beta = beta.contiguous()
+
+            core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=None,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=cu_seqlens,
+            )
 
         z_shape_og = z.shape
         # reshape input data into 2D tensor

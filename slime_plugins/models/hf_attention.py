@@ -9,6 +9,8 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule
 
+from slime_plugins.models.gdn_cp import packed_shard_to_zigzag, zigzag_to_packed_shard
+
 
 def _load_hf_config(checkpoint_path):
     """Load HF config with fallback for unsupported model types."""
@@ -67,6 +69,10 @@ class HuggingfaceAttention(MegatronModule, ABC):
     "cross attn" specializations.
     """
 
+    # Set True by detect_and_setup_hybrid_cp when the GDN module handles CP
+    # natively via fla.ops.cp (no full-sequence all-gather).
+    hybrid_cp: bool = False
+
     def __init__(
         self,
         args,
@@ -114,10 +120,20 @@ class HuggingfaceAttention(MegatronModule, ABC):
                 group=mpu.get_tensor_model_parallel_group(),
             )
 
-        if mpu.get_context_parallel_world_size() > 1:
-            cp_size = mpu.get_context_parallel_world_size()
-            # Use custom all-gather whose backward returns local gradient
-            # instead of reduce-scatter, since the computation is duplicated.
+        cp_size = mpu.get_context_parallel_world_size()
+        if cp_size > 1 and self.hybrid_cp:
+            # Native fla CP expects each rank to own a contiguous shard of the
+            # packed global token stream. allgather-CP already provides that.
+            if not getattr(self.args, "allgather_cp", False):
+                hidden_states = zigzag_to_packed_shard(
+                    hidden_states,
+                    cu_seqlens,
+                    mpu.get_context_parallel_group(),
+                    mpu.get_context_parallel_rank(),
+                    cp_size,
+                )
+        elif cp_size > 1:
+            # Legacy path: all-gather full sequence and run duplicated GDN.
             hidden_states_list = _AllGatherForDuplicatedComputation.apply(
                 hidden_states,
                 mpu.get_context_parallel_group(),
@@ -149,7 +165,16 @@ class HuggingfaceAttention(MegatronModule, ABC):
 
         output = output.permute(1, 0, 2)  # [seq_len, bsz, hidden_dim]
 
-        if mpu.get_context_parallel_world_size() > 1:
+        if cp_size > 1 and self.hybrid_cp:
+            if not getattr(self.args, "allgather_cp", False):
+                output = packed_shard_to_zigzag(
+                    output,
+                    cu_seqlens,
+                    mpu.get_context_parallel_group(),
+                    mpu.get_context_parallel_rank(),
+                    cp_size,
+                )
+        elif cp_size > 1:
             cp_rank = mpu.get_context_parallel_rank()
             output_list = []
             for i in range(len(cu_seqlens) - 1):

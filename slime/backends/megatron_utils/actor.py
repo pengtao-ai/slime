@@ -95,6 +95,17 @@ class MegatronTrainRayActor(TrainRayActor):
             args, role
         )
 
+        if mpu.get_context_parallel_world_size() > 1:
+            from slime_plugins.models.gdn_cp import detect_and_setup_hybrid_cp
+
+            for model_chunk in self.model:
+                detect_and_setup_hybrid_cp(
+                    model_chunk,
+                    mpu.get_context_parallel_group(),
+                    mpu.get_context_parallel_rank(),
+                    mpu.get_context_parallel_world_size(),
+                )
+
         vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
         if vpp_size > 1:
             from megatron.core.utils import get_model_config
