@@ -418,6 +418,9 @@ async def ensure_agent_user(sb: Sandbox, workdir: str) -> None:
     await sb.exec(
         f"id agent >/dev/null 2>&1 || useradd -m -s /bin/bash agent && "
         f"chown -R agent:agent /home/agent {workdir} && "
+        # Baked Kaniko images may omit /tmp or leave it 0755; Claude Code +
+        # harness launchers need a world-writable sticky /tmp.
+        f"mkdir -p /tmp && chmod 1777 /tmp && "
         f"git config --system --add safe.directory '*' && id agent",
         user="root",
         check=True,

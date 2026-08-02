@@ -7,6 +7,13 @@ runs/
 examples/llm_offload/data
 examples/coding_agent_rl/sglang_infer_stubs/
 examples/coding_agent_rl/tarballs/
+examples/coding_agent_rl/docker_build/assets/
+examples/coding_agent_rl/docker_build/restored/
+examples/coding_agent_rl/docker_build/kaniko_out/
+examples/coding_agent_rl/docker_build/bake_failures.jsonl
+examples/coding_agent_rl/docker_build/verify_failures.jsonl
+examples/coding_agent_rl/docker_build/dockerfiles/
+examples/coding_agent_rl/docker_build/.env
 examples/coding_agent_rl/data/
 # C extensions
 *.so

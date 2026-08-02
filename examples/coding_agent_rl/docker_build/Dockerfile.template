@@ -1,0 +1,38 @@
+# Generated for ScaleSWE agent bake. Placeholders: __BASE_IMAGE__ __WORKDIR__ __INSTANCE_ID__
+FROM __BASE_IMAGE__
+
+# Host JuiceFS may mount /workspace; Kaniko is run with a filtered /proc mountinfo
+# so this path is snapshotted into the image (runtime workdir stays /workspace/...).
+COPY restored/__INSTANCE_ID__/workspace/ /workspace/
+
+# Build scratch under /tmp_build (not /tmp) so we never rewrite the image's /tmp mode.
+COPY assets/node22.tar /tmp_build/node22.tar
+COPY assets/claude-code-local.tgz /tmp_build/claude-code-local.tgz
+COPY dockerfiles/__INSTANCE_ID__.pre.sh /tmp_build/pre_commands.sh
+
+RUN set -eux; \
+    mkdir -p /opt/node22; \
+    tar xf /tmp_build/node22.tar -C /opt/node22 --strip-components=1; \
+    ln -sf /opt/node22/bin/node /usr/local/bin/node; \
+    ln -sf /opt/node22/bin/npm /usr/local/bin/npm; \
+    ln -sf /opt/node22/bin/npx /usr/local/bin/npx; \
+    node --version; npm --version; \
+    npm install -g --prefix=/usr/local --no-audit --no-fund /tmp_build/claude-code-local.tgz; \
+    ls -la /usr/local/bin/claude; \
+    test -e /usr/local/bin/claude; \
+    rm -f /tmp_build/node22.tar /tmp_build/claude-code-local.tgz
+
+RUN set -eux; \
+    id agent >/dev/null 2>&1 || useradd -m -s /bin/bash agent; \
+    test -d "__WORKDIR__"; \
+    chown -R agent:agent /home/agent /workspace; \
+    git config --system --add safe.directory '*'; \
+    chmod 755 /tmp_build/pre_commands.sh; \
+    id agent
+
+USER agent
+WORKDIR __WORKDIR__
+RUN set -eux; bash /tmp_build/pre_commands.sh
+
+USER root
+RUN rm -rf /tmp_build

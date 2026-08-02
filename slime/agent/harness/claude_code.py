@@ -34,6 +34,16 @@ class ClaudeCodeHarness(BaseHarness):
     }
 
     async def install_cli(self, sb: Sandbox) -> None:
+        # Pre-baked ScaleSWE agent images already ship Node + claude under
+        # /usr/local; skip the host-tarball upload path when the binary works.
+        ec, _, _ = await sb.exec(
+            "test -x /usr/local/bin/claude && /usr/local/bin/claude --version",
+            user="root",
+            check=False,
+            timeout=60,
+        )
+        if ec == 0:
+            return
         await install_npm_cli(
             sb,
             node_runtime=Path(os.environ[self.node_tarball_env]),

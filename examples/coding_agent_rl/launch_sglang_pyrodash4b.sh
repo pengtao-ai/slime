@@ -19,8 +19,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MODEL_PATH="${MODEL_PATH:-/workspace/models/pyromind/PyroDash-4B-SFT-0728}"
-SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-PyroDash-4B-SFT-0728}"
+MODEL_PATH="${MODEL_PATH:-/workspace/models/pyromind/PyroDash-4B-SFT-0731}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-PyroDash-4B-SFT-0731}"
 PORT="${PORT:-30000}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.85}"

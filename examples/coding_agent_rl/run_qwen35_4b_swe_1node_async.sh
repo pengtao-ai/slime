@@ -32,12 +32,27 @@ source "${SLIME_DIR}/scripts/models/qwen3.5-4B.sh"
 NUM_GPUS="${NUM_GPUS:-8}"
 ACTOR_GPUS="${ACTOR_GPUS:-6}"
 ROLLOUT_GPUS="${ROLLOUT_GPUS:-$((NUM_GPUS - ACTOR_GPUS))}"
+# Train-only (load saved rollout dumps): no SGLang, rollout GPUs may be 0.
+LOAD_DEBUG_ROLLOUT_DATA="${LOAD_DEBUG_ROLLOUT_DATA:-}"
+DEBUG_TRAIN_ONLY="${DEBUG_TRAIN_ONLY:-0}"
+if [[ -n "${LOAD_DEBUG_ROLLOUT_DATA}" ]]; then
+  DEBUG_TRAIN_ONLY=1
+fi
+if [[ "${DEBUG_TRAIN_ONLY}" == "1" ]]; then
+  ACTOR_GPUS="${ACTOR_GPUS:-${NUM_GPUS}}"
+  ROLLOUT_GPUS="${ROLLOUT_GPUS:-0}"
+fi
+
 if (( ACTOR_GPUS + ROLLOUT_GPUS > NUM_GPUS )); then
   echo "ERROR: ACTOR_GPUS(${ACTOR_GPUS})+ROLLOUT_GPUS(${ROLLOUT_GPUS}) > NUM_GPUS(${NUM_GPUS})" >&2
   exit 1
 fi
-if (( ACTOR_GPUS < 1 || ROLLOUT_GPUS < 1 )); then
-  echo "ERROR: async mode needs ACTOR_GPUS>=1 and ROLLOUT_GPUS>=1" >&2
+if (( ACTOR_GPUS < 1 )); then
+  echo "ERROR: ACTOR_GPUS must be >= 1" >&2
+  exit 1
+fi
+if [[ "${DEBUG_TRAIN_ONLY}" != "1" ]] && (( ROLLOUT_GPUS < 1 )); then
+  echo "ERROR: async mode needs ROLLOUT_GPUS>=1 unless DEBUG_TRAIN_ONLY / LOAD_DEBUG_ROLLOUT_DATA" >&2
   exit 1
 fi
 
@@ -64,12 +79,12 @@ if (( ROLLOUT_GPUS % ROLLOUT_TP_SIZE != 0 )); then
 fi
 
 # ============ context length ============
-MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-100000}"
-MAX_GEN_LEN="${MAX_GEN_LEN:-100000}"
+MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-160000}"
+MAX_GEN_LEN="${MAX_GEN_LEN:-160000}"
 # Per-GPU token budget after CP split. Sync uses MAX/4 with CP=4.
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-$((MAX_CONTEXT_LEN / CP_SIZE))}"
 # Megatron asserts seq_length % (2 * CP) == 0. Align up when needed
-# (e.g. CP=6 → 100000 % 12 != 0 → 200004).
+# (e.g. CP=6 → 160000 % 12 != 0 → 200004).
 SEQ_LENGTH="${SEQ_LENGTH:-${MAX_CONTEXT_LEN}}"
 if (( CP_SIZE > 1 )); then
   _cp_align=$((CP_SIZE * 2))
@@ -101,7 +116,7 @@ EXP_TAG="${EXP_TAG:-agent_only_qwen35_4b_async}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 RUN_ROOT="${RUN_ROOT:-${SLIME_DIR}/runs/${EXP_TAG}_${STAMP}}"
 SAVE_DIR="${SAVE_DIR:-${RUN_ROOT}/checkpoints}"
-SAVE_INTERVAL="${SAVE_INTERVAL:-5}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-10}"
 UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-1}"
 # eos/pad; offload launchers append <|/llm_offload|> id (e.g. 248078).
 ROLLOUT_STOP_TOKEN_IDS="${ROLLOUT_STOP_TOKEN_IDS:-248046 248044}"
@@ -117,7 +132,7 @@ echo "SAVE_DIR=${SAVE_DIR}  SAVE_INTERVAL=${SAVE_INTERVAL}"
 echo "ACTOR_GPUS=${ACTOR_GPUS} ROLLOUT_GPUS=${ROLLOUT_GPUS} (TP=${TP_SIZE} PP=${PP_SIZE} CP=${CP_SIZE} DP=${DP_SIZE} seq=${SEQ_LENGTH} max_tokens/gpu=${MAX_TOKENS_PER_GPU})"
 echo "ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE} N_SAMPLES=${N_SAMPLES_PER_PROMPT} GLOBAL_BATCH=${GLOBAL_BATCH_SIZE}"
 echo "QWEN_GDN_BACKEND=${QWEN_GDN_BACKEND}"
-echo "SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS=${SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS:-100000}"
+echo "SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS=${SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS:-160000}"
 echo "======================================================================"
 if (( GLOBAL_BATCH_SIZE % DP_SIZE != 0 )); then
   echo "ERROR: GLOBAL_BATCH_SIZE(${GLOBAL_BATCH_SIZE}) must be divisible by DP(${DP_SIZE})" >&2
@@ -145,12 +160,19 @@ ROLLOUT_ARGS=(
    --rollout-max-response-len ${MAX_GEN_LEN}
    --rollout-temperature 1.0
    --rollout-stop-token-ids ${ROLLOUT_STOP_TOKEN_IDS}
-   --num-steps-per-rollout 1
+   --num-steps-per-rollout ${NUM_STEPS_PER_ROLLOUT:-1}
    --global-batch-size ${GLOBAL_BATCH_SIZE}
-   --micro-batch-size 1
-   --save-debug-rollout-data "${RUN_ROOT}/rollout_dumps/rollout_{rollout_id}.pt"
+   --micro-batch-size ${MICRO_BATCH_SIZE:-1}
    --update-weights-interval "${UPDATE_WEIGHTS_INTERVAL}"
 )
+if [[ -n "${LOAD_DEBUG_ROLLOUT_DATA}" ]]; then
+  ROLLOUT_ARGS+=(--load-debug-rollout-data "${LOAD_DEBUG_ROLLOUT_DATA}")
+else
+  ROLLOUT_ARGS+=(--save-debug-rollout-data "${RUN_ROOT}/rollout_dumps/rollout_{rollout_id}.pt")
+fi
+if [[ "${DEBUG_TRAIN_ONLY}" == "1" && -z "${LOAD_DEBUG_ROLLOUT_DATA}" ]]; then
+  ROLLOUT_ARGS+=(--debug-train-only)
+fi
 
 # Per-GPU token budget already set above (MAX_TOKENS_PER_GPU).
 PERF_ARGS=(
@@ -212,6 +234,27 @@ MISC_ARGS=(
    --attention-backend flash
 )
 
+# Optional CUDA memory snapshot (rank 0 only; see slime/utils/profile_utils.py).
+RECORD_MEMORY_HISTORY="${RECORD_MEMORY_HISTORY:-0}"
+if [[ "${RECORD_MEMORY_HISTORY}" == "1" ]]; then
+  MEMORY_SNAPSHOT_DIR="${MEMORY_SNAPSHOT_DIR:-${RUN_ROOT}/mem_snap}"
+  MEMORY_SNAPSHOT_PATH="${MEMORY_SNAPSHOT_PATH:-snap.pickle}"
+  MEMORY_SNAPSHOT_NUM_STEPS="${MEMORY_SNAPSHOT_NUM_STEPS:-1}"
+  mkdir -p "${MEMORY_SNAPSHOT_DIR}"
+  MISC_ARGS+=(
+    --record-memory-history
+    --memory-recorder torch
+    --memory-snapshot-dir "${MEMORY_SNAPSHOT_DIR}"
+    --memory-snapshot-path "${MEMORY_SNAPSHOT_PATH}"
+    --memory-snapshot-num-steps "${MEMORY_SNAPSHOT_NUM_STEPS}"
+    --profile-target train_overall
+  )
+  echo "Memory snapshot: dir=${MEMORY_SNAPSHOT_DIR} path=${MEMORY_SNAPSHOT_PATH} steps=${MEMORY_SNAPSHOT_NUM_STEPS}"
+fi
+if [[ "${DEBUG_TRAIN_ONLY}" == "1" ]]; then
+  echo "DEBUG_TRAIN_ONLY=1 (no SGLang); LOAD_DEBUG_ROLLOUT_DATA=${LOAD_DEBUG_ROLLOUT_DATA:-<unset>}"
+fi
+
 # ============ ray cluster network ============
 export MASTER_ADDR="${MASTER_ADDR:-${MLP_WORKER_0_HOST:-$(hostname -I | awk '{print $1}')}}"
 export MASTER_PORT="${MASTER_PORT:-${MLP_WORKER_0_PORT:-6379}}"
@@ -236,9 +279,9 @@ export SWE_AGENT_TIME_BUDGET_SEC="${SWE_AGENT_TIME_BUDGET_SEC:-900}"
 export SWE_EVAL_TIMEOUT_SEC="${SWE_EVAL_TIMEOUT_SEC:-300}"
 export SWE_BOOT_CONCURRENCY
 # Higher = fewer TOKEN_FORK segments (more REALIGN / rewrite-merge); default was 1024.
-export SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS="${SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS:-100000}"
+export SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS="${SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS:-160000}"
 
-SETTINGS_JSON='{"permissions":{"defaultMode":"bypassPermissions"},"autoCompactEnabled":true,"autoCompactWindow":100000}'
+SETTINGS_JSON='{"permissions":{"defaultMode":"bypassPermissions"},"autoCompactEnabled":true,"autoCompactWindow":160000}'
 AGENTS_JSON='{"investigator":{"description":"Searches the repo for relevant files before any edit","prompt":"You are an investigator sub-agent. Use Grep/Read/Glob to find every file relevant to the user task, then return a short bulleted summary. Do NOT edit anything.","tools":["Grep","Read","Glob"]}}'
 export SLIME_AGENT_CC_EXTRA_ARGS="--settings '${SETTINGS_JSON}' --disable-slash-commands --agents '${AGENTS_JSON}' --disallowedTools WebFetch WebSearch"
 if [[ -z "${SLIME_AGENT_CC_EXTRA_ENVS:-}" ]]; then

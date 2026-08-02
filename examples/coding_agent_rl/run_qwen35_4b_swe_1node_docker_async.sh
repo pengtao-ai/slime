@@ -63,7 +63,7 @@ export N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"
 export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))}"
 export SWE_BOOT_CONCURRENCY="${SWE_BOOT_CONCURRENCY:-32}"
 # 200 prompts / batch=3 ≈ 67 steps/epoch.
-export NUM_ROLLOUT="${NUM_ROLLOUT:-50}"
+export NUM_ROLLOUT="${NUM_ROLLOUT:-100}"
 
 # Prefer actor GPUs: agents are sandbox-bound; train was the bottleneck on 4+4.
 # TP=1 CP=2 → DP=3 on 6 actor GPUs (GDN still all-gathers full seq per CP group).
@@ -75,18 +75,30 @@ export CP_SIZE="${CP_SIZE:-6}"
 export QWEN_GDN_BACKEND="${QWEN_GDN_BACKEND:-flashqla}"
 
 # Checkpointing.
-export SAVE_INTERVAL="${SAVE_INTERVAL:-5}"
+export SAVE_INTERVAL="${SAVE_INTERVAL:-10}"
 # Agent budget: 900 keeps step latency down; raise to 1200 if too many soft timeouts.
 export SWE_AGENT_TIME_BUDGET_SEC="${SWE_AGENT_TIME_BUDGET_SEC:-900}"
 export SWE_EVAL_TIMEOUT_SEC="${SWE_EVAL_TIMEOUT_SEC:-300}"
 
-if ! command -v docker >/dev/null 2>&1; then
-  echo "ERROR: docker not found on PATH" >&2
-  exit 1
+# Train-only (load-debug-rollout-data): skip Docker sandbox checks; no SGLang.
+_DEBUG_TRAIN="${DEBUG_TRAIN_ONLY:-0}"
+if [[ -n "${LOAD_DEBUG_ROLLOUT_DATA:-}" ]]; then
+  _DEBUG_TRAIN=1
 fi
-if ! docker info >/dev/null 2>&1; then
-  echo "ERROR: docker daemon not reachable (docker info failed)" >&2
-  exit 1
+
+if [[ "${_DEBUG_TRAIN}" != "1" ]]; then
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "ERROR: docker not found on PATH" >&2
+    exit 1
+  fi
+  if ! docker info >/dev/null 2>&1; then
+    echo "ERROR: docker daemon not reachable (docker info failed)" >&2
+    exit 1
+  fi
+else
+  export ACTOR_GPUS="${ACTOR_GPUS:-${NUM_GPUS}}"
+  export ROLLOUT_GPUS="${ROLLOUT_GPUS:-0}"
+  echo "DEBUG train-only mode: skip docker checks (ACTOR_GPUS=${ACTOR_GPUS} ROLLOUT_GPUS=${ROLLOUT_GPUS})"
 fi
 
 echo "======================================================================"
