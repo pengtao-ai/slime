@@ -43,12 +43,27 @@ SLIME_DIR="${SLIME_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 export SLIME_AGENT_OFFLOAD="${SLIME_AGENT_OFFLOAD:-1}"
 export OFFLOAD_EFFICIENCY_LAMBDA="${OFFLOAD_EFFICIENCY_LAMBDA:-0.05}"
 # help_seeking: unsolved+in-think offload gets partial credit (see offload.help_seeking_reward).
+# group_aware: sibling-relative bonuses (unique GLM solver / no-offload solver / all-fail seek).
 # Set OFFLOAD_REWARD_MODE=cost_aware to restore the old "fail → 0" shaping.
 # export OFFLOAD_REWARD_MODE="${OFFLOAD_REWARD_MODE:-help_seeking}"
 export OFFLOAD_REWARD_MODE="${OFFLOAD_REWARD_MODE:-cost_aware}"
 export OFFLOAD_SEEK_ALPHA="${OFFLOAD_SEEK_ALPHA:-0.1}"
 export OFFLOAD_SEEK_EMPTY_SCALE="${OFFLOAD_SEEK_EMPTY_SCALE:-0.5}"
 export OFFLOAD_UNIQUE_SOLVER_BONUS="${OFFLOAD_UNIQUE_SOLVER_BONUS:-0.15}"
+export OFFLOAD_NO_OFFLOAD_BONUS="${OFFLOAD_NO_OFFLOAD_BONUS:-0.15}"
+
+# ---- GiGPO (optional; off by default) ----
+# Enable with:
+#   export SLIME_GIGPO=1
+#   export OFFLOAD_REWARD_MODE=group_aware
+#   export CUSTOM_REWARD_POST_PROCESS=examples.coding_agent_rl.gigpo_train.post_process_rewards
+#   export CUSTOM_CONVERT_SAMPLES=examples.coding_agent_rl.gigpo_train.convert_samples_to_train_data
+#   export CUSTOM_ADVANTAGE=examples.coding_agent_rl.gigpo_train.compute_advantages
+# Knobs: GIGPO_GAMMA=0.95 GIGPO_STEP_ADVANTAGE_W=1.0 GIGPO_MODE=mean_norm
+export SLIME_GIGPO="${SLIME_GIGPO:-0}"
+export GIGPO_GAMMA="${GIGPO_GAMMA:-0.95}"
+export GIGPO_STEP_ADVANTAGE_W="${GIGPO_STEP_ADVANTAGE_W:-1.0}"
+export GIGPO_MODE="${GIGPO_MODE:-mean_norm}"
 export DASHSCOPE_BASE_URL="${DASHSCOPE_BASE_URL:-http://208.64.254.187:8000/v1}"
 export DASHSCOPE_API_KEY="${DASHSCOPE_API_KEY:-sk-6137d26281697017ef07ef4da0823dc16d32acaad253ecac}"
 export DASHSCOPE_MODEL="${DASHSCOPE_MODEL:-glm-5.2-fp8}"

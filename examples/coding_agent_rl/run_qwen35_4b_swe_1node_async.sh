@@ -202,6 +202,22 @@ ALGO_ARGS=(
    --eps-clip 0.2
    --eps-clip-high 0.28
 )
+# GiGPO: per-turn samples + custom convert/advantage (see examples/coding_agent_rl/gigpo_train.py).
+if [[ "${SLIME_GIGPO:-0}" == "1" ]]; then
+  ALGO_ARGS+=(
+    --custom-advantage-function-path "${CUSTOM_ADVANTAGE:-examples.coding_agent_rl.gigpo_train.compute_advantages}"
+    --gamma "${GIGPO_GAMMA:-0.95}"
+  )
+  ROLLOUT_ARGS+=(
+    --custom-convert-samples-to-train-data-path "${CUSTOM_CONVERT_SAMPLES:-examples.coding_agent_rl.gigpo_train.convert_samples_to_train_data}"
+    --custom-reward-post-process-path "${CUSTOM_REWARD_POST_PROCESS:-examples.coding_agent_rl.gigpo_train.post_process_rewards}"
+  )
+elif [[ "${OFFLOAD_REWARD_MODE:-}" == "group_aware" ]]; then
+  # Group-relative offload shaping without step-level GiGPO.
+  ROLLOUT_ARGS+=(
+    --custom-reward-post-process-path "${CUSTOM_REWARD_POST_PROCESS:-examples.coding_agent_rl.gigpo_train.post_process_rewards}"
+  )
+fi
 
 OPTIMIZER_ARGS=(
    --optimizer adam

@@ -291,12 +291,26 @@ def log_rollout_data(
                 "num_microbatches",
                 "micro_batch_indices",
                 "source_names",
+                # GiGPO metadata: opaque ids / strings, not scalar metrics
+                "traj_uids",
+                "anchor_obs",
+                "partition",
             ]:
                 continue
             # Emit (sum, count) so gather_log_data can do a weighted average across
             # DP ranks. This stops the legacy "every rank has the same N samples"
             # assumption from biasing means once uneven-DP partitioning lands.
             if isinstance(val, (list, tuple)):
+                if not val:
+                    continue
+                # Skip non-numeric metadata lists (e.g. string uids) instead of
+                # failing on sum(str).
+                first = val[0]
+                if isinstance(first, str) or (
+                    first is not None
+                    and not isinstance(first, (int, float, bool, torch.Tensor, np.integer, np.floating))
+                ):
+                    continue
                 count = len(val)
                 if isinstance(val[0], torch.Tensor):
                     # NOTE: Here we have to do the clone().detach(), otherwise the tensor will be

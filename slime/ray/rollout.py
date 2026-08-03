@@ -872,6 +872,13 @@ class RolloutManager:
                 "source_names",
                 "prompt",
                 "teacher_log_probs",
+                # GiGPO extras (populated by custom convert when enabled)
+                "group_indices",
+                "traj_uids",
+                "anchor_obs",
+                "step_immediate_rewards",
+                "episode_rewards",
+                "turn_indices",
             ]:
                 if key not in data:
                     continue

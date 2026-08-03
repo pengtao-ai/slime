@@ -97,6 +97,7 @@ DEFAULT_OFFLOAD_THINK_FORMAT_PENALTY = 0.25
 DEFAULT_OFFLOAD_SEEK_ALPHA = 0.1
 DEFAULT_OFFLOAD_SEEK_EMPTY_SCALE = 0.5
 DEFAULT_OFFLOAD_UNIQUE_SOLVER_BONUS = 0.15
+DEFAULT_OFFLOAD_NO_OFFLOAD_BONUS = 0.15
 
 
 def offload_system_append_text() -> str:
@@ -169,10 +170,12 @@ def think_format_penalty() -> float:
 
 
 def reward_mode() -> str:
-    """``cost_aware`` (default) or ``help_seeking`` — see :func:`help_seeking_reward`."""
+    """``cost_aware`` (default), ``help_seeking``, or ``group_aware``."""
     mode = (os.environ.get("OFFLOAD_REWARD_MODE") or "cost_aware").strip().lower()
     if mode in ("help_seeking", "help-seeking", "seek"):
         return "help_seeking"
+    if mode in ("group_aware", "group-aware", "group"):
+        return "group_aware"
     return "cost_aware"
 
 
@@ -186,6 +189,10 @@ def seek_empty_scale() -> float:
 
 def unique_solver_bonus() -> float:
     return float(os.environ.get("OFFLOAD_UNIQUE_SOLVER_BONUS", str(DEFAULT_OFFLOAD_UNIQUE_SOLVER_BONUS)))
+
+
+def no_offload_bonus() -> float:
+    return float(os.environ.get("OFFLOAD_NO_OFFLOAD_BONUS", str(DEFAULT_OFFLOAD_NO_OFFLOAD_BONUS)))
 
 
 def _api_key() -> str:
@@ -1102,3 +1109,127 @@ def help_seeking_reward(
         bonus = float(unique_bonus if unique_bonus is not None else unique_solver_bonus())
         reward += bonus
     return max(0.0, reward)
+
+
+def _offload_count(stats: dict[str, Any] | None) -> int:
+    return int((stats or {}).get("offload_count", 0) or 0)
+
+
+def group_aware_rewards(
+    group: list[dict[str, Any]],
+    *,
+    lam: float | None = None,
+    alpha: float | None = None,
+    empty_scale: float | None = None,
+    unique_bonus: float | None = None,
+    no_offload_bonus_v: float | None = None,
+    format_penalty: float | None = None,
+    report: dict[str, Any] | None = None,
+) -> list[float]:
+    """Per-session rewards with group-relative offload shaping.
+
+    Each item in ``group`` is a dict with keys:
+      ``solved``, ``stats``, optional ``usage``, ``empty_patch``.
+
+    Rules (same ``group_index`` / instance siblings):
+      - all unsolved: legitimate in-think offload → α (else 0)
+      - unique solver that used GLM while others failed without GLM → +unique_bonus
+      - solved without GLM → +no_offload_bonus
+
+    If ``report`` is provided, it is filled with shaping diagnostics
+    (solved/offload counts, which bonuses fired).
+    """
+    n = len(group)
+    if n == 0:
+        if report is not None:
+            report.clear()
+            report.update(
+                {
+                    "n": 0,
+                    "n_solved": 0,
+                    "n_offload": 0,
+                    "unique_bonus_applied": False,
+                    "no_offload_bonus_count": 0,
+                    "all_fail": False,
+                    "rewards": [],
+                }
+            )
+        return []
+
+    bases: list[float] = []
+    solved_flags: list[bool] = []
+    used_glm: list[bool] = []
+    for item in group:
+        solved = float(item.get("solved", 0.0) or 0.0)
+        stats = item.get("stats")
+        usage = item.get("usage")
+        empty_patch = bool(item.get("empty_patch", False))
+        oc = _offload_count(stats)
+        used_glm.append(oc >= 1)
+        solved_flags.append(solved > 0.0)
+        bases.append(
+            help_seeking_reward(
+                solved,
+                stats,
+                usage=usage if isinstance(usage, dict) else None,
+                lam=lam,
+                format_penalty=format_penalty,
+                alpha=alpha,
+                empty_patch=empty_patch,
+                empty_scale=empty_scale,
+            )
+        )
+
+    n_solved = sum(1 for s in solved_flags if s)
+    n_offload = sum(1 for u in used_glm if u)
+    out = list(bases)
+    ub = float(unique_bonus if unique_bonus is not None else unique_solver_bonus())
+    nob = float(no_offload_bonus_v if no_offload_bonus_v is not None else no_offload_bonus())
+    unique_applied = False
+    no_offload_bonus_count = 0
+
+    if n_solved == 0:
+        # help_seeking already gave α to legitimate offloads; keep that.
+        out = [max(0.0, r) for r in out]
+        if report is not None:
+            report.clear()
+            report.update(
+                {
+                    "n": n,
+                    "n_solved": 0,
+                    "n_offload": n_offload,
+                    "unique_bonus_applied": False,
+                    "no_offload_bonus_count": 0,
+                    "all_fail": True,
+                    "rewards": list(out),
+                }
+            )
+        return out
+
+    # Unique GLM solver among failures-without-GLM siblings.
+    glm_solvers = [i for i in range(n) if solved_flags[i] and used_glm[i]]
+    non_glm_fail = [i for i in range(n) if (not solved_flags[i]) and (not used_glm[i])]
+    if len(glm_solvers) == 1 and len(non_glm_fail) == n - 1:
+        out[glm_solvers[0]] = max(0.0, out[glm_solvers[0]] + ub)
+        unique_applied = True
+
+    for i in range(n):
+        if solved_flags[i] and not used_glm[i]:
+            out[i] = max(0.0, out[i] + nob)
+            no_offload_bonus_count += 1
+
+    out = [max(0.0, r) for r in out]
+    if report is not None:
+        report.clear()
+        report.update(
+            {
+                "n": n,
+                "n_solved": n_solved,
+                "n_offload": n_offload,
+                "unique_bonus_applied": unique_applied,
+                "no_offload_bonus_count": no_offload_bonus_count,
+                "all_fail": False,
+                "rewards": list(out),
+            }
+        )
+    return out

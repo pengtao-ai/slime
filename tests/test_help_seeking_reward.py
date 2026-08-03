@@ -61,6 +61,8 @@ def test_reward_mode_help_seeking(monkeypatch):
     assert offload.reward_mode() == "help_seeking"
     monkeypatch.setenv("OFFLOAD_REWARD_MODE", "cost_aware")
     assert offload.reward_mode() == "cost_aware"
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "group_aware")
+    assert offload.reward_mode() == "group_aware"
 
 
 if __name__ == "__main__":

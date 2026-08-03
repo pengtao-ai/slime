@@ -403,9 +403,18 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             if session_obj is not None and getattr(session_obj, "offload_stats", None):
                 offload_stats = dict(session_obj.offload_stats)
             train_reward = solved
+            usage = md.get("usage") if isinstance(md.get("usage"), dict) else None
             if offload.offload_enabled():
-                usage = md.get("usage") if isinstance(md.get("usage"), dict) else None
-                if offload.reward_mode() == "help_seeking":
+                mode = offload.reward_mode()
+                if mode == "group_aware":
+                    # Per-sample base; sibling reshaping happens in gigpo_train.post_process_rewards.
+                    train_reward = offload.help_seeking_reward(
+                        solved,
+                        offload_stats,
+                        usage=usage,
+                        empty_patch=empty_patch,
+                    )
+                elif mode == "help_seeking":
                     train_reward = offload.help_seeking_reward(
                         solved,
                         offload_stats,
@@ -421,7 +430,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     solved,
                     train_reward,
                     empty_patch,
-                    offload.reward_mode(),
+                    mode,
                     offload_stats,
                 )
             if evaluation:
@@ -462,6 +471,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         "solved": solved,
                         "empty_patch": empty_patch,
                         "offload_stats": offload_stats,
+                        "usage": usage,
+                        "episode_reward": float(train_reward),
+                        "problem_statement": str(md.get("problem_statement") or ""),
+                        "workdir": str(md.get("workdir") or ""),
+                        "session_id": session_id,
                         "timeline": timeline,
                     },
                 )

@@ -12,12 +12,17 @@ from __future__ import annotations
 import dataclasses
 import enum
 import logging
+import os
 from collections.abc import Iterator
 from typing import Any
 
 from slime.utils.types import Sample
 
 logger = logging.getLogger(__name__)
+
+
+def _gigpo_per_turn_enabled() -> bool:
+    return os.environ.get("SLIME_GIGPO", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 # ===========================================================================
@@ -400,6 +405,31 @@ class TrajectoryManager:
 
         for s in samples:
             s.reward = reward
+            if s.metadata is None:
+                s.metadata = {}
+            # Ensure episode_reward is visible for GiGPO step discounting.
+            s.metadata.setdefault("episode_reward", float(reward))
+            if s.metadata.get("gigpo") and s.metadata.get("branch_key") == "main" and s.metadata.get(
+                "is_terminal_step"
+            ):
+                s.metadata["step_immediate_reward"] = float(reward)
+
+        # If GiGPO per-turn emitted multiple main leaves, only the globally last
+        # main terminal step should carry immediate reward.
+        if _gigpo_per_turn_enabled() and samples:
+            main_terms = [
+                s
+                for s in samples
+                if (s.metadata or {}).get("gigpo") and (s.metadata or {}).get("branch_key") == "main"
+            ]
+            for s in main_terms:
+                s.metadata["step_immediate_reward"] = 0.0
+                s.metadata["is_terminal_step"] = False
+            if main_terms:
+                # Highest turn_index among main steps.
+                last = max(main_terms, key=lambda x: int((x.metadata or {}).get("turn_index") or 0))
+                last.metadata["step_immediate_reward"] = float(reward)
+                last.metadata["is_terminal_step"] = True
 
         self._trees.pop(sid, None)
         self._turn_count.pop(sid, None)
@@ -557,11 +587,155 @@ class TrajectoryManager:
             "use_tool": use_tool,
             "ill_formed": ill_formed,
         }
+        if _gigpo_per_turn_enabled():
+            return self._chain_to_per_turn_samples(
+                chain,
+                base_sample=base_sample,
+                extra_metadata=md,
+                max_sample_tokens=max_sample_tokens,
+            )
         return [
             builder.to_sample(base_sample, md, max_sample_tokens)
             for builder in self._split_chain_into_builders(chain)
             if builder.has_trained_response()
         ]
+
+    def _chain_to_per_turn_samples(
+        self,
+        chain: list[MessageNode],
+        *,
+        base_sample: Sample,
+        extra_metadata: dict[str, Any] | None,
+        max_sample_tokens: int = 0,
+    ) -> list[Sample]:
+        """Emit one Sample per trained SLM turn (GiGPO step rows)."""
+        # Lazy import: coding-agent example helpers (optional dependency path).
+        try:
+            from examples.coding_agent_rl.gigpo_anchor import (
+                branch_key_from_user_task,
+                extract_text_content,
+                extract_tool_name_and_input,
+                make_anchor_obs,
+            )
+        except ImportError:
+            logger.warning("GiGPO per-turn requested but gigpo_anchor import failed; falling back to packed samples")
+            return [
+                builder.to_sample(base_sample, extra_metadata or {}, max_sample_tokens)
+                for builder in self._split_chain_into_builders(chain)
+                if builder.has_trained_response()
+            ]
+
+        instance_id = str((extra_metadata or {}).get("instance_id") or base_sample.label or "")
+        problem_statement = str((extra_metadata or {}).get("problem_statement") or "")
+        workdir = str((extra_metadata or {}).get("workdir") or "")
+        episode_user = ""
+        if isinstance(base_sample.prompt, list) and base_sample.prompt:
+            episode_user = extract_text_content(base_sample.prompt[0] if isinstance(base_sample.prompt[0], dict) else {})
+        elif isinstance(base_sample.prompt, str):
+            episode_user = base_sample.prompt
+
+        # First user task on this chain → branch_key.
+        first_user = ""
+        for n in chain:
+            if n.role == "user" and n.message:
+                first_user = extract_text_content(n.message)
+                if first_user.strip():
+                    break
+        bkey = branch_key_from_user_task(first_user, episode_user=episode_user or problem_statement)
+        base_rid = base_sample.rollout_id if base_sample.rollout_id is not None else base_sample.index
+        traj_uid = f"{base_rid}:{bkey}"
+
+        asst_nodes = [n for n in chain if n.role == "assistant" and n.turn is not None]
+        samples: list[Sample] = []
+        for asst_node in asst_nodes:
+            trained = not asst_node.response_trained
+            asst_node.response_trained = True
+            if not trained:
+                continue
+            turn = asst_node.turn
+            assert turn is not None
+            if not turn.output_ids:
+                continue
+
+            # Anchor = env observation before this action (prev tool result), or init.
+            prev_tool_name: str | None = None
+            prev_tool_input: dict[str, Any] | None = None
+            prev_tool_result: str | None = None
+            path = asst_node.path_from_root()
+            # Walk backwards: find last user/tool message before this assistant; and the
+            # assistant tool_use that produced it.
+            for i in range(len(path) - 2, -1, -1):
+                node = path[i]
+                if node.role in ("user", "tool") and node.message:
+                    prev_tool_result = extract_text_content(node.message)
+                    # preceding assistant with tool call
+                    for j in range(i - 1, -1, -1):
+                        if path[j].role == "assistant" and path[j].message:
+                            prev_tool_name, prev_tool_input = extract_tool_name_and_input(path[j].message)
+                            break
+                    break
+
+            is_init = prev_tool_result is None and prev_tool_name is None
+            anchor = make_anchor_obs(
+                instance_id=instance_id,
+                branch_key=bkey,
+                tool_name=prev_tool_name,
+                tool_input=prev_tool_input,
+                tool_result_text=prev_tool_result,
+                workdir=workdir,
+                is_init=is_init,
+                problem_statement=problem_statement or episode_user,
+            )
+
+            tokens = list(turn.prompt_ids) + list(turn.output_ids)
+            resp_len = len(turn.output_ids)
+            if turn.output_loss_mask:
+                loss_mask = list(turn.output_loss_mask)
+            else:
+                loss_mask = [1] * resp_len
+            logprobs = list(turn.output_log_probs) if turn.output_log_probs else [0.0] * resp_len
+            if len(logprobs) != resp_len:
+                logprobs = (logprobs + [0.0] * resp_len)[:resp_len]
+            if max_sample_tokens and len(tokens) > max_sample_tokens:
+                # Keep response tail within budget when possible.
+                overflow = len(tokens) - max_sample_tokens
+                if overflow >= len(turn.prompt_ids):
+                    continue
+                tokens = tokens[overflow:]
+                # prompt truncated; response unchanged
+            md = {
+                **(extra_metadata or {}),
+                "gigpo": True,
+                "anchor_obs": anchor,
+                "traj_uid": traj_uid,
+                "branch_key": bkey,
+                "turn_index": asst_node.turn_index,
+                "step_immediate_reward": 0.0,
+                "episode_reward": float((extra_metadata or {}).get("episode_reward", 0.0) or 0.0),
+            }
+            samples.append(
+                Sample(
+                    index=base_sample.index,
+                    group_index=base_sample.group_index,
+                    rollout_id=base_rid,
+                    prompt=base_sample.prompt,
+                    label=base_sample.label,
+                    tokens=tokens,
+                    response_length=resp_len,
+                    loss_mask=loss_mask,
+                    rollout_log_probs=logprobs,
+                    reward=0.0,
+                    status=Sample.Status.TRUNCATED if turn.finish_reason == "length" else Sample.Status.COMPLETED,
+                    metadata=md,
+                )
+            )
+
+        # Mark last main-branch turn as the terminal immediate reward carrier.
+        if samples and bkey == "main":
+            ep_r = float((extra_metadata or {}).get("episode_reward", 0.0) or 0.0)
+            samples[-1].metadata["step_immediate_reward"] = ep_r
+            samples[-1].metadata["is_terminal_step"] = True
+        return samples
 
 
 __all__ = [
