@@ -104,10 +104,9 @@ def build_rows(samples: list[dict[str, Any]], *, tok) -> list[dict[str, Any]]:
 
 
 def _tool_of(anchor: str) -> str:
-    try:
-        return (json.loads(anchor).get("obs") or ["?"])[0]
-    except (json.JSONDecodeError, TypeError):
-        return "?"
+    from examples.coding_agent_rl.gigpo_anchor import anchor_tool_label
+
+    return anchor_tool_label(anchor)
 
 
 def assign_group_ids(rows: list[dict[str, Any]]) -> dict[str, int]:
