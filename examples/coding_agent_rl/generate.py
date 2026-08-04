@@ -62,6 +62,32 @@ class _OffloadMixin:
     Code's full system (incl. ``gitStatus``).
     """
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._sid_repo_state: dict[str, dict[str, Any]] = {}
+        self._sid_turn_git_diffs: dict[str, list[dict[str, Any]]] = {}
+
+    def bind_repo_state(self, sid: str, *, sb: Any, workdir: str) -> None:
+        self._sid_repo_state[sid] = {"sb": sb, "workdir": workdir}
+
+    def unbind_repo_state(self, sid: str) -> None:
+        self._sid_repo_state.pop(sid, None)
+
+    def pop_turn_git_diffs(self, sid: str) -> list[dict[str, Any]]:
+        return self._sid_turn_git_diffs.pop(sid, [])
+
+    async def _capture_turn_git_diff(self, sid: str, session: Session) -> None:
+        state = self._sid_repo_state.get(sid)
+        if not state:
+            return
+        turn_index = int(((session.timing or {}).get("current_turn", 0) or 0))
+        record = {"turn_index": turn_index, "git_diff": ""}
+        try:
+            record["git_diff"] = await swe.capture_turn_git_diff(state["sb"], state["workdir"])
+        except Exception as exc:
+            record["capture_error"] = f"{type(exc).__name__}: {exc}"
+        self._sid_turn_git_diffs.setdefault(sid, []).append(record)
+
     def _preprocess_body(self, body: dict) -> None:
         super()._preprocess_body(body)
         offload.inject_offload_into_request_body(body)
@@ -77,7 +103,7 @@ class _OffloadMixin:
         session: Session,
         sid: str,
     ) -> Reply:
-        return await offload.apply_offload_if_needed(
+        reply = await offload.apply_offload_if_needed(
             reply,
             raw_output=raw_output,
             translated=translated,
@@ -87,6 +113,8 @@ class _OffloadMixin:
             tokenizer=self.tokenizer,
             tools_schema=tools_schema,
         )
+        await self._capture_turn_git_diff(sid, session)
+        return reply
 
 
 class CodingAnthropicAdapter(_OffloadMixin, AnthropicAdapter):
@@ -340,6 +368,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     args={"instance_id": instance_id},
                 ):
                     await swe.prepare_workspace(sb, md["workdir"], md)
+                state.adapter.bind_repo_state(session_id, sb=sb, workdir=md["workdir"])
                 with chrome_span(
                     trace_events,
                     "agent_run",
@@ -463,6 +492,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         "empty_patch": empty_patch,
                         "offload_stats": offload_stats,
                         "timeline": timeline,
+                        "turn_git_diffs": state.adapter.pop_turn_git_diffs(session_id),
                     },
                 )
             if not samples:
@@ -518,6 +548,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         _attach_timeline(result_samples, timeline)
         return result_samples
     finally:
+        state.adapter.unbind_repo_state(session_id)
+        state.adapter.pop_turn_git_diffs(session_id)
         await state.adapter.drop_session(session_id, wait_timeout=30)  # cleanup only, idempotent
         with chrome_span(
             trace_events,

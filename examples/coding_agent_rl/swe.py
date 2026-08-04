@@ -25,6 +25,7 @@ harness is the prompt, which the orchestrator passes into ``harness.run()``.
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import logging
 import os
@@ -227,10 +228,67 @@ async def apply_pre_commands(sb: Sandbox, workdir: str, pre: list[str] | str) ->
 # ---------------------------------------------------------------------------
 # Diff capture (agent sandbox, after harness.run)
 # ---------------------------------------------------------------------------
+_DIFF_EXCLUDES = "-- . ':(exclude)PROBLEM_STATEMENT.md' ':(exclude).harness/'"
+
+
 async def git_diff(sb: Sandbox, workdir: str) -> str:
     cmd = f"cd {workdir} && git add -N . && git diff -- . ':(exclude)PROBLEM_STATEMENT.md' ':(exclude).harness/'"
     _, out, _ = await sb.exec(cmd, user="agent", timeout=120)
     return out
+
+
+async def capture_turn_git_diff(sb: Sandbox, workdir: str) -> str:
+    tracked = await _tracked_git_diff(sb, workdir)
+    untracked = await _untracked_git_diff(sb, workdir)
+    if tracked and untracked:
+        return f"{tracked.rstrip()}\n{untracked}"
+    return tracked or untracked
+
+
+async def _tracked_git_diff(sb: Sandbox, workdir: str) -> str:
+    cmd = f"cd {workdir} && git diff --no-ext-diff -M -C {_DIFF_EXCLUDES}"
+    _, out, _ = await sb.exec(cmd, user="agent", timeout=120)
+    return out
+
+
+async def _untracked_git_diff(sb: Sandbox, workdir: str) -> str:
+    cmd = (
+        f"cd {workdir} && git ls-files --others --exclude-standard {_DIFF_EXCLUDES}"
+    )
+    _, out, _ = await sb.exec(cmd, user="agent", timeout=120)
+    paths = [line.strip() for line in out.splitlines() if line.strip()]
+    if not paths:
+        return ""
+    patches: list[str] = []
+    for rel_path in paths:
+        try:
+            body = await sb.read_file(f"{workdir.rstrip('/')}/{rel_path}", user="agent")
+        except Exception:
+            body = ""
+        patches.append(_format_untracked_patch(rel_path, body))
+    return "\n".join(patches)
+
+
+def _format_untracked_patch(rel_path: str, body: str) -> str:
+    new_text = body if isinstance(body, str) else str(body)
+    if new_text and not new_text.endswith("\n"):
+        new_text += "\n"
+    diff_lines = difflib.unified_diff(
+        [],
+        new_text.splitlines(keepends=True),
+        fromfile=f"a/{rel_path}",
+        tofile=f"b/{rel_path}",
+        n=3,
+        lineterm="",
+    )
+    patch = "\n".join(diff_lines)
+    if patch:
+        return f"diff --git a/{rel_path} b/{rel_path}\nnew file mode 100644\n{patch}\n"
+    return (
+        f"diff --git a/{rel_path} b/{rel_path}\n"
+        f"new file mode 100644\n"
+        f"--- a/{rel_path}\n+++ b/{rel_path}\n"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -186,6 +186,9 @@ def test_generate_produces_trained_samples():
             assert len(s.loss_mask) == len(s.rollout_log_probs) == s.response_length
             assert sum(s.loss_mask) > 0  # at least one trained token
             assert s.metadata.get("agent_exit_code") == 0
+            turn_git_diffs = s.metadata.get("turn_git_diffs") or []
+            assert turn_git_diffs
+            assert all("turn_index" in d and "git_diff" in d for d in turn_git_diffs)
         # eval_cmd "true" applied cleanly on a clean (empty) diff -> reward 1.0,
         # split evenly across the emitted samples.
         assert abs(sum(s.reward for s in samples) - 1.0) < 1e-9

@@ -44,8 +44,8 @@ export SLIME_AGENT_OFFLOAD="${SLIME_AGENT_OFFLOAD:-1}"
 export OFFLOAD_EFFICIENCY_LAMBDA="${OFFLOAD_EFFICIENCY_LAMBDA:-0.05}"
 # help_seeking: unsolved+in-think offload gets partial credit (see offload.help_seeking_reward).
 # Set OFFLOAD_REWARD_MODE=cost_aware to restore the old "fail → 0" shaping.
-# export OFFLOAD_REWARD_MODE="${OFFLOAD_REWARD_MODE:-help_seeking}"
-export OFFLOAD_REWARD_MODE="${OFFLOAD_REWARD_MODE:-cost_aware}"
+export OFFLOAD_REWARD_MODE="${OFFLOAD_REWARD_MODE:-help_seeking}"
+# export OFFLOAD_REWARD_MODE="${OFFLOAD_REWARD_MODE:-cost_aware}"
 export OFFLOAD_SEEK_ALPHA="${OFFLOAD_SEEK_ALPHA:-0.1}"
 export OFFLOAD_SEEK_EMPTY_SCALE="${OFFLOAD_SEEK_EMPTY_SCALE:-0.5}"
 export OFFLOAD_UNIQUE_SOLVER_BONUS="${OFFLOAD_UNIQUE_SOLVER_BONUS:-0.15}"
