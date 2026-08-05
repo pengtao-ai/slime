@@ -41,7 +41,7 @@ SLIME_DIR="${SLIME_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 
 # ---- mid-turn offload ----
 export SLIME_AGENT_OFFLOAD="${SLIME_AGENT_OFFLOAD:-1}"
-export OFFLOAD_EFFICIENCY_LAMBDA="${OFFLOAD_EFFICIENCY_LAMBDA:-0.05}"
+export OFFLOAD_EFFICIENCY_LAMBDA="${OFFLOAD_EFFICIENCY_LAMBDA:-0.5}"
 # help_seeking: unsolved+in-think offload gets partial credit (see offload.help_seeking_reward).
 # Set OFFLOAD_REWARD_MODE=cost_aware to restore the old "fail → 0" shaping.
 export OFFLOAD_REWARD_MODE="${OFFLOAD_REWARD_MODE:-help_seeking}"
@@ -49,9 +49,9 @@ export OFFLOAD_REWARD_MODE="${OFFLOAD_REWARD_MODE:-help_seeking}"
 export OFFLOAD_SEEK_ALPHA="${OFFLOAD_SEEK_ALPHA:-0.1}"
 export OFFLOAD_SEEK_EMPTY_SCALE="${OFFLOAD_SEEK_EMPTY_SCALE:-0.5}"
 export OFFLOAD_UNIQUE_SOLVER_BONUS="${OFFLOAD_UNIQUE_SOLVER_BONUS:-0.15}"
-export DASHSCOPE_BASE_URL="${DASHSCOPE_BASE_URL:-http://208.64.254.187:8000/v1}"
+export DASHSCOPE_BASE_URL="${DASHSCOPE_BASE_URL:-http://208.64.254.187:8001/v1}"
 export DASHSCOPE_API_KEY="${DASHSCOPE_API_KEY:-sk-6137d26281697017ef07ef4da0823dc16d32acaad253ecac}"
-export DASHSCOPE_MODEL="${DASHSCOPE_MODEL:-glm-5.2-fp8}"
+export DASHSCOPE_MODEL="${DASHSCOPE_MODEL:-deepseek-v4-flash-0731}"
 export OFFLOAD_MAX_TOKENS="${OFFLOAD_MAX_TOKENS:-32768}"
 # PyroDash-4B-SFT-0723: <|llm_offload|>=248077, <|/llm_offload|>=248078.
 # Stop on the *close* tag so open + digit N can be emitted first.
@@ -69,8 +69,8 @@ fi
 
 # ---- PyroDash checkpoints (BF16 train + BF16 rollout) ----
 # SGLang loads padded HF vocab rows; Megatron torch_dist is padded to 248320.
-export HF_CHECKPOINT="${HF_CHECKPOINT:-/workspace/models/pyromind/PyroDash-4B-SFT-07313}"
-export REF_MODEL_PATH="${REF_MODEL_PATH:-/workspace/models/pyromind/PyroDash-4B-SFT-07313_torch_dist}"
+export HF_CHECKPOINT="${HF_CHECKPOINT:-/workspace/models/pyromind/PyroDash-4B-SFT-0803}"
+export REF_MODEL_PATH="${REF_MODEL_PATH:-/workspace/models/pyromind/PyroDash-4B-SFT-0803_torch_dist}"
 export EXP_TAG="${EXP_TAG:-agent_offload_pyrodash4b_docker_async}"
 # FP8 KV cache for longer agent decode contexts (rollout only; weights stay BF16).
 export SGLANG_KV_CACHE_DTYPE="${SGLANG_KV_CACHE_DTYPE:-fp8_e4m3}"

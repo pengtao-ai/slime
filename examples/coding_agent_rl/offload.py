@@ -259,7 +259,9 @@ def reasoning_from_n(n: int) -> tuple[bool, str | None]:
     """Map digit N -> ``(enable_thinking, reasoning_effort)``."""
     if n <= 0:
         return False, None
-    if n <= 5:
+    if n <= 3:
+        return True, "low"
+    if n <= 6:
         return True, "high"
     return True, "max"
 
