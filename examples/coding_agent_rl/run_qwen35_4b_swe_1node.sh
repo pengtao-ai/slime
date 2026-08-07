@@ -91,6 +91,9 @@ ROLLOUT_ARGS=(
    --micro-batch-size 1
    --save-debug-rollout-data "${RUN_ROOT}/rollout_dumps/rollout_{rollout_id}.pt"
 )
+if [[ "${OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG:-}" =~ ^(1|true|yes|on)$ ]]; then
+  ROLLOUT_ARGS+=(--rollout-sample-filter-path examples.coding_agent_rl.offload.shape_group_help_seeking_rewards)
+fi
 
 PERF_ARGS=(
    --tensor-model-parallel-size ${TP_SIZE}
@@ -243,6 +246,7 @@ keys = (
     "OFFLOAD_THINK_FORMAT_PENALTY",
     "OFFLOAD_REWARD_MODE", "OFFLOAD_SEEK_ALPHA",
     "OFFLOAD_SEEK_EMPTY_SCALE", "OFFLOAD_UNIQUE_SOLVER_BONUS",
+    "OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG",
     "OFFLOAD_STOP_TOKEN_ID", "ROLLOUT_STOP_TOKEN_IDS",
     "SLIME_AGENT_OFFLOAD_SYSTEM_APPEND",
     "SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS",

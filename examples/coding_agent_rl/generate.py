@@ -435,11 +435,14 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             if offload.offload_enabled():
                 usage = md.get("usage") if isinstance(md.get("usage"), dict) else None
                 if offload.reward_mode() == "help_seeking":
+                    # When OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG=1, defer α to
+                    # shape_group_help_seeking_rewards (group all-failed only).
                     train_reward = offload.help_seeking_reward(
                         solved,
                         offload_stats,
                         usage=usage,
                         empty_patch=empty_patch,
+                        encourage_seek=not offload.seek_only_when_all_wrong(),
                     )
                 else:
                     train_reward = offload.cost_aware_reward(solved, offload_stats, usage=usage)

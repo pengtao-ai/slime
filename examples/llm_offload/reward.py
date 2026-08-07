@@ -37,8 +37,8 @@ logger = logging.getLogger(__name__)
 
 OFFLOAD_TAG = "<|llm_offload|>"
 REDIRECT_END = "<|im_end|>"
-DEFAULT_DASHSCOPE_BASE_URL = os.environ.get("DASHSCOPE_BASE_URL", "http://127.0.0.1:8000/v1")
-DEFAULT_DASHSCOPE_MODEL = os.environ.get("DASHSCOPE_MODEL", "glm-5.2-fp8")
+DEFAULT_DASHSCOPE_BASE_URL = os.environ.get("DASHSCOPE_BASE_URL", "http://208.64.254.187:8001/v1")
+DEFAULT_DASHSCOPE_MODEL = os.environ.get("DASHSCOPE_MODEL", "deepseek-v4-flash-0731")
 DEFAULT_OFFLOAD_MAX_TOKENS = int(os.environ.get("OFFLOAD_MAX_TOKENS", "8192"))
 MAX_CALL_NUM = 8192
 DEFAULT_LOG_PREVIEW_CHARS = 400
@@ -217,7 +217,11 @@ def _call_remote_chat(
         "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
-        "chat_template_kwargs": {"enable_thinking": enable_thinking},
+        "chat_template_kwargs": (
+            {"thinking": True, "reasoning_effort": "high"}
+            if enable_thinking
+            else {"thinking": False}
+        ),
     }
 
     try:

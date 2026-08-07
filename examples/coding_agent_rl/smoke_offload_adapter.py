@@ -163,7 +163,8 @@ async def _run() -> None:
                 assert any("<part_think>" in (m.get("content") or "") for m in glm_msgs)
                 # budget = OFFLOAD_MAX_TOKENS - len(SLM output ids)
                 assert glm.requests[0]["max_tokens"] == 100 - len(TURN1_IDS)
-                assert glm.requests[0].get("reasoning_effort") == "max"  # N=7
+                assert glm.requests[0].get("chat_template_kwargs", {}).get("thinking") is True
+                assert glm.requests[0].get("chat_template_kwargs", {}).get("reasoning_effort") == "max"  # N=7
 
                 # ---- round 2: history includes composed assistant ----
                 body2 = {

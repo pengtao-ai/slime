@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Inference-only: CC → adapter → GLM only (no local SLM, no offload relay).
+# Inference-only: CC → adapter → remote LLM only (no local SLM, no offload relay).
 #
 # Defaults: resume into the existing run dir; skip samples with summary.json.
 #
@@ -11,9 +11,9 @@
 #     (probe failures are now per-sample RuntimeError + retries)
 #
 # Prerequisites:
-#   export DASHSCOPE_API_KEY=...
-#   export DASHSCOPE_BASE_URL=https://.../v1
-#   export DASHSCOPE_MODEL=glm-5.2-fp8   # optional
+#   export DASHSCOPE_API_KEY=...   # or rely on defaults below
+#   export DASHSCOPE_BASE_URL=http://host:8001/v1
+#   export DASHSCOPE_MODEL=deepseek-v4-flash-0731   # optional
 #   node + claude-code tarballs under examples/coding_agent_rl/tarballs/
 #
 # Example:
@@ -26,8 +26,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." &>/dev/null && pwd)"
 
+# ---- remote LLM (deepseek-v4-flash; was GLM) ----
+export DASHSCOPE_BASE_URL="${DASHSCOPE_BASE_URL:-http://208.64.254.187:8001/v1}"
+export DASHSCOPE_API_KEY="${DASHSCOPE_API_KEY:-sk-6137d26281697017ef07ef4da0823dc16d32acaad253ecac}"
+export DASHSCOPE_MODEL="${DASHSCOPE_MODEL:-deepseek-v4-flash-0731}"
+# Infer default: thinking on + max effort (override with --no-thinking / --reasoning-effort).
+export INFER_REASONING_EFFORT="${INFER_REASONING_EFFORT:-high}"
+
 if [[ -z "${DASHSCOPE_API_KEY:-}" && -z "${OPENAI_API_KEY:-}" ]]; then
-  echo "ERROR: set DASHSCOPE_API_KEY (or OPENAI_API_KEY) for GLM." >&2
+  echo "ERROR: set DASHSCOPE_API_KEY (or OPENAI_API_KEY) for remote LLM." >&2
   exit 1
 fi
 
@@ -52,16 +59,16 @@ export ADAPTER_PORT="${ADAPTER_PORT:-18011}"
 : "${ADAPTER_PUBLIC_URL:=}"
 export ADAPTER_PUBLIC_URL
 
-OUT_DIR="${OUT_DIR:-${REPO_ROOT}/runs/infer_cc_glm_20260728_141118}"
+OUT_DIR="${OUT_DIR:-${REPO_ROOT}/runs/infer_cc_dsv4flash_20260806_141118}"
 JSONL="${PROMPT_DATA:-${SCRIPT_DIR}/data/swe_train_scaleswe.jsonl}"
 TIME_BUDGET="${SWE_AGENT_TIME_BUDGET_SEC:-${TIME_BUDGET:-900}}"
-LIMIT="${LIMIT:-${INFER_LIMIT:-10000}}"
-OFFSET="${OFFSET:-${INFER_OFFSET:-0}}"
+LIMIT="${LIMIT:-${INFER_LIMIT:-20000}}"
+OFFSET="${OFFSET:-${INFER_OFFSET:-15000}}"
 # docker-rt: keep concurrent sandboxes modest; override upward if stable.
 CONCURRENCY="${CONCURRENCY:-${INFER_CONCURRENCY:-8}}"
 
 echo "======================================================================"
-echo "Infer CC → GLM only (no SLM / no train) [resume]"
+echo "Infer CC → deepseek only (no SLM / no train) [resume]"
 echo "  OUT_DIR=${OUT_DIR}"
 echo "  JSONL=${JSONL}"
 echo "  LIMIT=${LIMIT} OFFSET=${OFFSET} CONCURRENCY=${CONCURRENCY}"
@@ -69,8 +76,9 @@ echo "  ADAPTER_BIND_HOST=${ADAPTER_BIND_HOST}"
 echo "  ADAPTER_PUBLIC_HOST=${ADAPTER_PUBLIC_HOST}:${ADAPTER_PORT}"
 echo "  SLIME_AGENT_DOCKER_NETWORK=${SLIME_AGENT_DOCKER_NETWORK}"
 echo "  SLIME_AGENT_DOCKER_NAME_PREFIX=${SLIME_AGENT_DOCKER_NAME_PREFIX}"
-echo "  DASHSCOPE_BASE_URL=${DASHSCOPE_BASE_URL:-}"
-echo "  DASHSCOPE_MODEL=${DASHSCOPE_MODEL:-}"
+echo "  DASHSCOPE_BASE_URL=${DASHSCOPE_BASE_URL}"
+echo "  DASHSCOPE_MODEL=${DASHSCOPE_MODEL}"
+echo "  INFER_REASONING_EFFORT=${INFER_REASONING_EFFORT}"
 echo "  TIME_BUDGET=${TIME_BUDGET}"
 echo "======================================================================"
 

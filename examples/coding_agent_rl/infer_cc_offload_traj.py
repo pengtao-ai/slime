@@ -16,7 +16,7 @@ Prereqs::
 
     export DASHSCOPE_API_KEY=...
     export DASHSCOPE_BASE_URL=https://.../v1
-    export DASHSCOPE_MODEL=glm-5.2-fp8   # optional
+    export DASHSCOPE_MODEL=deepseek-v4-flash-0731   # optional
 
 Then::
 
@@ -693,7 +693,7 @@ def main() -> None:
     p.add_argument("--time-budget", type=int, default=int(os.environ.get("SWE_AGENT_TIME_BUDGET_SEC", "600")))
     p.add_argument("--max-context-len", type=int, default=int(os.environ.get("SMOKE_MAX_CONTEXT_LEN", "96000")))
     p.add_argument("--max-new-tokens", type=int, default=int(os.environ.get("SMOKE_MAX_NEW_TOKENS", "8192")))
-    p.add_argument("--temperature", type=float, default=float(os.environ.get("SMOKE_TEMPERATURE", "0.7")))
+    p.add_argument("--temperature", type=float, default=float(os.environ.get("SMOKE_TEMPERATURE", "1.0")))
     p.add_argument("--prompt", default=os.environ.get("SWE_CC_PROMPT", DEFAULT_PROMPT))
     p.add_argument(
         "--out-dir",
@@ -710,11 +710,15 @@ def main() -> None:
     p.add_argument("--eval", action="store_true")
     p.add_argument("--eval-timeout", type=int, default=600)
     p.add_argument("--require-exit-zero", action="store_true")
-    p.add_argument("--no-thinking", action="store_true", help="Disable GLM enable_thinking")
+    p.add_argument(
+        "--no-thinking",
+        action="store_true",
+        help="Disable chat_template_kwargs.thinking",
+    )
     p.add_argument(
         "--reasoning-effort",
         default=os.environ.get("INFER_REASONING_EFFORT", ""),
-        help="Optional GLM reasoning_effort (e.g. high)",
+        help="Optional chat_template_kwargs.reasoning_effort (e.g. max)",
     )
     p.add_argument(
         "--limit",

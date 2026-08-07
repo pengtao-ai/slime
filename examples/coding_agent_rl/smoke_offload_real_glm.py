@@ -15,7 +15,7 @@ Does not need GPU / Docker / Ray. Requires DASHSCOPE_* env (or launcher defaults
 
   export DASHSCOPE_API_KEY=...
   export DASHSCOPE_BASE_URL=http://host:8000/v1
-  export DASHSCOPE_MODEL=glm-5.2-fp8
+  export DASHSCOPE_MODEL=deepseek-v4-flash-0731
   python examples/coding_agent_rl/smoke_offload_real_glm.py
   # optional: OFFLOAD_N=3 OFFLOAD_MAX_TOKENS=512
 """
@@ -32,7 +32,7 @@ _REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO))
 
 os.environ.setdefault("SLIME_AGENT_OFFLOAD", "1")
-os.environ.setdefault("DASHSCOPE_MODEL", "glm-5.2-fp8")
+os.environ.setdefault("DASHSCOPE_MODEL", "deepseek-v4-flash-0731")
 os.environ.setdefault("OFFLOAD_MAX_TOKENS", "512")
 
 from examples.coding_agent_rl import offload  # noqa: E402

@@ -165,6 +165,10 @@ ROLLOUT_ARGS=(
    --micro-batch-size ${MICRO_BATCH_SIZE:-1}
    --update-weights-interval "${UPDATE_WEIGHTS_INTERVAL}"
 )
+# help_seeking α only when the whole GRPO group failed (no-op unless env set).
+if [[ "${OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG:-}" =~ ^(1|true|yes|on)$ ]]; then
+  ROLLOUT_ARGS+=(--rollout-sample-filter-path examples.coding_agent_rl.offload.shape_group_help_seeking_rewards)
+fi
 if [[ -n "${LOAD_DEBUG_ROLLOUT_DATA}" ]]; then
   ROLLOUT_ARGS+=(--load-debug-rollout-data "${LOAD_DEBUG_ROLLOUT_DATA}")
 else
@@ -332,6 +336,7 @@ keys = (
     "OFFLOAD_THINK_FORMAT_PENALTY",
     "OFFLOAD_REWARD_MODE", "OFFLOAD_SEEK_ALPHA",
     "OFFLOAD_SEEK_EMPTY_SCALE", "OFFLOAD_UNIQUE_SOLVER_BONUS",
+    "OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG",
     "OFFLOAD_STOP_TOKEN_ID", "ROLLOUT_STOP_TOKEN_IDS",
     "SLIME_AGENT_OFFLOAD_SYSTEM_APPEND",
     "SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS",

@@ -14,7 +14,7 @@
 #   3. Remote grader / GLM OpenAI-compatible API:
 #        export DASHSCOPE_API_KEY=...
 #        export DASHSCOPE_BASE_URL=http://host:8000/v1
-#        export DASHSCOPE_MODEL=glm-5.2-fp8
+#        export DASHSCOPE_MODEL=deepseek-v4-flash-0731
 #        export OFFLOAD_EFFICIENCY_LAMBDA=0.6
 #
 # Run from a long-lived shell / tmux:
@@ -62,8 +62,8 @@ mkdir -p "${RUN_ROOT}/rollout_dumps"
 LOG_FILE="${RUN_ROOT}/run.log"
 
 # Remote offload grader (consumed by examples.llm_offload.reward)
-export DASHSCOPE_BASE_URL="${DASHSCOPE_BASE_URL:-http://127.0.0.1:8000/v1}"
-export DASHSCOPE_MODEL="${DASHSCOPE_MODEL:-glm-5.2-fp8}"
+export DASHSCOPE_BASE_URL="${DASHSCOPE_BASE_URL:-http://208.64.254.187:8001/v1}"
+export DASHSCOPE_MODEL="${DASHSCOPE_MODEL:-deepseek-v4-flash-0731}"
 export OFFLOAD_EFFICIENCY_LAMBDA="${OFFLOAD_EFFICIENCY_LAMBDA:-0.6}"
 export OFFLOAD_MAX_TOKENS="${OFFLOAD_MAX_TOKENS:-8192}"
 export OFFLOAD_MAX_WORKERS="${OFFLOAD_MAX_WORKERS:-32}"

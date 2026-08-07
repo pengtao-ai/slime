@@ -12,6 +12,8 @@ examples/coding_agent_rl/docker_build/restored/
 examples/coding_agent_rl/docker_build/kaniko_out/
 examples/coding_agent_rl/docker_build/bake_failures.jsonl
 examples/coding_agent_rl/docker_build/verify_failures.jsonl
+examples/coding_agent_rl/docker_build/bake_failures_reward1_glm_20260728.jsonl
+examples/coding_agent_rl/docker_build/verify_failures_reward1_glm_20260728.jsonl
 examples/coding_agent_rl/docker_build/dockerfiles/
 examples/coding_agent_rl/docker_build/.env
 examples/coding_agent_rl/data/

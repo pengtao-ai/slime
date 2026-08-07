@@ -5,8 +5,9 @@ Per agent round (every Claude Code / Codex request):
 1. Adapter always calls the local SLM first.
 2. If the SLM emits ``<|llm_offload|>N<|/llm_offload|>`` *inside thinking*
    (before ``</think>``; Qwen often omits the opening ``<think>`` from output_ids),
-   call remote GLM with thinking selected by ``N`` (0=off, 1-5=high, 6-9=max).
-   Spans after ``</think>`` do not call GLM and incur a think-format reward penalty.
+   call remote LLM with thinking selected by ``N`` (0=off, 1-3=low, 4-6=high, 7-9=max)
+   via ``chat_template_kwargs.thinking`` / ``reasoning_effort``.
+   Spans after ``</think>`` do not call the remote LLM and incur a think-format reward penalty.
 3. Compose SLM prefix + GLM continuation into one complete assistant reply and
    only then flush it to the agent.
 
@@ -51,8 +52,8 @@ OFFLOAD_CLOSE = "<|/llm_offload|>"
 OFFLOAD_TAG = OFFLOAD_OPEN
 _OFFLOAD_SPAN_RE = re.compile(re.escape(OFFLOAD_OPEN) + r"(\d)" + re.escape(OFFLOAD_CLOSE))
 
-DEFAULT_DASHSCOPE_BASE_URL = os.environ.get("DASHSCOPE_BASE_URL", "http://127.0.0.1:8000/v1")
-DEFAULT_DASHSCOPE_MODEL = os.environ.get("DASHSCOPE_MODEL", "glm-5.2-fp8")
+DEFAULT_DASHSCOPE_BASE_URL = os.environ.get("DASHSCOPE_BASE_URL", "http://208.64.254.187:8001/v1")
+DEFAULT_DASHSCOPE_MODEL = os.environ.get("DASHSCOPE_MODEL", "deepseek-v4-flash-0731")
 DEFAULT_OFFLOAD_MAX_TOKENS = int(os.environ.get("OFFLOAD_MAX_TOKENS", "8192"))
 
 COST_SMALL_PROMPT = float(os.environ.get("OFFLOAD_COST_SMALL_PROMPT", "0.017"))
@@ -186,6 +187,20 @@ def seek_empty_scale() -> float:
 
 def unique_solver_bonus() -> float:
     return float(os.environ.get("OFFLOAD_UNIQUE_SOLVER_BONUS", str(DEFAULT_OFFLOAD_UNIQUE_SOLVER_BONUS)))
+
+
+def seek_only_when_all_wrong() -> bool:
+    """If true, help-seeking α is granted only when every sibling in the group failed.
+
+    Per-sample finish then uses ``encourage_seek=False``; group shaping is applied
+    later by :func:`shape_group_help_seeking_rewards` (``--rollout-sample-filter-path``).
+    """
+    return os.environ.get("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 def _api_key() -> str:
@@ -614,7 +629,9 @@ def _call_remote_chat_sync(
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    chat_kwargs: dict[str, Any] = {"enable_thinking": enable_thinking}
+    # deepseek-v4-flash: chat_template_kwargs.thinking (+ reasoning_effort).
+    # Older GLM gateways used enable_thinking; this endpoint expects thinking.
+    chat_kwargs: dict[str, Any] = {"thinking": enable_thinking}
     if enable_thinking and reasoning_effort:
         chat_kwargs["reasoning_effort"] = reasoning_effort
     body: dict[str, Any] = {
@@ -623,9 +640,6 @@ def _call_remote_chat_sync(
         "max_tokens": max_tokens,
         "chat_template_kwargs": chat_kwargs,
     }
-    if enable_thinking and reasoning_effort:
-        # Some OpenAI-compatible gateways read this at the top level.
-        body["reasoning_effort"] = reasoning_effort
     openai_tools = _normalize_openai_tools(tools)
     if openai_tools:
         # Same split as Claude Code → slime: tools schema is request-level, not
@@ -1058,14 +1072,14 @@ def help_seeking_reward(
     empty_scale: float | None = None,
     unique_solver: bool = False,
     unique_bonus: float | None = None,
+    encourage_seek: bool = True,
 ) -> float:
     """Train reward that keeps a gradient toward offloading when stuck.
 
     Compared to :func:`cost_aware_reward` (which gives ``0`` on all failures),
-    this credits legitimate in-think help-seeking even when grading fails, so
-    GRPO does not extinguish ``<|llm_offload|>`` as soon as the SLM can solve
-    some siblings alone.
+    this credits legitimate in-think help-seeking even when grading fails.
 
+    - unsolved, ``encourage_seek=False``: ``0`` (defer α to group shaping)
     - unsolved, no in-think offload: ``0``
     - unsolved, ``offload_count>0`` and no outside-think spans: ``α``
       (scaled by ``empty_scale`` when ``empty_patch``)
@@ -1074,9 +1088,14 @@ def help_seeking_reward(
       optional ``unique_bonus`` when this traj is the sole solver in its group
       (caller must set ``unique_solver``; default unused at per-sample finish)
 
+    With ``OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG=1``, per-sample finish passes
+    ``encourage_seek=False`` and :func:`shape_group_help_seeking_rewards` grants
+    α only when every sibling session failed.
+
     Enable via ``OFFLOAD_REWARD_MODE=help_seeking``. Knobs:
     ``OFFLOAD_SEEK_ALPHA``, ``OFFLOAD_SEEK_EMPTY_SCALE``,
-    ``OFFLOAD_UNIQUE_SOLVER_BONUS``, plus the usual λ / format-penalty envs.
+    ``OFFLOAD_UNIQUE_SOLVER_BONUS``, ``OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG``,
+    plus the usual λ / format-penalty envs.
     """
     st = stats or {}
     oc = int(st.get("offload_count", 0) or 0)
@@ -1085,7 +1104,7 @@ def help_seeking_reward(
     emp_scale = float(empty_scale if empty_scale is not None else seek_empty_scale())
 
     if float(solved) <= 0.0:
-        if oc < 1 or outside > 0:
+        if not encourage_seek or oc < 1 or outside > 0:
             return 0.0
         credit = alpha_v
         if empty_patch:
@@ -1104,3 +1123,59 @@ def help_seeking_reward(
         bonus = float(unique_bonus if unique_bonus is not None else unique_solver_bonus())
         reward += bonus
     return max(0.0, reward)
+
+
+def _session_solved(metadata: dict[str, Any] | None) -> bool:
+    md = metadata or {}
+    if md.get("grading_solved") is True:
+        return True
+    return float(md.get("solved", 0) or 0) > 0.0
+
+
+def _session_segments(group_item: Any) -> list[Any]:
+    """One GRPO sibling may be a Sample or a fan-out ``list[Sample]``."""
+    if isinstance(group_item, list):
+        return [s for s in group_item if s is not None]
+    return [group_item] if group_item is not None else []
+
+
+def shape_group_help_seeking_rewards(args: Any, groups: list) -> None:
+    """Rollout sample filter: grant help-seeking α only when the whole group failed.
+
+    Wire with ``--rollout-sample-filter-path examples.coding_agent_rl.offload.shape_group_help_seeking_rewards``.
+    No-op unless ``OFFLOAD_REWARD_MODE=help_seeking`` and
+    ``OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG`` is enabled.
+
+    Mutates ``sample.reward`` in place. ``args`` is unused but required by the
+    rollout-sample-filter contract.
+    """
+    del args  # plugin signature
+    if reward_mode() != "help_seeking" or not seek_only_when_all_wrong():
+        return
+
+    alpha_v = seek_alpha()
+    emp_scale = seek_empty_scale()
+
+    for group in groups:
+        sessions = [_session_segments(item) for item in group]
+        sessions = [segs for segs in sessions if segs]
+        if not sessions:
+            continue
+        if any(_session_solved(getattr(segs[0], "metadata", None)) for segs in sessions):
+            # Any sibling solved → do not encourage offload on failures.
+            continue
+
+        for segs in sessions:
+            md = getattr(segs[0], "metadata", None) or {}
+            stats = md.get("offload_stats") or {}
+            oc = int(stats.get("offload_count", 0) or 0)
+            outside = int(stats.get("offload_outside_think_count", 0) or 0)
+            if oc < 1 or outside > 0:
+                continue
+            credit = alpha_v
+            if md.get("empty_patch"):
+                credit *= emp_scale
+            credit = max(0.0, float(credit))
+            for sample in segs:
+                if float(getattr(sample, "reward", 0.0) or 0.0) <= 0.0:
+                    sample.reward = credit

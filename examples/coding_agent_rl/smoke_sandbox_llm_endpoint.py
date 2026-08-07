@@ -32,8 +32,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from slime.agent.sandbox import DockerSandbox
 
 
-DEFAULT_BASE_URL = "http://208.64.254.187:8000"
-DEFAULT_MODEL = "glm-5.2-fp8"
+DEFAULT_BASE_URL = "http://208.64.254.187:8001"
+DEFAULT_MODEL = "deepseek-v4-flash-0731"
 DEFAULT_PROMPT = "Reply with exactly: pong"
 
 
@@ -46,7 +46,7 @@ def _build_payload(*, model: str, prompt: str, stream: bool, enable_thinking: bo
         "max_tokens": 64,
     }
     if enable_thinking:
-        body["chat_template_kwargs"] = {"enable_thinking": True}
+        body["chat_template_kwargs"] = {"thinking": True, "reasoning_effort": "high"}
     return body
 
 

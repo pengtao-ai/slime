@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from examples.coding_agent_rl import offload
@@ -20,12 +22,30 @@ def _stats(*, oc: int = 0, outside: int = 0, small_o: int = 100, glm_o: int = 0)
     }
 
 
+def _sample(*, reward: float, solved: float, oc: int = 0, outside: int = 0, empty_patch: bool = False):
+    return SimpleNamespace(
+        reward=reward,
+        metadata={
+            "solved": solved,
+            "grading_solved": solved == 1.0,
+            "empty_patch": empty_patch,
+            "offload_stats": _stats(oc=oc, outside=outside),
+        },
+    )
+
+
 def test_unsolved_no_offload_is_zero():
     assert offload.help_seeking_reward(0.0, _stats(oc=0), alpha=0.1) == 0.0
 
 
 def test_unsolved_in_think_offload_gets_alpha():
     assert offload.help_seeking_reward(0.0, _stats(oc=2), alpha=0.1) == pytest.approx(0.1)
+
+
+def test_unsolved_encourage_seek_false_is_zero():
+    assert (
+        offload.help_seeking_reward(0.0, _stats(oc=2), alpha=0.1, encourage_seek=False) == 0.0
+    )
 
 
 def test_unsolved_empty_patch_scales_alpha():
@@ -61,6 +81,49 @@ def test_reward_mode_help_seeking(monkeypatch):
     assert offload.reward_mode() == "help_seeking"
     monkeypatch.setenv("OFFLOAD_REWARD_MODE", "cost_aware")
     assert offload.reward_mode() == "cost_aware"
+
+
+def test_shape_group_all_wrong_grants_alpha(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
+    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
+    a = _sample(reward=0.0, solved=0.0, oc=1)
+    b = _sample(reward=0.0, solved=0.0, oc=0)
+    offload.shape_group_help_seeking_rewards(None, [[a, b]])
+    assert a.reward == pytest.approx(0.1)
+    assert b.reward == 0.0
+
+
+def test_shape_group_any_solved_does_not_encourage(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
+    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
+    failed_offload = _sample(reward=0.0, solved=0.0, oc=2)
+    solved = _sample(reward=0.9, solved=1.0, oc=0)
+    offload.shape_group_help_seeking_rewards(None, [[failed_offload, solved]])
+    assert failed_offload.reward == 0.0
+    assert solved.reward == pytest.approx(0.9)
+
+
+def test_shape_group_noop_without_flag(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    monkeypatch.delenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", raising=False)
+    a = _sample(reward=0.0, solved=0.0, oc=1)
+    offload.shape_group_help_seeking_rewards(None, [[a]])
+    assert a.reward == 0.0
+
+
+def test_shape_group_fanout_segments(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
+    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
+    seg0 = _sample(reward=0.0, solved=0.0, oc=1)
+    seg1 = _sample(reward=0.0, solved=0.0, oc=1)
+    other = _sample(reward=0.0, solved=0.0, oc=0)
+    offload.shape_group_help_seeking_rewards(None, [[[seg0, seg1], other]])
+    assert seg0.reward == pytest.approx(0.1)
+    assert seg1.reward == pytest.approx(0.1)
+    assert other.reward == 0.0
 
 
 if __name__ == "__main__":
