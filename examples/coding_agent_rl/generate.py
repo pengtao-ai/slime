@@ -325,7 +325,8 @@ class _AdapterService(metaclass=SingletonMeta):
 async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], evaluation: bool = False):
     """Per-sample agent function with wall-clock guard (see rollout_guard_sec)."""
     state = _AdapterService(args)
-    protocol = CONFIG.eval_protocol if evaluation else CONFIG.train_protocol
+    raw_protocol = (base_sample.metadata or {}).get("protocol")
+    protocol = raw_protocol or (CONFIG.eval_protocol if evaluation else CONFIG.train_protocol)
     md = swe.get_metadata(base_sample, protocol)
     instance_id = md["instance_id"]
     if not md["image"] or not md["workdir"]:
@@ -360,6 +361,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     try:
         async with asyncio.timeout(CONFIG.rollout_guard_sec):
             async with boot_agent_sandbox(md["image"], instance_id, events=trace_events, tid=tid) as sb:
+                is_tmax = md.get("protocol") == swe.PROTOCOL_TMAX
                 with chrome_span(
                     trace_events,
                     "prepare_workspace",
@@ -384,14 +386,31 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         time_budget_sec=CONFIG.agent_time_budget_sec,
                         prompt=swe.SWE_PROMPT,
                     )
-                with chrome_span(
-                    trace_events,
-                    "git_diff",
-                    cat="outer",
-                    tid=tid,
-                    args={"instance_id": instance_id},
-                ):
-                    diff_text = await swe.git_diff(sb, md["workdir"])
+                diff_text = ""
+                reward = 0.0
+                applied_cleanly = True
+                if is_tmax:
+                    with chrome_span(
+                        trace_events,
+                        "eval",
+                        cat="outer",
+                        tid=tid,
+                        args={"instance_id": instance_id, "protocol": "tmax"},
+                    ):
+                        reward, applied_cleanly = await swe.grade_tmax_inplace(
+                            sb,
+                            md,
+                            timeout_sec=CONFIG.eval_timeout_sec,
+                        )
+                else:
+                    with chrome_span(
+                        trace_events,
+                        "git_diff",
+                        cat="outer",
+                        tid=tid,
+                        args={"instance_id": instance_id},
+                    ):
+                        diff_text = await swe.git_diff(sb, md["workdir"])
                 # Best-effort diagnostics before the sandbox is torn down. Used when
                 # finish_session later returns no turns (adapter_session_empty).
                 diag = ""
@@ -406,22 +425,24 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 except Exception:
                     diag = ""
 
-            with chrome_span(
-                trace_events,
-                "eval",
-                cat="outer",
-                tid=tid,
-                args={"instance_id": instance_id},
-            ):
-                reward, applied_cleanly = await swe.run_evaluation(
-                    md,
-                    diff_text=diff_text,
-                    timeout_sec=CONFIG.eval_timeout_sec,
-                )
+            if not is_tmax:
+                with chrome_span(
+                    trace_events,
+                    "eval",
+                    cat="outer",
+                    tid=tid,
+                    args={"instance_id": instance_id},
+                ):
+                    reward, applied_cleanly = await swe.run_evaluation(
+                        md,
+                        diff_text=diff_text,
+                        timeout_sec=CONFIG.eval_timeout_sec,
+                    )
             solved = float(reward)
             empty_patch = not (diff_text or "").strip()
-            # Belt-and-suspenders: never train on "solved" with no repo change.
-            if empty_patch and solved == 1.0:
+            # Belt-and-suspenders: never train on "solved" with no repo change
+            # (scaleswe/swebench only — tmax scores final environment state).
+            if (not is_tmax) and empty_patch and solved == 1.0:
                 logger.warning(
                     "[coding_agent_rl] %s: grader returned solved with empty patch; forcing solved=0",
                     instance_id,
@@ -493,6 +514,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         "instance_id": instance_id,
                         "solved": solved,
                         "empty_patch": empty_patch,
+                        "protocol": md.get("protocol"),
                         "offload_stats": offload_stats,
                         "timeline": timeline,
                         "turn_git_diffs": state.adapter.pop_turn_git_diffs(session_id),

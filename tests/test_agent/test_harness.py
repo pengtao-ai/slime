@@ -198,6 +198,7 @@ def test_ensure_agent_user_provisions_user_and_git_safe_dir():
         cmd = next(c for c, _ in sb.exec_log if "useradd" in c)
         assert "id agent" in cmd
         assert "chown -R agent:agent" in cmd and "/workspace/repo" in cmd
+        assert "command -v git" in cmd
         assert "git config --system --add safe.directory '*'" in cmd
 
     asyncio.run(run_case())

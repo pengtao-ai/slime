@@ -421,7 +421,9 @@ async def ensure_agent_user(sb: Sandbox, workdir: str) -> None:
         # Baked Kaniko images may omit /tmp or leave it 0755; Claude Code +
         # harness launchers need a world-writable sticky /tmp.
         f"mkdir -p /tmp && chmod 1777 /tmp && "
-        f"git config --system --add safe.directory '*' && id agent",
+        # Tmax terminal images often omit git; skip safe.directory when absent.
+        f"(command -v git >/dev/null 2>&1 && git config --system --add safe.directory '*' || true) && "
+        f"id agent",
         user="root",
         check=True,
         timeout=60,

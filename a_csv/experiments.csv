@@ -1,0 +1,2 @@
+﻿模型名称,基座模型,训练集数据,训练方法,参数,平均reward,Solve率,平均耗时秒,Offload轨迹调用率,平均Offload次数,Reward趋势图,耗时图,Offload调用率图
+agent_offload_pyrodash4b_docker_async_20260808_163214,PyroDash-4B-SFT-0803,mixed400.jsonl,异步 GRPO + help_seeking offload,算法=GRPO; 学习率=1e-6; clip=0.2-0.28; KL=0; 熵=0; 计划rollout=100; 实际完成=80; rollout_batch=4; 每题样本数=8; 全局batch=32; 温度=1.0; 存盘间隔=20; reward=help_seeking(全组失败才鼓励求助),0.4944,48.9%,359,98.1%,22.7,imgs/20260808_163214/reward_trend.png,imgs/20260808_163214/latency_agent_run.png,imgs/20260808_163214/offload_rate.png

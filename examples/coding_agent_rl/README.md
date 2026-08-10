@@ -29,26 +29,49 @@ The slime training stack itself follows the standard setup. On top of that you n
 
 ## Dataset Format
 
-Standard slime JSONL with three keys:
+Standard slime JSONL with three keys. Rows may mix ScaleSWE and Tmax via
+``metadata.protocol`` (``scaleswe`` default when omitted; ``tmax`` for
+terminal-task images):
 
 ```jsonc
 {
-  "prompt": "<falls back here if metadata.problem_statement is missing>",
+  "prompt": [{"role": "user", "content": "<problem>"}],
   "label": "<instance_id or grader label>",
   "metadata": {
+    "protocol": "scaleswe",  // or "tmax"; omit => scaleswe
     "image": "your-registry/swe-image:<tag>",  // sandbox image reference
-    "workdir": "/workspace/<repo>",            // repo path inside the sandbox
+    "workdir": "/workspace/<repo>",            // tmax: usually /home/user
     "problem_statement": "<issue body>",
-    // exactly one of the following two graders:
+    // scaleswe graders (exactly one):
     "swepro": { /* SWE-bench Pro test harness — preferred */ },
-    "eval_cmd": "pytest -x tests/..."          // last-resort: exit 0 = solved
-    // sweb-style rows: metadata.remote_env_info.f2p_script (Python file
-    // ending in `sys.exit(pytest.main(...))`) is auto-wrapped into eval_cmd.
+    "eval_cmd": "pytest -x tests/...",
+    // sweb-style: metadata.remote_env_info.f2p_script
+    // tmax grader (deferred until after Claude Code exits):
+    "test_sh": "#!/bin/bash\n..."
   }
 }
 ```
 
 Wire it up with `--input-key prompt --label-key label --metadata-key metadata`.
+
+### Mixing ScaleSWE + Tmax
+
+```bash
+# Convert each source (tmax pulls HF task-data for test_sh):
+python examples/coding_agent_rl/convert_scaleswe_to_slime.py \
+  --src /path/to/scaleswe.jsonl --dst data/scaleswe.jsonl
+python examples/coding_agent_rl/convert_tmax_to_slime.py \
+  --dst data/tmax.jsonl --limit 200
+
+# Offline mix; SWE_TRAIN_PROTOCOL is only a fallback when protocol is missing:
+cat data/scaleswe.jsonl data/tmax.jsonl | shuf > data/mixed.jsonl
+PROMPT_DATA=$PWD/examples/coding_agent_rl/data/mixed.jsonl \
+  bash examples/coding_agent_rl/run_qwen35_4b_swe_1node_docker_async.sh
+```
+
+Tmax grading runs **in the same agent sandbox** after the harness exits (tests
+are written only then — not present during the CC episode). ScaleSWE still uses
+git_diff + a fresh eval sandbox.
 
 ## Mid-turn LLM offload (PyroDash)
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Convert AweAI-Team/Scale-SWE jsonl into slime coding-agent prompt data.
 
-Scale-SWE fields -> slime Sample row for SWE_TRAIN_PROTOCOL=scaleswe:
+Scale-SWE fields -> slime Sample row (metadata.protocol=scaleswe):
 
-  prompt / label / metadata.{image,workdir,problem_statement,pre_commands}
+  prompt / label / metadata.{protocol,image,workdir,problem_statement,pre_commands}
   metadata.remote_env_info.f2p_script  (required by swe._metadata_scaleswe)
 
 Example:
@@ -35,6 +35,7 @@ def convert_row(row: dict) -> dict | None:
         "prompt": [{"role": "user", "content": problem}],
         "label": instance_id,
         "metadata": {
+            "protocol": "scaleswe",
             "instance_id": instance_id,
             "image": image,
             "workdir": workdir,

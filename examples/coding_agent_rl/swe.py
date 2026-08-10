@@ -1,18 +1,21 @@
-"""SWE task layer: dataset parsing, workspace prep, diff capture, fresh-sandbox eval.
+"""SWE task layer: dataset parsing, workspace prep, diff capture, grading.
 
-One module, two grading protocols selected per-call (never an import-time side
-effect):
+Protocols selected per-call (never an import-time side effect):
 
   - "scaleswe" (default): scaleswe data shape (image_url + pre_commands +
-    swepro/eval_cmd/f2p_script); custom "exit 0 == solved" grading.
+    swepro/eval_cmd/f2p_script); custom "exit 0 == solved" grading on a
+    fresh sandbox after git_diff apply.
   - "swebench": SWE-bench Verified (remote_env_info.{image,base_commit,
     test_patch,FAIL_TO_PASS,PASS_TO_PASS,version}); graded with swebench's
     official make_test_spec + get_eval_report so each repo uses its own
     test_cmd and log parser.
+  - "tmax": terminal-task images (env_config.image + deferred test_sh);
+    graded in-place on the agent sandbox after harness.run (tests are not
+    present during the agent episode).
 
 The only thing that varies by protocol is the dataset schema and how a
-diff is scored. Everything sandbox-side (prepare_workspace / git_diff /
-apply_diff / pre_commands) is shared and lives here once.
+diff / final state is scored. Everything sandbox-side (prepare_workspace /
+git_diff / apply_diff / pre_commands) is shared and lives here once.
 ``get_metadata(sample, protocol)`` produces the ``md`` dict; the
 protocol-specific grading payload is carried under ``md["grading"]``
 and is opaque to generate.py (which only reads instance_id / image / workdir).
@@ -52,11 +55,13 @@ logger = logging.getLogger(__name__)
 
 PROTOCOL_SCALESWE = "scaleswe"
 PROTOCOL_SWEBENCH = "swebench"
+PROTOCOL_TMAX = "tmax"
 
 # Paths inside the sandbox (avoid clashes with image-shipped paths).
 _PATCH = "/workspace/__cagent_patch__.diff"
 _PRE = "/workspace/__cagent_pre__.sh"
 _F2P = "/workspace/__cagent_f2p__.py"
+_TMAX_TEST = "/workspace/__tmax_test__.sh"
 _SWEPRO_DIR = "/workspace/swepro_eval"
 
 SWE_PROMPT = os.environ.get(
@@ -78,6 +83,8 @@ class EvalResult(NamedTuple):
 def get_metadata(sample: Sample, protocol: str = PROTOCOL_SCALESWE) -> dict[str, Any]:
     if protocol == PROTOCOL_SWEBENCH:
         return _metadata_swebench(sample)
+    if protocol == PROTOCOL_TMAX:
+        return _metadata_tmax(sample)
     return _metadata_scaleswe(sample)
 
 
@@ -138,6 +145,29 @@ def _metadata_swebench(sample: Sample) -> dict[str, Any]:
     }
 
 
+def _metadata_tmax(sample: Sample) -> dict[str, Any]:
+    """Tmax / open-instruct shape: image + deferred ``test_sh`` final-state grader.
+
+    ``test_sh`` is written into the agent sandbox only after harness.run
+    (see ``grade_tmax_inplace``), matching official deferred-tests semantics.
+    """
+    m = sample.metadata or {}
+    rem = m.get("remote_env_info") or {}
+    env = m.get("env_config") or {}
+    label = sample.label if (isinstance(sample.label, str) and len(sample.label) < 256) else None
+    return {
+        "protocol": PROTOCOL_TMAX,
+        "instance_id": m.get("instance_id") or env.get("task_id") or rem.get("instance_id") or label or "unknown",
+        "image": m.get("image") or env.get("image") or rem.get("image_url") or rem.get("image"),
+        "workdir": m.get("workdir") or rem.get("workdir") or "/home/user",
+        "problem_statement": m.get("problem_statement") or _coerce_prompt(sample.prompt),
+        "grading": {
+            "test_sh": m.get("test_sh") or rem.get("test_sh"),
+            "setup_sh": m.get("setup_sh") or rem.get("setup_sh"),
+        },
+    }
+
+
 def _coerce_prompt(prompt) -> str:
     """Extract the user-message text from a prompt (str or chat-message list)."""
     if isinstance(prompt, str):
@@ -152,6 +182,11 @@ def _coerce_prompt(prompt) -> str:
 def evaluability_check(md: dict) -> str | None:
     if md.get("protocol") == PROTOCOL_SWEBENCH:
         return _evaluability_check_swebench(md)
+    if md.get("protocol") == PROTOCOL_TMAX:
+        test_sh = (md.get("grading") or {}).get("test_sh")
+        if not (isinstance(test_sh, str) and test_sh.strip()):
+            return "missing_test_sh"
+        return None
     return "protocol_row_mismatch:looks_swebench" if md.get("looks_swebench") else None
 
 
@@ -184,14 +219,18 @@ async def prepare_workspace(sb: Sandbox, workdir: str, md: dict) -> None:
     create the agent user here too -- it is idempotent.
     """
     await agent_sandbox.ensure_agent_user(sb, workdir)
+    grading = md.get("grading") or {}
     if md.get("protocol") == PROTOCOL_SCALESWE:
-        grading = md.get("grading") or {}
         swepro = grading.get("swepro")
         if swepro:
             await apply_before_repo_set_cmd(sb, workdir, swepro)
         pre_commands = grading.get("pre_commands")
         if pre_commands:
             await apply_pre_commands(sb, workdir, pre_commands)
+    elif md.get("protocol") == PROTOCOL_TMAX:
+        setup_sh = grading.get("setup_sh")
+        if isinstance(setup_sh, str) and setup_sh.strip():
+            await apply_pre_commands(sb, workdir, setup_sh)
     await sb.write_file(
         f"{workdir}/PROBLEM_STATEMENT.md",
         md.get("problem_statement") or "",
@@ -292,19 +331,55 @@ def _format_untracked_patch(rel_path: str, body: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Eval dispatch (fresh sandbox, apply diff, run dataset tests)
+# Eval dispatch
 # ---------------------------------------------------------------------------
-async def run_evaluation(md: dict, *, diff_text: str, timeout_sec: int) -> EvalResult:
-    """Uniform entry point: dispatch to the protocol's grader.
+async def grade_tmax_inplace(sb: Sandbox, md: dict, *, timeout_sec: int) -> EvalResult:
+    """Deferred Tmax verifier on the *agent* sandbox (after harness.run).
 
-    No-test-cheating guarantee (both grading protocols): the eval sandbox is built from
-    the same image but starts CLEAN, so only the model-produced diff affects
-    reward.
+    Writes ``test_sh`` into the container only at grade time so the agent cannot
+    read verifier scripts during the episode. Exit 0 == reward 1.0.
+    """
+    test_sh = (md.get("grading") or {}).get("test_sh")
+    if not (isinstance(test_sh, str) and test_sh.strip()):
+        logger.warning("[swe.tmax] missing test_sh; reward=0")
+        return EvalResult(0.0, True)
+    await sb.exec("mkdir -p /workspace /logs/verifier && chmod 777 /workspace /logs/verifier", user="root", check=False, timeout=30)
+    await sb.write_file(_TMAX_TEST, test_sh, user="root")
+    await sb.exec(f"chmod 755 {_TMAX_TEST}", user="root", check=False, timeout=30)
+    ec, out, err = await sb.exec(f"bash {_TMAX_TEST}", user="root", check=False, timeout=timeout_sec)
+    reward = 1.0 if ec == 0 else 0.0
+    # Prefer official reward.txt when the verifier wrote one (Harbor/tmax style).
+    try:
+        raw = await sb.read_file("/logs/verifier/reward.txt", user="root")
+        if raw and raw.strip():
+            reward = max(0.0, min(1.0, float(raw.strip())))
+    except Exception:
+        pass
+    logger.info(
+        "[swe.tmax] %s: reward=%.1f exit=%s out_tail=%r err_tail=%r",
+        md.get("instance_id"),
+        reward,
+        ec,
+        (out or "")[-200:],
+        (err or "")[-200:],
+    )
+    return EvalResult(reward, True)
+
+
+async def run_evaluation(md: dict, *, diff_text: str, timeout_sec: int) -> EvalResult:
+    """Fresh-sandbox graders for scaleswe / swebench (not tmax).
+
+    No-test-cheating guarantee: the eval sandbox is built from the same image
+    but starts CLEAN, so only the model-produced diff affects reward.
 
     Empty / whitespace-only patches never count as solved: some ScaleSWE images are
     already green at baseline, which previously let no-op EOS episodes score 1.0 and
     collapse the policy under cost-aware GRPO.
+
+    Tmax must use ``grade_tmax_inplace`` on the agent sandbox instead.
     """
+    if md.get("protocol") == PROTOCOL_TMAX:
+        raise ValueError("tmax grading requires grade_tmax_inplace on the agent sandbox")
     if not (diff_text or "").strip():
         logger.info("[swe] empty patch → reward=0 (no free solves on already-green baselines)")
         return EvalResult(0.0, True)

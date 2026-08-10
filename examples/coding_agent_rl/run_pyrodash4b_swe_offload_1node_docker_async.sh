@@ -42,9 +42,10 @@ export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE="${TORCH_ALLOW_TF32_CUBLAS_OVERRIDE:-1}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 SLIME_DIR="${SLIME_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 
+export SAVE_INTERVAL="${SAVE_INTERVAL:-3}"
 # ---- mid-turn offload ----
 export SLIME_AGENT_OFFLOAD=1
-export OFFLOAD_EFFICIENCY_LAMBDA=0.5
+export OFFLOAD_EFFICIENCY_LAMBDA=0.3
 # help_seeking + only-all-wrong: α only if the whole GRPO group failed
 # (see offload.shape_group_help_seeking_rewards). Else do not encourage offload.
 # Set OFFLOAD_REWARD_MODE=cost_aware to restore the old "fail → 0" shaping.
@@ -82,7 +83,8 @@ export SGLANG_KV_CACHE_DTYPE="${SGLANG_KV_CACHE_DTYPE:-fp8_e4m3}"
 
 # Pre-baked ScaleSWE agent images (Node22 + Claude Code + pre_commands).
 # Override with PROMPT_DATA=.../swe_train_scaleswe_200.jsonl for the raw bases.
-export PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/data/swe_train_scaleswe_200_baked.jsonl}"
+# export PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/data/swe_train_scaleswe_200_baked.jsonl}"
+export PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/data/mixed400.jsonl}"
 
 # ---- train-only CUDA memory snapshot (exclude SGLang rollout) ----
 # Default ON for this launcher while debugging train OOM. Set DEBUG_TRAIN_MEM=0 for full RL.
