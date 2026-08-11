@@ -27,9 +27,11 @@ class CodexHarness(BaseHarness):
     extra_args_env = "SLIME_AGENT_CODEX_EXTRA_ARGS"
     extra_envs_env = "SLIME_AGENT_CODEX_EXTRA_ENVS"
 
-    # static flags after ``codex exec``; --skip-git-repo-check lets it run in
-    # workdirs whose git check is brittle (e.g. shallow clones)
-    exec_flags = "--skip-git-repo-check"
+    # static flags after ``codex exec``:
+    # - --skip-git-repo-check: workdirs whose git check is brittle (shallow clones)
+    # - --dangerously-bypass-approvals-and-sandbox: we already run inside an
+    #   external Docker sandbox; Codex's nested read-only sandbox would block edits
+    exec_flags = "--skip-git-repo-check --dangerously-bypass-approvals-and-sandbox"
 
     # config.toml written into the sandbox. base_url MUST be inline here (Codex
     # only honours env vars for the default OpenAI provider). {model} / {base_url}

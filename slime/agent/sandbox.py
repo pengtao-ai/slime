@@ -451,7 +451,7 @@ class DockerSandbox:
     async def __aenter__(self) -> DockerSandbox:
         import uuid
 
-        name = f"slime-sb-{uuid.uuid4().hex[:12]}"
+        name = f"sweval_mjy-{uuid.uuid4().hex[:12]}"
         if self.pull:
             await self._run_host(["docker", "pull", self.image], timeout=600, check=True)
 

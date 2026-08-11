@@ -288,9 +288,19 @@ def record_local_turn_tokens(session: Session, turn: TurnRecord) -> None:
     stats["small_output_tokens"] = int(stats.get("small_output_tokens", 0)) + len(turn.output_ids or [])
 
 
-def _estimate_tokens(text: str) -> int:
-    """Rough token estimate when the remote API omits ``usage``."""
-    return max(0, (len(text) + 3) // 4)
+def require_usage_tokens(usage: dict[str, Any] | None, *, where: str) -> tuple[int, int]:
+    """Require API ``usage``; never estimate. Raises if missing/incomplete."""
+    if not usage:
+        raise RuntimeError(f"{where}: response missing usage; refuse to estimate tokens")
+    inp = usage.get("prompt_tokens")
+    if inp is None:
+        inp = usage.get("input_tokens")
+    out = usage.get("completion_tokens")
+    if out is None:
+        out = usage.get("output_tokens")
+    if inp is None or out is None:
+        raise RuntimeError(f"{where}: usage incomplete (need prompt+completion tokens): {usage!r}")
+    return int(inp), int(out)
 
 
 def _record_glm_usage(
@@ -301,24 +311,8 @@ def _record_glm_usage(
     content: str,
     think: str,
 ) -> None:
-    if usage:
-        inp = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
-        out = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
-    else:
-        chunks: list[str] = []
-        for m in messages:
-            c = m.get("content")
-            if isinstance(c, str) and c:
-                chunks.append(c)
-            for tc in m.get("tool_calls") or []:
-                chunks.append(json.dumps(tc, ensure_ascii=False))
-        inp = _estimate_tokens("\n".join(chunks))
-        out = _estimate_tokens(f"{think}{content}")
-        logger.warning(
-            "[coding_agent_offload] remote usage missing; estimated glm_in=%d glm_out=%d",
-            inp,
-            out,
-        )
+    del messages, content, think  # kept for call-site compat; accounting is usage-only
+    inp, out = require_usage_tokens(usage, where="GLM")
     stats["glm_input_tokens"] = int(stats.get("glm_input_tokens", 0)) + inp
     stats["glm_output_tokens"] = int(stats.get("glm_output_tokens", 0)) + out
 

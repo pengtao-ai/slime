@@ -8,6 +8,8 @@ examples/llm_offload/data
 examples/coding_agent_rl/sglang_infer_stubs/
 examples/coding_agent_rl/tarballs/
 examples/coding_agent_rl/data/
+eval
+infer_use/
 # C extensions
 *.so
 

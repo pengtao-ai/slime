@@ -142,6 +142,7 @@ async def _pick_adapter_host(
     preferred: str | None,
     attempts: int = 3,
     retry_delay_sec: float = 2.0,
+    verbose: bool = True,
 ) -> str:
     """From inside the sandbox, find a host that accepts TCP to the adapter port.
 
@@ -189,14 +190,16 @@ sys.exit(2)
     for attempt in range(1, max(1, attempts) + 1):
         code, out, err = await sb.exec("python3 /tmp/smoke_adapter_probe.py", timeout=60)
         last_err = (err or "").strip()[:800]
-        print(
-            f"[smoke] adapter reachability probe attempt={attempt}/{attempts} "
-            f"exit={code}\n{last_err}",
-            flush=True,
-        )
+        if verbose:
+            print(
+                f"[smoke] adapter reachability probe attempt={attempt}/{attempts} "
+                f"exit={code}\n{last_err}",
+                flush=True,
+            )
         host = (out or "").strip().splitlines()[-1] if (out or "").strip() else ""
         if code == 0 and host and not host.startswith("FAIL"):
-            print(f"[smoke] sandbox reaches adapter via host={host!r}", flush=True)
+            if verbose:
+                print(f"[smoke] sandbox reaches adapter via host={host!r}", flush=True)
             return host
         if attempt < max(1, attempts):
             await asyncio.sleep(retry_delay_sec)
@@ -224,13 +227,12 @@ def _setup_docker_env(*, network: str) -> None:
         os.environ["SLIME_AGENT_CC_EXTRA_ARGS"] = (
             f"--settings '{settings}' --disallowedTools WebFetch WebSearch"
         )
-    # Claude Code defaults max output to 32k and errors if the wire claims more;
-    # keep smoke replies small. Also avoid the adapter returning empty "length"
-    # turns just because --max-context-len was tiny.
+    # Claude Code defaults max output to 32k and errors if the wire claims more.
+    # Align with eval --max-new-tokens default (8192).
     if "SLIME_AGENT_CC_EXTRA_ENVS" not in os.environ:
         os.environ["SLIME_AGENT_CC_EXTRA_ENVS"] = json.dumps(
             {
-                "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "4096",
+                "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "8192",
                 "MAX_THINKING_TOKENS": "0",
             }
         )

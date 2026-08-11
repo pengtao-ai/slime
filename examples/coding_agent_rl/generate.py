@@ -4,8 +4,8 @@
 
 generate() is a four-stage orchestrator: swe.prepare_workspace + harness.run
 -> swe.git_diff -> swe.run_evaluation -> adapter.finish_session. The (harness,
-adapter) pair is chosen by the SWE_AGENT env var (claude_code | codex); see
-_AGENTS below.
+adapter) pair is chosen by the SWE_AGENT env var
+(claude_code | codex | opencode | pi | miniswe); see _AGENTS below.
 Sandbox-side work is split across three layers: the provider-agnostic sandbox
 contract (slime.agent.sandbox), the swappable harness lifecycle
 (slime.agent.harness), and the SWE task layer (examples.coding_agent_rl.swe --
@@ -32,7 +32,13 @@ from typing import Any
 from slime.agent.adapters import AnthropicAdapter, OpenAIAdapter
 from slime.agent.adapters.common import Reply, Session
 from slime.agent.aiohttp_threaded import FilteredAccessLogger, run_app_in_thread
-from slime.agent.harness import ClaudeCodeHarness, CodexHarness
+from slime.agent.harness import (
+    ClaudeCodeHarness,
+    CodexHarness,
+    MiniSweHarness,
+    OpenCodeHarness,
+    PiHarness,
+)
 from slime.agent.sandbox import make_sandbox
 from slime.agent.trajectory import TurnRecord
 from slime.utils.misc import SingletonMeta
@@ -94,6 +100,9 @@ class CodingOpenAIAdapter(_OffloadMixin, OpenAIAdapter):
 _AGENTS = {
     "claude_code": (ClaudeCodeHarness, CodingAnthropicAdapter),
     "codex": (CodexHarness, CodingOpenAIAdapter),
+    "opencode": (OpenCodeHarness, CodingAnthropicAdapter),
+    "pi": (PiHarness, CodingAnthropicAdapter),
+    "miniswe": (MiniSweHarness, CodingAnthropicAdapter),
 }
 AGENT_NAME = os.environ.get("SWE_AGENT", "claude_code")
 if AGENT_NAME not in _AGENTS:

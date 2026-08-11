@@ -26,7 +26,14 @@ if str(REPO_ROOT) not in sys.path:
 from tests.test_agent._fakes import FakeSandbox  # noqa: E402
 
 from slime.agent import sandbox as sandbox_mod  # noqa: E402
-from slime.agent.harness import ClaudeCodeHarness, CodexHarness, HarnessContext  # noqa: E402
+from slime.agent.harness import (  # noqa: E402
+    ClaudeCodeHarness,
+    CodexHarness,
+    HarnessContext,
+    MiniSweHarness,
+    OpenCodeHarness,
+    PiHarness,
+)
 from slime.agent.harness import common as hc  # noqa: E402
 
 NUM_GPUS = 0
@@ -179,9 +186,155 @@ def test_codex_launch_command_and_env():
         assert rc == 0
         body = next(v for k, v in sb.files.items() if k.endswith("run.sh"))
         assert "codex exec" in body and "do work" in body and "--skip-git-repo-check" in body
+        assert "--dangerously-bypass-approvals-and-sandbox" in body
         env = captured["env"]
         assert env["OPENAI_API_KEY"] == "sess-cx"
         assert env["OPENAI_BASE_URL"] == "http://host:18001/v1"
+
+    asyncio.run(run_case())
+
+
+# ===========================================================================
+# §3b OpenCodeHarness config + launch
+# ===========================================================================
+
+
+def test_opencode_write_config_points_anthropic_at_adapter():
+    async def run_case():
+        sb = FakeSandbox()
+        await OpenCodeHarness().write_config(sb, _ctx(sid="sess-oc", url="http://host:18001"))
+        joined = " ".join(cmd for cmd, _ in sb.exec_log)
+        assert "/home/agent/.config/opencode/opencode.json" in joined
+        # baseURL must include /v1 for OpenCode's Anthropic client
+        assert "http://host:18001/v1" in joined
+        assert "anthropic/slime-actor" in joined or "slime-actor" in joined
+        # custom model must be registered or OpenCode raises ProviderModelNotFoundError
+        assert '"models"' in joined or "models" in joined
+        assert "small_model" in joined
+        assert "sess-oc" in joined
+
+    asyncio.run(run_case())
+
+
+def test_opencode_launch_command_and_env():
+    async def run_case():
+        captured = {}
+
+        async def agent(env):
+            captured["env"] = env
+            return 0
+
+        sb = FakeSandbox(on_launch=agent)
+        with patch.object(hc.asyncio, "sleep", new=_fast_sleep):
+            rc = await OpenCodeHarness().launch_and_wait(
+                sb, _ctx(sid="sess-oc", url="http://host:18001"), prompt="solve it", time_budget_sec=30
+            )
+        assert rc == 0
+        body = next(v for k, v in sb.files.items() if k.endswith("run.sh"))
+        assert "opencode run" in body
+        assert "--auto" in body
+        assert "solve it" in body
+        assert "-m" in body and "anthropic/slime-actor" in body
+        env = captured["env"]
+        assert env["ANTHROPIC_API_KEY"] == "sess-oc"
+        assert env["ANTHROPIC_AUTH_TOKEN"] == "sess-oc"
+        assert env["ANTHROPIC_BASE_URL"] == "http://host:18001/v1"
+        assert env["OPENCODE_DISABLE_AUTOUPDATE"] == "1"
+
+    asyncio.run(run_case())
+
+
+# ===========================================================================
+# §3c PiHarness config + launch
+# ===========================================================================
+
+
+def test_pi_write_config_points_anthropic_at_adapter():
+    async def run_case():
+        sb = FakeSandbox()
+        await PiHarness().write_config(sb, _ctx(sid="sess-pi", url="http://host:18092"))
+        joined = " ".join(cmd for cmd, _ in sb.exec_log)
+        assert "/home/agent/.pi/agent/models.json" in joined
+        # pi appends /v1/messages; baseUrl is adapter root (no trailing /v1)
+        assert "http://host:18092" in joined
+        assert "http://host:18092/v1" not in joined
+        assert "anthropic-messages" in joined
+        assert "slime-actor" in joined
+        assert "sess-pi" in joined
+
+    asyncio.run(run_case())
+
+
+def test_pi_launch_command_and_env():
+    async def run_case():
+        captured = {}
+
+        async def agent(env):
+            captured["env"] = env
+            return 0
+
+        sb = FakeSandbox(on_launch=agent)
+        with patch.object(hc.asyncio, "sleep", new=_fast_sleep):
+            rc = await PiHarness().launch_and_wait(
+                sb, _ctx(sid="sess-pi", url="http://host:18092"), prompt="solve it", time_budget_sec=30
+            )
+        assert rc == 0
+        body = next(v for k, v in sb.files.items() if k.endswith("run.sh"))
+        assert "/usr/local/bin/pi" in body
+        assert "-p" in body
+        assert "--provider anthropic" in body
+        assert "solve it" in body
+        env = captured["env"]
+        assert env["ANTHROPIC_API_KEY"] == "sess-pi"
+        assert env["ANTHROPIC_BASE_URL"] == "http://host:18092"
+        assert env["PI_SKIP_VERSION_CHECK"] == "1"
+
+    asyncio.run(run_case())
+
+
+# ===========================================================================
+# §3d MiniSweHarness config + launch
+# ===========================================================================
+
+
+def test_miniswe_write_config_points_anthropic_at_adapter():
+    async def run_case():
+        sb = FakeSandbox()
+        await MiniSweHarness().write_config(sb, _ctx(sid="sess-ms", url="http://host:18093"))
+        cfg = sb.files.get("/home/agent/.config/mini-swe-agent/slime.yaml", "")
+        assert "anthropic/slime-actor" in cfg
+        assert "http://host:18093" in cfg
+        assert "api_key: sess-ms" in cfg
+        assert "cost_tracking: ignore_errors" in cfg
+        assert "mode: yolo" in cfg
+        assert "environment_class: local" in cfg
+
+    asyncio.run(run_case())
+
+
+def test_miniswe_launch_command_and_env():
+    async def run_case():
+        captured = {}
+
+        async def agent(env):
+            captured["env"] = env
+            return 0
+
+        sb = FakeSandbox(on_launch=agent)
+        with patch.object(hc.asyncio, "sleep", new=_fast_sleep):
+            rc = await MiniSweHarness().launch_and_wait(
+                sb, _ctx(sid="sess-ms", url="http://host:18093"), prompt="solve it", time_budget_sec=30
+            )
+        assert rc == 0
+        body = next(v for k, v in sb.files.items() if k.endswith("run.sh"))
+        assert "/usr/local/bin/mini" in body
+        assert "-y" in body
+        assert "--exit-immediately" in body
+        assert "solve it" in body
+        env = captured["env"]
+        assert env["ANTHROPIC_API_KEY"] == "sess-ms"
+        assert env["ANTHROPIC_BASE_URL"] == "http://host:18093"
+        assert env["MSWEA_COST_TRACKING"] == "ignore_errors"
 
     asyncio.run(run_case())
 
