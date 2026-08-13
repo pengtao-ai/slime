@@ -3,7 +3,7 @@
 
 Scale-SWE fields -> slime Sample row (metadata.protocol=scaleswe):
 
-  prompt / label / metadata.{protocol,image,workdir,problem_statement,pre_commands}
+  prompt / label / metadata.{protocol,agent,image,workdir,problem_statement,pre_commands}
   metadata.remote_env_info.f2p_script  (required by swe._metadata_scaleswe)
 
 Example:
@@ -19,8 +19,10 @@ import argparse
 import json
 from pathlib import Path
 
+from examples.coding_agent_rl.agents_registry import resolve_agent
 
-def convert_row(row: dict) -> dict | None:
+
+def convert_row(row: dict, *, default_agent: str = "claude_code") -> dict | None:
     image = row.get("image_url") or row.get("image")
     workdir = row.get("workdir")
     f2p_script = row.get("f2p_script")
@@ -29,6 +31,7 @@ def convert_row(row: dict) -> dict | None:
     if not image or not workdir or not f2p_script:
         return None
     pre_commands = row.get("pre_commands")
+    agent = resolve_agent(row.get("agent") or default_agent).name
     # Qwen3.5 HF checkpoints ship a VLM processor; Dataset requires conversation
     # prompts (list[dict]) whenever a processor loads successfully.
     return {
@@ -36,6 +39,7 @@ def convert_row(row: dict) -> dict | None:
         "label": instance_id,
         "metadata": {
             "protocol": "scaleswe",
+            "agent": agent,
             "instance_id": instance_id,
             "image": image,
             "workdir": workdir,
@@ -57,6 +61,11 @@ def main() -> None:
     p.add_argument("--src", type=Path, required=True, help="Scale-SWE processed_to_upload.jsonl")
     p.add_argument("--dst", type=Path, required=True, help="Output slime jsonl")
     p.add_argument("--limit", type=int, default=0, help="Keep at most N rows (0 = all)")
+    p.add_argument(
+        "--default-agent",
+        default="claude_code",
+        help="metadata.agent when source row has no agent (default: claude_code)",
+    )
     args = p.parse_args()
 
     args.dst.parent.mkdir(parents=True, exist_ok=True)
@@ -68,7 +77,7 @@ def main() -> None:
             line = line.strip()
             if not line:
                 continue
-            out = convert_row(json.loads(line))
+            out = convert_row(json.loads(line), default_agent=args.default_agent)
             if out is None:
                 skipped += 1
                 continue

@@ -18,7 +18,9 @@ diff / final state is scored. Everything sandbox-side (prepare_workspace /
 git_diff / apply_diff / pre_commands) is shared and lives here once.
 ``get_metadata(sample, protocol)`` produces the ``md`` dict; the
 protocol-specific grading payload is carried under ``md["grading"]``
-and is opaque to generate.py (which only reads instance_id / image / workdir).
+and is opaque to generate.py (which only reads instance_id / image /
+workdir / agent). ``md["agent"]`` selects the coding harness
+(``agents_registry``); it is independent of ``protocol``.
 
 Harness-agnostic on purpose -- nothing here is Claude-specific. ``SWE_PROMPT`` is
 the task instruction (semantics, not CLI syntax). The only place a task meets a
@@ -40,6 +42,11 @@ from slime.agent import sandbox as agent_sandbox
 from slime.agent.adapters.common import flatten_content
 from slime.agent.sandbox import Sandbox, exec_and_wait, make_sandbox
 from slime.utils.types import Sample
+
+try:
+    from .agents_registry import resolve_agent
+except ImportError:  # script-style import (examples/coding_agent_rl on sys.path)
+    from agents_registry import resolve_agent
 
 try:
     from swebench.harness.grading import get_eval_report  # type: ignore
@@ -104,6 +111,7 @@ def _metadata_scaleswe(sample: Sample) -> dict[str, Any]:
     looks_swebench = bool(rem.get("test_patch")) and not (swepro or eval_cmd or f2p_script)
     return {
         "protocol": PROTOCOL_SCALESWE,
+        "agent": resolve_agent(m.get("agent")).name,
         "instance_id": m.get("instance_id") or rem.get("instance_id") or label or "unknown",
         "image": m.get("image") or rem.get("image_url"),
         "workdir": m.get("workdir") or rem.get("workdir"),
@@ -137,6 +145,7 @@ def _metadata_swebench(sample: Sample) -> dict[str, Any]:
     }
     return {
         "protocol": PROTOCOL_SWEBENCH,
+        "agent": resolve_agent(m.get("agent")).name,
         "instance_id": instance["instance_id"],
         "image": rem.get("image"),
         "workdir": rem.get("workdir") or "/testbed",
@@ -157,6 +166,7 @@ def _metadata_tmax(sample: Sample) -> dict[str, Any]:
     label = sample.label if (isinstance(sample.label, str) and len(sample.label) < 256) else None
     return {
         "protocol": PROTOCOL_TMAX,
+        "agent": resolve_agent(m.get("agent")).name,
         "instance_id": m.get("instance_id") or env.get("task_id") or rem.get("instance_id") or label or "unknown",
         "image": m.get("image") or env.get("image") or rem.get("image_url") or rem.get("image"),
         "workdir": m.get("workdir") or rem.get("workdir") or "/home/user",

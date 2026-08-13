@@ -3,9 +3,10 @@
     --custom-generate-function-path examples.coding_agent_rl.generate.generate
 
 generate() is a four-stage orchestrator: swe.prepare_workspace + harness.run
--> swe.git_diff -> swe.run_evaluation -> adapter.finish_session. The (harness,
-adapter) pair is chosen by the SWE_AGENT env var (claude_code | codex); see
-_AGENTS below.
+-> swe.git_diff -> swe.run_evaluation -> adapter.finish_session. The harness is
+chosen per sample via ``metadata.agent`` (fallback: ``SWE_AGENT`` env); see
+``agents_registry``. All agents except ``codex`` use the Anthropic (CC) adapter;
+``codex`` uses the OpenAI adapter. Both protocols share one HTTP server.
 Sandbox-side work is split across three layers: the provider-agnostic sandbox
 contract (slime.agent.sandbox), the swappable harness lifecycle
 (slime.agent.harness), and the SWE task layer (examples.coding_agent_rl.swe --
@@ -38,7 +39,7 @@ from slime.agent.adapters import AnthropicAdapter, OpenAIAdapter
 from slime.agent.adapters.common import Reply, Session
 from slime.agent.aiohttp_threaded import FilteredAccessLogger, run_app_in_thread
 from slime.agent.chrome_trace import chrome_span, ensure_session_timing
-from slime.agent.harness import ClaudeCodeHarness, CodexHarness
+from slime.agent.harness.common import BaseHarness
 from slime.agent.sandbox import make_sandbox
 from slime.agent.trajectory import TurnRecord
 from slime.utils.misc import SingletonMeta
@@ -46,6 +47,7 @@ from slime.utils.processing_utils import load_tokenizer
 from slime.utils.types import Sample
 
 from . import offload, swe
+from .agents_registry import AdapterProtocol, resolve_agent
 
 logger = logging.getLogger(__name__)
 logging.getLogger("e2b").setLevel(logging.WARNING)
@@ -125,15 +127,6 @@ class CodingOpenAIAdapter(_OffloadMixin, OpenAIAdapter):
     pass
 
 
-_AGENTS = {
-    "claude_code": (ClaudeCodeHarness, CodingAnthropicAdapter),
-    "codex": (CodexHarness, CodingOpenAIAdapter),
-}
-AGENT_NAME = os.environ.get("SWE_AGENT", "claude_code")
-if AGENT_NAME not in _AGENTS:
-    raise ValueError(f"SWE_AGENT={AGENT_NAME!r} not in {sorted(_AGENTS)}")
-HARNESS_CLS, ADAPTER_CLS = _AGENTS[AGENT_NAME]
-
 @dataclass(frozen=True)
 class SweConfig:
     eval_protocol: str  # eval-path schema/grader (SWE_EVAL_PROTOCOL)
@@ -209,6 +202,7 @@ async def boot_agent_sandbox(
     image: str,
     instance_id: str,
     *,
+    harness: BaseHarness,
     events: list[dict[str, Any]],
     tid: int,
 ) -> AsyncIterator:
@@ -234,17 +228,18 @@ async def boot_agent_sandbox(
                     "boot_sandbox",
                     cat="outer",
                     tid=tid,
-                    args={"instance_id": instance_id, "attempt": attempt + 1},
+                    args={"instance_id": instance_id, "attempt": attempt + 1, "agent": harness.name},
                 ):
                     await cand.__aenter__()
                     logger.info(
-                        "[coding_agent_rl] %s: sandbox_id=%s image=%s",
+                        "[coding_agent_rl] %s: sandbox_id=%s image=%s agent=%s",
                         instance_id,
                         cand.sandbox_id,
                         image,
+                        harness.name,
                     )
                     try:
-                        await HARNESS_CLS().install_cli(cand)
+                        await harness.install_cli(cand)
                     except BaseException:
                         await cand.__aexit__(None, None, None)
                         raise
@@ -273,6 +268,8 @@ async def boot_agent_sandbox(
 
 
 class _AdapterService(metaclass=SingletonMeta):
+    """Shared HTTP endpoint hosting Anthropic + OpenAI adapter routes."""
+
     def __init__(self, args) -> None:
         self.tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
         self.max_context_len = int(getattr(args, "rollout_max_context_len", 0) or 0)
@@ -285,22 +282,28 @@ class _AdapterService(metaclass=SingletonMeta):
                 "ADAPTER_PUBLIC_HOST (host sandboxes can reach) so the coding "
                 "agent can dial back to the Anthropic adapter."
             )
-        self.adapter = ADAPTER_CLS(
+        adapter_kwargs = dict(
             tokenizer=self.tokenizer,
             sglang_url=sglang_url,
             tool_parser=self.tool_parser,
             reasoning_parser=self.reasoning_parser,
             fork_threshold_tokens=CONFIG.fork_merge_threshold,
         )
+        self.anthropic = CodingAnthropicAdapter(**adapter_kwargs)
+        self.openai = CodingOpenAIAdapter(**adapter_kwargs)
+        # Mount OpenAI chat-completions on the Anthropic app so one public URL
+        # serves both protocols (routes do not overlap).
+        self.openai._register_routes(self.anthropic.app)
+        self._sid_protocol: dict[str, AdapterProtocol] = {}
         # handler_cancellation=True so a client disconnect cancels the handler
         # coroutine, arming the fire-and-forget /abort_request in the adapter.
         # Otherwise a cancelled client leaves an inflight sglang /generate that
         # races the next release_memory_occupation and trips its idle assertion.
         self.app_handle = run_app_in_thread(
-            self.adapter.app,
+            self.anthropic.app,
             host=CONFIG.adapter_bind_host,
             port=CONFIG.adapter_port,
-            thread_name="anthropic-adapter",
+            thread_name="coding-agent-adapter",
             runner_kwargs={
                 "handler_cancellation": True,
                 "access_log_class": FilteredAccessLogger,
@@ -321,6 +324,56 @@ class _AdapterService(metaclass=SingletonMeta):
             self.reasoning_parser,
         )
 
+    def adapter_for(self, protocol: AdapterProtocol):
+        return self.openai if protocol == "openai" else self.anthropic
+
+    def open_session(
+        self,
+        session_id: str,
+        *,
+        protocol: AdapterProtocol,
+        sampling_defaults: dict[str, Any],
+        max_context_tokens: int,
+    ) -> Session:
+        adapter = self.adapter_for(protocol)
+        adapter.open_session(
+            session_id,
+            sampling_defaults=sampling_defaults,
+            max_context_tokens=max_context_tokens,
+        )
+        self._sid_protocol[session_id] = protocol
+        return adapter.store[session_id]
+
+    def bind_repo_state(self, session_id: str, *, sb: Any, workdir: str) -> None:
+        self.adapter_for(self._sid_protocol[session_id]).bind_repo_state(session_id, sb=sb, workdir=workdir)
+
+    def unbind_repo_state(self, session_id: str) -> None:
+        protocol = self._sid_protocol.get(session_id)
+        if protocol is None:
+            return
+        self.adapter_for(protocol).unbind_repo_state(session_id)
+
+    def pop_turn_git_diffs(self, session_id: str) -> list[dict[str, Any]]:
+        protocol = self._sid_protocol.get(session_id)
+        if protocol is None:
+            return []
+        return self.adapter_for(protocol).pop_turn_git_diffs(session_id)
+
+    def session_store_get(self, session_id: str):
+        protocol = self._sid_protocol.get(session_id)
+        if protocol is None:
+            return None
+        return self.adapter_for(protocol).store.get(session_id)
+
+    async def finish_session(self, session_id: str, **kwargs):
+        return await self.adapter_for(self._sid_protocol[session_id]).finish_session(session_id, **kwargs)
+
+    async def drop_session(self, session_id: str, *, wait_timeout: float = 30) -> None:
+        protocol = self._sid_protocol.pop(session_id, None)
+        if protocol is None:
+            return
+        await self.adapter_for(protocol).drop_session(session_id, wait_timeout=wait_timeout)
+
 
 async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], evaluation: bool = False):
     """Per-sample agent function with wall-clock guard (see rollout_guard_sec)."""
@@ -328,6 +381,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     raw_protocol = (base_sample.metadata or {}).get("protocol")
     protocol = raw_protocol or (CONFIG.eval_protocol if evaluation else CONFIG.train_protocol)
     md = swe.get_metadata(base_sample, protocol)
+    agent_spec = resolve_agent(md.get("agent"))
+    harness = agent_spec.harness_cls()
     instance_id = md["instance_id"]
     if not md["image"] or not md["workdir"]:
         return _abort_result(base_sample, "missing_image_or_workdir", instance_id)
@@ -348,19 +403,25 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         thread_name=thread_name,
     )
 
-    state.adapter.open_session(
+    session_obj = state.open_session(
         session_id,
+        protocol=agent_spec.adapter_protocol,
         sampling_defaults=sampling_params,
         max_context_tokens=state.max_context_len,
     )
-    session_obj = state.adapter.store[session_id]
     ensure_session_timing(session_obj, tid=tid, events=trace_events)
 
     t0 = time.time()
     result_samples: list[Sample] | None = None
     try:
         async with asyncio.timeout(CONFIG.rollout_guard_sec):
-            async with boot_agent_sandbox(md["image"], instance_id, events=trace_events, tid=tid) as sb:
+            async with boot_agent_sandbox(
+                md["image"],
+                instance_id,
+                harness=harness,
+                events=trace_events,
+                tid=tid,
+            ) as sb:
                 is_tmax = md.get("protocol") == swe.PROTOCOL_TMAX
                 with chrome_span(
                     trace_events,
@@ -370,15 +431,19 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     args={"instance_id": instance_id},
                 ):
                     await swe.prepare_workspace(sb, md["workdir"], md)
-                state.adapter.bind_repo_state(session_id, sb=sb, workdir=md["workdir"])
+                state.bind_repo_state(session_id, sb=sb, workdir=md["workdir"])
                 with chrome_span(
                     trace_events,
                     "agent_run",
                     cat="outer",
                     tid=tid,
-                    args={"instance_id": instance_id, "session_id": session_id},
+                    args={
+                        "instance_id": instance_id,
+                        "session_id": session_id,
+                        "agent": agent_spec.name,
+                    },
                 ):
-                    agent_exit_code = await HARNESS_CLS().run(
+                    agent_exit_code = await harness.run(
                         sb,
                         workdir=md["workdir"],
                         session_id=session_id,
@@ -449,7 +514,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 )
                 solved = 0.0
             offload_stats = {}
-            session_obj = state.adapter.store.get(session_id)
+            session_obj = state.session_store_get(session_id)
             if session_obj is not None and getattr(session_obj, "offload_stats", None):
                 offload_stats = dict(session_obj.offload_stats)
             train_reward = solved
@@ -479,9 +544,10 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 )
             if evaluation:
                 logger.info(
-                    "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs "
+                    "[coding_agent_rl] %s: agent=%s reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs "
                     "timeline_events=%d (eval-only)",
                     instance_id,
+                    agent_spec.name,
                     solved,
                     bool(applied_cleanly),
                     agent_exit_code,
@@ -505,7 +571,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 tid=tid,
                 args={"instance_id": instance_id, "session_id": session_id},
             ):
-                samples = await state.adapter.finish_session(
+                samples = await state.finish_session(
                     session_id,
                     base_sample=base_sample,
                     reward=float(train_reward),
@@ -515,16 +581,18 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         "solved": solved,
                         "empty_patch": empty_patch,
                         "protocol": md.get("protocol"),
+                        "agent": agent_spec.name,
                         "offload_stats": offload_stats,
                         "timeline": timeline,
-                        "turn_git_diffs": state.adapter.pop_turn_git_diffs(session_id),
+                        "turn_git_diffs": state.pop_turn_git_diffs(session_id),
                     },
                 )
             if not samples:
                 logger.warning(
                     "[coding_agent_rl] %s: adapter_session_empty "
-                    "(agent_exit_code=%s adapter=%s). sandbox diag:\n%s",
+                    "(agent=%s agent_exit_code=%s adapter=%s). sandbox diag:\n%s",
                     instance_id,
+                    agent_spec.name,
                     agent_exit_code,
                     state.adapter_url,
                     (diag or "<empty>")[:1500],
@@ -534,19 +602,26 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 return result_samples
 
             for s in samples:
-                s.metadata = {**(s.metadata or {}), "agent_exit_code": agent_exit_code, "timeline": timeline}
+                s.metadata = {
+                    **(s.metadata or {}),
+                    "agent_exit_code": agent_exit_code,
+                    "agent": agent_spec.name,
+                    "timeline": timeline,
+                }
             if agent_exit_code != 0:
                 reason = "time budget exceeded" if agent_exit_code < 0 else f"CLI error (exit {agent_exit_code})"
                 logger.warning(
-                    "[coding_agent_rl] %s: agent_exit_code=%d (%s)",
+                    "[coding_agent_rl] %s: agent=%s agent_exit_code=%d (%s)",
                     instance_id,
+                    agent_spec.name,
                     agent_exit_code,
                     reason,
                 )
             logger.info(
-                "[coding_agent_rl] %s: reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs "
+                "[coding_agent_rl] %s: agent=%s reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs "
                 "segments=%d timeline_events=%d",
                 instance_id,
+                agent_spec.name,
                 float(train_reward),
                 bool(applied_cleanly),
                 agent_exit_code,
@@ -573,9 +648,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         _attach_timeline(result_samples, timeline)
         return result_samples
     finally:
-        state.adapter.unbind_repo_state(session_id)
-        state.adapter.pop_turn_git_diffs(session_id)
-        await state.adapter.drop_session(session_id, wait_timeout=30)  # cleanup only, idempotent
+        state.unbind_repo_state(session_id)
+        state.pop_turn_git_diffs(session_id)
+        await state.drop_session(session_id, wait_timeout=30)  # cleanup only, idempotent
         with chrome_span(
             trace_events,
             "cleanup_sleep",

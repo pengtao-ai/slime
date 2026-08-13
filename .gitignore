@@ -19,6 +19,7 @@ examples/coding_agent_rl/docker_build/.env
 examples/coding_agent_rl/data/
 # C extensions
 *.so
+a_csv/
 
 # Distribution / packaging
 .Python

@@ -24,21 +24,22 @@ slime 侧使用 **open-instruct 版** 转换后的 jsonl。
 
 ## 2. 与 ScaleSWE 对比
 
-ScaleSWE 是 slime `coding_agent_rl` 原有数据：真实/类 SWE 的「修 issue → 交 patch → 跑单测」。Tmax 是「进终端改环境 → 终态过 verifier」。两边在 slime 里 **共用 Claude Code**，用 `metadata.protocol` 区分 grader。
+ScaleSWE 是 slime `coding_agent_rl` 原有数据：真实/类 SWE 的「修 issue → 交 patch → 跑单测」。Tmax 是「进终端改环境 → 终态过 verifier」。两边用 `metadata.protocol` 区分 grader；用 `metadata.agent` 选择 harness（`claude_code` / `codex` / `pi` / `opencode` / `miniswe`）。除 `codex` 外共用 Anthropic（CC）adapter。
 
 | 维度 | ScaleSWE | Tmax |
 |------|----------|------|
 | 任务形态 | 修开源仓库 bug/PR | 合成终端任务（调试、ETL、运维…） |
-| 典型镜像 | `…/scaleswe-agent:<instance>` 或 baked 镜像 | `hamishi740/swerl-tmax-v3:<hash>`（每题一 tag） |
+| 典型镜像 | `…/scaleswe-agent:<instance>` 或 baked 镜像 | raw `hamishi740/swerl-tmax-v3:<hash>`，或 baked `…/tmax-agent:<hash>` |
 | `workdir` | `/workspace/<repo>` | `/home/user` |
 | `protocol` | `scaleswe`（可省略，默认） | `tmax`（必须写出） |
+| `agent` | 可选；缺省 `SWE_AGENT` / `claude_code` | 同左 |
 | 题面 | issue / problem_statement | 终端任务说明（从 HF `messages` user 抽出） |
 | 验题材料 | `remote_env_info.f2p_script`（或 swepro / eval_cmd） | `test_sh`（来自 task-data `tests/test.sh`） |
 | 验题时机 | agent 结束后：`git_diff` → **新干净沙箱** apply → 跑测 | agent 结束后：**同一沙箱** 才写入并跑 `test_sh` |
 | 成功含义 | 测试退出码 0 / f2p 通过 | 终态断言通过（或 `reward.txt`） |
 | 空 patch | 强制 `solved=0` | 不看 git_diff |
 | 转换脚本 | [`convert_scaleswe_to_slime.py`](./convert_scaleswe_to_slime.py) | [`convert_tmax_to_slime.py`](./convert_tmax_to_slime.py) |
-| 现成 jsonl | `data/swe_train_scaleswe_200_baked.jsonl` 等 | `data/tmax_smoke_3.jsonl`、`data/tmax_train_200.jsonl` |
+| 现成 jsonl | `data/swe_train_scaleswe_200_baked.jsonl`、`data/scaleswe_agents_smoke.jsonl`、`data/mixed_agents_bake_smoke_scaleswe*.jsonl` | `data/tmax_smoke_3.jsonl`、`data/tmax_agents_smoke.jsonl`、`data/tmax_train_200.jsonl`、`data/mixed_agents_bake_smoke_tmax*.jsonl` |
 
 ScaleSWE 样例（截断，见 `data/swe_train_scaleswe_200_baked.jsonl`）：
 
@@ -205,9 +206,10 @@ HF cache 中常见解压路径：
 
 ### 镜像是什么
 
-- 名称形如：`hamishi740/swerl-tmax-v3:<content-hash>`
-- **每题一个 tag**（约 1.4 万个不同镜像）；镜像内是任务环境（代码、依赖、fixture），**不含** Claude Code / vanillux agent
-- 来源字段：HF 行的 `env_config.image` → 转换后的 `metadata.image`
+- 名称形如：`hamishi740/swerl-tmax-v3:<content-hash>`（raw）或 `pyrominddynamics/tmax-agent:<content-hash>`（baked）
+- **每题一个 tag**（约 1.4 万个不同镜像）；raw 镜像内是任务环境（代码、依赖、fixture）
+- **baked**（`docker_build/bake_tmax_agent_images.py`）额外预装 Node 22 + `claude` / `opencode` / `pi` / `mini`；**不会**把 `test_sh` / `/tests` 打进镜像
+- 来源字段：HF 行的 `env_config.image` → 转换后的 `metadata.image`；bake 后原镜像写在 `metadata.docker_image`，`cli_prebaked=True`
 
 ### slime 如何起容器
 
@@ -217,12 +219,12 @@ export SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY=image
 # docker 时还需 ADAPTER_PUBLIC_HOST 等，使容器能回调 Anthropic adapter
 ```
 
-流程：按 `metadata.image` `docker pull` → boot → 在容器内 **安装 Node + Claude Code tarball**（Tmax 镜像未预装 CC，已验证可装）→ 跑 harness。
+流程：按 `metadata.image` `docker pull` → boot → harness `install_cli`（raw 会装 Node + CLI；`cli_prebaked` 镜像在二进制可用时跳过）→ 跑 harness。
 
 ### 运维注意
 
 1. **Docker Hub 拉取额度**：全量 RL 前需账号 / mirror / 缓存，否则拉镜像会成为瓶颈。
-2. **每次 boot 装 CC**：比 ScaleSWE baked 镜像慢；大批量时要预留时间。
+2. **CLI 安装**：raw Tmax 每次 boot 装 CLI；大批量优先用 `tmax-agent` bake（见 [`docker_build/README.md`](./docker_build/README.md)）。
 3. **特权 / DinD**：部分 Tmax 题会起容器（如 neo4j）；若失败需检查 Docker 能力（`--privileged` 等，按环境调整）。
 4. **workdir**：默认 `/home/user`，须在镜像中存在（一般已有 `user` 家目录）。
 

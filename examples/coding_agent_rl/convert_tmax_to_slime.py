@@ -3,7 +3,7 @@
 
 Produces rows with metadata.protocol=tmax for mixed ScaleSWE+Tmax training:
 
-  prompt / label / metadata.{protocol,image,workdir,problem_statement,test_sh}
+  prompt / label / metadata.{protocol,agent,image,workdir,problem_statement,test_sh}
 
 Example:
   python examples/coding_agent_rl/convert_tmax_to_slime.py \\
@@ -26,6 +26,8 @@ import subprocess
 import time
 from contextlib import suppress
 from pathlib import Path
+
+from examples.coding_agent_rl.agents_registry import resolve_agent
 
 # Strip vanillux-only harness rules that confuse Claude Code.
 _VANILLUX_TAIL_MARKERS = (
@@ -106,7 +108,7 @@ def _read_test_sh(task_data: Path, task_id: str) -> str | None:
     return None
 
 
-def convert_row(row: dict, *, task_data: Path) -> dict | None:
+def convert_row(row: dict, *, task_data: Path, default_agent: str = "claude_code") -> dict | None:
     env = row.get("env_config") or {}
     task_id = (
         (env.get("task_id") if isinstance(env, dict) else None)
@@ -129,11 +131,13 @@ def convert_row(row: dict, *, task_data: Path) -> dict | None:
             problem = instr.read_text(encoding="utf-8").strip()
     if not problem:
         return None
+    agent = resolve_agent(row.get("agent") or default_agent).name
     return {
         "prompt": [{"role": "user", "content": problem}],
         "label": task_id,
         "metadata": {
             "protocol": "tmax",
+            "agent": agent,
             "instance_id": task_id,
             "image": image,
             "workdir": "/home/user",
@@ -150,6 +154,11 @@ def main() -> None:
     p.add_argument("--task-data-dir", default=None, help="Pre-extracted task-data directory")
     p.add_argument("--limit", type=int, default=0, help="Keep at most N rows (0 = all)")
     p.add_argument("--split", default="train")
+    p.add_argument(
+        "--default-agent",
+        default="claude_code",
+        help="metadata.agent when source row has no agent (default: claude_code)",
+    )
     args = p.parse_args()
 
     from datasets import load_dataset
@@ -163,7 +172,7 @@ def main() -> None:
         for row in ds:
             if args.limit and kept >= args.limit:
                 break
-            out = convert_row(dict(row), task_data=task_data)
+            out = convert_row(dict(row), task_data=task_data, default_agent=args.default_agent)
             if out is None:
                 skipped += 1
                 continue

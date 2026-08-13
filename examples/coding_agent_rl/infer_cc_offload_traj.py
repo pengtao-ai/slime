@@ -59,15 +59,27 @@ from slime.agent.adapters.common import (  # noqa: E402
     Session,
     tool_call_dict,
 )
+from slime.agent.adapters.openai import OpenAIAdapter  # noqa: E402
 from slime.agent.aiohttp_threaded import FilteredAccessLogger, run_app_in_thread
-from slime.agent.harness import ClaudeCodeHarness
 from slime.agent.sandbox import DockerSandbox, ensure_agent_user
 from slime.utils.types import Sample
+
+from agents_registry import resolve_agent  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("infer_cc_glm")
 
 DEFAULT_PROMPT = "Read PROBLEM_STATEMENT.md and fix the issue. Use tools as needed."
+
+_TB = _EXAMPLE_DIR / "tarballs"
+DEFAULT_AGENT_ENVS = {
+    "SLIME_AGENT_NODE_TARBALL": _TB / "node-v22.20.0-linux-x64.tar.xz",
+    "SLIME_AGENT_CC_TARBALL": _TB / "anthropic-ai-claude-code-local-linux-x64.tgz",
+    "SLIME_AGENT_CODEX_TARBALL": _TB / "openai-codex-local.tgz",
+    "SLIME_AGENT_PI_TARBALL": _TB / "pi-coding-agent-local.tgz",
+    "SLIME_AGENT_OPENCODE_TARBALL": _TB / "opencode-ai-local-linux-x64.tgz",
+    "SLIME_AGENT_MINISWE_WHEEL": _TB / "miniswe-wheels",
+}
 
 
 class _StubTokenizer:
@@ -342,6 +354,268 @@ class GlmOnlyAnthropicAdapter(AnthropicAdapter):
             self.inflight.get(sid, set()).discard(task)
 
 
+def _openai_wire_from_glm(
+    *,
+    content: str,
+    think: str,
+    tool_calls: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any], str, str]:
+    """Build OpenAI wire + manager messages from a remote chat reply."""
+    wire_tcs: list[dict[str, Any]] = []
+    mgr_tcs: list[dict[str, Any]] = []
+    for i, tc in enumerate(tool_calls or []):
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+        name = fn.get("name") or tc.get("name")
+        if not name:
+            continue
+        args = fn.get("arguments") if fn else tc.get("arguments")
+        if isinstance(args, str):
+            try:
+                args_dict = json.loads(args) if args.strip() else {}
+            except json.JSONDecodeError:
+                args_dict = {"_raw_arguments": args}
+        elif isinstance(args, dict):
+            args_dict = args
+        else:
+            args_dict = {}
+        call_id = str(tc.get("id") or f"call_{i}_{secrets.token_hex(6)}")
+        wire_tcs.append(
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": str(name),
+                    "arguments": offload._arguments_as_openai_json(args_dict),
+                },
+            }
+        )
+        mgr_tcs.append(
+            {
+                "type": "function",
+                "function": {"name": str(name), "arguments": args_dict},
+            }
+        )
+    wire_message: dict[str, Any] = {
+        "role": "assistant",
+        "content": None if wire_tcs else (content or None),
+    }
+    manager_message: dict[str, Any] = {
+        "role": "assistant",
+        "content": "" if wire_tcs else (content or ""),
+    }
+    if think:
+        wire_message["reasoning_content"] = think
+    if wire_tcs:
+        wire_message["tool_calls"] = wire_tcs
+        manager_message["tool_calls"] = mgr_tcs
+    wire_finish = "tool_calls" if wire_tcs else "stop"
+    stop_reason = "tool_use" if wire_tcs else "end_turn"
+    return wire_message, manager_message, wire_finish, stop_reason
+
+
+class GlmOnlyOpenAIAdapter(OpenAIAdapter):
+    """OpenAI /v1/chat/completions → remote LLM; no SGLang / offload."""
+
+    log_prefix = "glm_only_openai_adapter"
+
+    def __init__(
+        self,
+        *,
+        enable_thinking: bool = True,
+        reasoning_effort: str | None = None,
+        debug_callback=None,
+    ) -> None:
+        super().__init__(
+            tokenizer=_StubTokenizer(),
+            sglang_url="http://127.0.0.1:0",
+            debug_callback=debug_callback,
+        )
+        self.enable_thinking = enable_thinking
+        self.reasoning_effort = reasoning_effort
+        self.traj_by_sid: dict[str, list[dict[str, Any]]] = {}
+        self.sid_requests_dir: dict[str, Path] = {}
+
+    def bind_session_outdir(self, sid: str, requests_dir: Path) -> None:
+        self.sid_requests_dir[sid] = Path(requests_dir)
+        self.traj_by_sid.setdefault(sid, [])
+
+    def pop_session_traj(self, sid: str) -> list[dict[str, Any]]:
+        self.sid_requests_dir.pop(sid, None)
+        return list(self.traj_by_sid.pop(sid, []))
+
+    async def _run_turn(self, request: web.Request) -> web.StreamResponse:
+        body = await request.json()
+        sid = self._session_id(request, body)
+        if sid in self.closed:
+            return web.Response(status=503, text="session closed")
+        capped = self._check_turn_cap(sid)
+        if capped is not None:
+            return capped
+
+        s = self.store.setdefault(sid, Session())
+        task = asyncio.current_task()
+        self.inflight.setdefault(sid, set()).add(task)
+        t0 = time.monotonic()
+        try:
+            translated, tools_schema = self._translate(body)
+            openai_messages = _translated_to_openai_messages(translated)
+            max_tokens = int(
+                body.get("max_completion_tokens")
+                or body.get("max_tokens")
+                or (s.sampling_defaults or {}).get("max_new_tokens")
+                or offload.DEFAULT_OFFLOAD_MAX_TOKENS
+            )
+            content, think, usage, tool_calls = await offload.call_remote_chat(
+                openai_messages,
+                max_tokens=max_tokens,
+                enable_thinking=self.enable_thinking,
+                reasoning_effort=self.reasoning_effort,
+                tools=tools_schema,
+            )
+            if content.startswith("[Error:"):
+                logger.error("[%s] sid=%s GLM error: %s", self.log_prefix, sid, content[:500])
+
+            wire_message, manager_message, wire_finish, stop_reason = _openai_wire_from_glm(
+                content=content,
+                think=think,
+                tool_calls=tool_calls,
+            )
+            reply = Reply(
+                manager_message=manager_message,
+                finish_reason="tool_calls" if tool_calls else "stop",
+                wire=(wire_message, wire_finish),
+            )
+            in_tok = int((usage or {}).get("prompt_tokens") or 0)
+            out_tok = int((usage or {}).get("completion_tokens") or 0)
+            stream = body.get("stream") is True or "text/event-stream" in request.headers.get("Accept", "")
+            try:
+                response = await self._respond(request, body, reply, in_tok, out_tok, stream)
+            except (ConnectionResetError, asyncio.CancelledError) as e:
+                logger.warning(
+                    "[%s] sid=%s client disconnected: %s after %.1fs",
+                    self.log_prefix,
+                    sid,
+                    type(e).__name__,
+                    time.monotonic() - t0,
+                )
+                if isinstance(e, asyncio.CancelledError):
+                    raise
+                return web.Response(status=499, text="client disconnected")
+
+            bucket = self.traj_by_sid.setdefault(sid, [])
+            record = {
+                "sid": sid,
+                "turn_index": len(bucket),
+                "elapsed_sec": round(time.monotonic() - t0, 3),
+                "openai_request": {
+                    "messages": _jsonable(openai_messages),
+                    "tools": _jsonable(offload._normalize_openai_tools(tools_schema)),
+                    "max_tokens": max_tokens,
+                    "model": _glm_endpoint()[1],
+                },
+                "openai_response": {
+                    "content": content,
+                    "reasoning_content": think,
+                    "tool_calls": _jsonable(tool_calls),
+                    "usage": _jsonable(usage),
+                },
+                # Keep anthropic_response shape so _save_outputs / summaries stay shared.
+                "anthropic_response": {
+                    "content": [{"type": "text", "text": content}] if content else [],
+                    "stop_reason": stop_reason,
+                },
+                "manager_message": _jsonable(manager_message),
+            }
+            bucket.append(record)
+            req_dir = self.sid_requests_dir.get(sid)
+            if req_dir is not None:
+                path = _write_request_file(req_dir, record)
+                logger.info("[%s] wrote %s (messages=%d)", self.log_prefix, path, len(openai_messages))
+            self._run_debug_callback(sid, translated, tools_schema, manager_message, None)
+            return response
+        finally:
+            self.inflight.get(sid, set()).discard(task)
+
+
+class DualInferAdapters:
+    """One HTTP server: Anthropic routes + OpenAI chat-completions for codex."""
+
+    def __init__(
+        self,
+        *,
+        enable_thinking: bool = True,
+        reasoning_effort: str | None = None,
+    ) -> None:
+        self.anthropic = GlmOnlyAnthropicAdapter(
+            enable_thinking=enable_thinking,
+            reasoning_effort=reasoning_effort,
+        )
+        self.openai = GlmOnlyOpenAIAdapter(
+            enable_thinking=enable_thinking,
+            reasoning_effort=reasoning_effort,
+        )
+        self.openai._register_routes(self.anthropic.app)
+        self._sid_protocol: dict[str, str] = {}
+        self.app = self.anthropic.app
+
+    def adapter_for(self, protocol: str):
+        return self.openai if protocol == "openai" else self.anthropic
+
+    def open_session(self, sid: str, *, protocol: str, sampling_defaults: dict, max_context_tokens: int) -> None:
+        self.adapter_for(protocol).open_session(
+            sid,
+            sampling_defaults=sampling_defaults,
+            max_context_tokens=max_context_tokens,
+        )
+        self._sid_protocol[sid] = protocol
+
+    def bind_session_outdir(self, sid: str, requests_dir: Path) -> None:
+        self.adapter_for(self._sid_protocol[sid]).bind_session_outdir(sid, requests_dir)
+
+    def pop_session_traj(self, sid: str) -> list[dict[str, Any]]:
+        protocol = self._sid_protocol.get(sid)
+        if protocol is None:
+            return []
+        return self.adapter_for(protocol).pop_session_traj(sid)
+
+    async def drop_session(self, sid: str, *, wait_timeout: float = 10) -> None:
+        protocol = self._sid_protocol.pop(sid, None)
+        if protocol is None:
+            return
+        await self.adapter_for(protocol).drop_session(sid, wait_timeout=wait_timeout)
+
+
+def setup_agent_tarball_envs(*, node_tarball: Path | None = None, cc_tarball: Path | None = None) -> None:
+    """Export host paths for all five harness CLIs (override if already set)."""
+    for key, default in DEFAULT_AGENT_ENVS.items():
+        if key == "SLIME_AGENT_NODE_TARBALL" and node_tarball is not None:
+            os.environ[key] = str(node_tarball)
+            continue
+        if key == "SLIME_AGENT_CC_TARBALL" and cc_tarball is not None:
+            os.environ[key] = str(cc_tarball)
+            continue
+        os.environ.setdefault(key, str(default))
+    for key in DEFAULT_AGENT_ENVS:
+        path = Path(os.environ[key])
+        if not path.exists():
+            raise SystemExit(f"{key} missing: {path}")
+
+
+def _count_tool_use_turns(traj_turns: list[dict[str, Any]]) -> int:
+    n = 0
+    for t in traj_turns:
+        anth = t.get("anthropic_response") or {}
+        if anth.get("stop_reason") == "tool_use":
+            n += 1
+            continue
+        oai = t.get("openai_response") or {}
+        if oai.get("tool_calls"):
+            n += 1
+    return n
+
+
 def _save_outputs(
     *,
     out_dir: Path,
@@ -439,7 +713,7 @@ def _load_done_summary(sample_dir: Path) -> dict[str, Any] | None:
 async def _run_one_sample(
     *,
     args: argparse.Namespace,
-    adapter: GlmOnlyAnthropicAdapter,
+    adapters: DualInferAdapters,
     adapter_port: int,
     index: int,
     sample: Sample,
@@ -448,19 +722,22 @@ async def _run_one_sample(
 ) -> dict[str, Any]:
     async with sem:
         md = swe.get_metadata(sample, swe.PROTOCOL_SCALESWE)
+        agent_spec = resolve_agent(md.get("agent"))
+        harness = agent_spec.harness_cls()
         image = args.image or md["image"]
         workdir = md["workdir"]
         instance_id = md["instance_id"]
-        session_id = f"infer-glm-{index}-{secrets.token_hex(6)}"
+        session_id = f"infer-{agent_spec.name}-{index}-{secrets.token_hex(6)}"
         sample_dir.mkdir(parents=True, exist_ok=True)
         requests_dir = sample_dir / "requests"
         requests_dir.mkdir(parents=True, exist_ok=True)
-        adapter.bind_session_outdir(session_id, requests_dir)
-        adapter.open_session(
+        adapters.open_session(
             session_id,
+            protocol=agent_spec.adapter_protocol,
             sampling_defaults={"temperature": args.temperature, "max_new_tokens": args.max_new_tokens},
             max_context_tokens=args.max_context_len,
         )
+        adapters.bind_session_outdir(session_id, requests_dir)
 
         agent_exit_code = -999
         harness_traj = ""
@@ -470,7 +747,10 @@ async def _run_one_sample(
         error: str | None = None
         t0 = time.monotonic()
         try:
-            print(f"[infer:{index}] start instance={instance_id} image={image}", flush=True)
+            print(
+                f"[infer:{index}] start agent={agent_spec.name} instance={instance_id} image={image}",
+                flush=True,
+            )
             async with DockerSandbox(image) as sb:
                 await ensure_agent_user(sb, workdir)
                 code, out, err = await sb.exec("id -u; id -un", user="agent", timeout=30)
@@ -482,7 +762,6 @@ async def _run_one_sample(
                     sb, port=adapter_port, preferred=(args.public_host or None)
                 )
                 adapter_url = f"http://{adapter_host}:{adapter_port}"
-                harness = ClaudeCodeHarness()
                 await harness.install_cli(sb)
                 await swe.prepare_workspace(sb, workdir, md)
                 if args.shrink_problem:
@@ -511,10 +790,10 @@ async def _run_one_sample(
                     )
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
-            logger.exception("[infer:%s] failed instance=%s", index, instance_id)
+            logger.exception("[infer:%s] failed instance=%s agent=%s", index, instance_id, agent_spec.name)
         finally:
-            traj_turns = adapter.pop_session_traj(session_id)
-            await adapter.drop_session(session_id, wait_timeout=10)
+            traj_turns = adapters.pop_session_traj(session_id)
+            await adapters.drop_session(session_id, wait_timeout=10)
 
         base, model = _glm_endpoint()
         summary = {
@@ -523,12 +802,12 @@ async def _run_one_sample(
             "mode": "glm_only",
             "index": index,
             "instance_id": instance_id,
+            "agent": agent_spec.name,
+            "adapter_protocol": agent_spec.adapter_protocol,
             "session_id": session_id,
             "agent_exit_code": agent_exit_code,
             "turns": len(traj_turns),
-            "tool_use_turns": sum(
-                1 for t in traj_turns if t["anthropic_response"]["stop_reason"] == "tool_use"
-            ),
+            "tool_use_turns": _count_tool_use_turns(traj_turns),
             "reward": reward,
             "eval_applied": applied,
             "patch_chars": len(patch_diff or ""),
@@ -547,7 +826,7 @@ async def _run_one_sample(
             summary=summary,
         )
         print(
-            f"[infer:{index}] done ok={summary['ok']} turns={summary['turns']} "
+            f"[infer:{index}] done agent={agent_spec.name} ok={summary['ok']} turns={summary['turns']} "
             f"reward={reward} exit={agent_exit_code} err={error}",
             flush=True,
         )
@@ -559,9 +838,7 @@ async def run_infer(args: argparse.Namespace) -> None:
     os.environ["SLIME_AGENT_OFFLOAD"] = "0"
     _require_glm_env()
     smoke._setup_docker_env(network=args.network)
-    os.environ["SLIME_AGENT_NODE_TARBALL"] = str(args.node_tarball)
-    os.environ["SLIME_AGENT_CC_TARBALL"] = str(args.cc_tarball)
-    os.environ["SWE_AGENT"] = "claude_code"
+    setup_agent_tarball_envs(node_tarball=args.node_tarball, cc_tarball=args.cc_tarball)
     os.environ["SWE_CC_PROMPT"] = args.prompt
     if args.pull:
         os.environ["SLIME_AGENT_DOCKER_PULL"] = "1"
@@ -604,12 +881,12 @@ async def run_infer(args: argparse.Namespace) -> None:
     base, model = _glm_endpoint()
     new_results: list[dict[str, Any]] = []
     if pending:
-        adapter = GlmOnlyAnthropicAdapter(
+        adapters = DualInferAdapters(
             enable_thinking=not args.no_thinking,
             reasoning_effort=args.reasoning_effort or None,
         )
         handle = run_app_in_thread(
-            adapter.app,
+            adapters.app,
             host=args.bind_host,
             port=args.bind_port,
             thread_name="infer-glm-adapter",
@@ -624,7 +901,7 @@ async def run_infer(args: argparse.Namespace) -> None:
             tasks = [
                 _run_one_sample(
                     args=args,
-                    adapter=adapter,
+                    adapters=adapters,
                     adapter_port=handle.port,
                     index=index,
                     sample=sample,

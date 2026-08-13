@@ -7,8 +7,10 @@ Checks (per unique ``metadata.image``):
 * no ``deepswe/`` or ``scaleswe/`` path prefixes in the image rootfs
 * no ``/tmp_build`` (bake scratch must be removed)
 * if ``/tmp`` exists in the image: mode must be ``1777``, and no leftover bake
-  artifacts under it (``node22.tar``, ``claude-code-local.tgz``,
-  ``pre_commands.sh``). Missing ``/tmp`` is OK (runtime creates it).
+  artifacts under it (node/agent tarballs, ``pre_commands.sh``). Missing
+  ``/tmp`` is OK (runtime creates it).
+* pre-baked CLIs exist under ``/usr/local/bin``: node, npm, claude, opencode,
+  pi, mini (``cli_prebaked`` = Node + four agents)
 * ``metadata.workdir`` is a git work tree on branch ``scaleswe``; porcelain
   entries matching ScaleSWE ``pre_commands`` keep-list (``*.egg-info``,
   ``.tox``, ``.venv``) and generated ``version.py`` are ignored
@@ -36,17 +38,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from bake_common import AGENT_ASSET_NAMES, check_prebaked_clis
+
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _EXAMPLE_DIR = _SCRIPT_DIR.parent
 _VERIFY_TMP_ROOT = Path(os.environ.get("VERIFY_TMP_ROOT", "/tmp/slime-verify-scaleswe"))
 _FORBIDDEN_TOP_DIRS = ("deepswe", "scaleswe")
 _EXPECTED_BRANCH = "scaleswe"
 _EXPECTED_TMP_MODE = 0o1777
-_FORBIDDEN_TMP_LEFTOVERS = (
-    "node22.tar",
-    "claude-code-local.tgz",
-    "pre_commands.sh",
-)
+_FORBIDDEN_TMP_LEFTOVERS = (*AGENT_ASSET_NAMES, "pre_commands.sh")
 # ScaleSWE pre_commands use: git clean -fd -e '*.egg-info' -e '.tox' -e '.venv'
 _IGNORED_DIRTY_DIR_NAMES = frozenset({".tox", ".venv", "venv", ".eggs"})
 _IGNORED_DIRTY_FILE_NAMES = frozenset({"version.py"})
@@ -257,6 +257,7 @@ def verify_extracted(job: VerifyJob, root: Path) -> dict[str, Any]:
             errors.append(f"forbidden path present: /{name}/")
 
     _check_tmp_layout(root, errors)
+    check_prebaked_clis(root, errors)
 
     rel = job.workdir.lstrip("/")
     if not rel:

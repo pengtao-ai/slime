@@ -53,10 +53,11 @@ sys.path.insert(0, str(_EXAMPLE_DIR))
 import infer_cc_offload_traj as base  # noqa: E402
 import smoke_claude_code_docker as smoke  # noqa: E402
 import swe  # noqa: E402
-from slime.agent.harness import ClaudeCodeHarness  # noqa: E402
 from slime.agent.sandbox import DockerSandbox, ensure_agent_user  # noqa: E402
 from slime.agent.aiohttp_threaded import FilteredAccessLogger, run_app_in_thread  # noqa: E402
 from slime.utils.types import Sample  # noqa: E402
+
+from agents_registry import resolve_agent  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("infer_cc_tmax")
@@ -78,7 +79,7 @@ def _resolve_protocol(sample: Sample) -> str:
 async def _run_one_sample(
     *,
     args: argparse.Namespace,
-    adapter: base.GlmOnlyAnthropicAdapter,
+    adapters: base.DualInferAdapters,
     adapter_port: int,
     index: int,
     sample: Sample,
@@ -88,6 +89,8 @@ async def _run_one_sample(
     async with sem:
         protocol = _resolve_protocol(sample)
         md = swe.get_metadata(sample, protocol)
+        agent_spec = resolve_agent(md.get("agent"))
+        harness = agent_spec.harness_cls()
         image = args.image or md["image"]
         workdir = md["workdir"]
         instance_id = md["instance_id"]
@@ -97,16 +100,17 @@ async def _run_one_sample(
         if args.eval and uneval:
             raise SystemExit(f"[infer:{index}] unevaluable ({uneval}): {instance_id}")
 
-        session_id = f"infer-tmax-{index}-{secrets.token_hex(6)}"
+        session_id = f"infer-tmax-{agent_spec.name}-{index}-{secrets.token_hex(6)}"
         sample_dir.mkdir(parents=True, exist_ok=True)
         requests_dir = sample_dir / "requests"
         requests_dir.mkdir(parents=True, exist_ok=True)
-        adapter.bind_session_outdir(session_id, requests_dir)
-        adapter.open_session(
+        adapters.open_session(
             session_id,
+            protocol=agent_spec.adapter_protocol,
             sampling_defaults={"temperature": args.temperature, "max_new_tokens": args.max_new_tokens},
             max_context_tokens=args.max_context_len,
         )
+        adapters.bind_session_outdir(session_id, requests_dir)
 
         agent_exit_code = -999
         harness_traj = ""
@@ -117,7 +121,8 @@ async def _run_one_sample(
         t0 = time.monotonic()
         try:
             print(
-                f"[infer:{index}] start instance={instance_id} protocol={md.get('protocol')} image={image}",
+                f"[infer:{index}] start agent={agent_spec.name} instance={instance_id} "
+                f"protocol={md.get('protocol')} image={image}",
                 flush=True,
             )
             async with DockerSandbox(image) as sb:
@@ -131,7 +136,6 @@ async def _run_one_sample(
                     sb, port=adapter_port, preferred=(args.public_host or None)
                 )
                 adapter_url = f"http://{adapter_host}:{adapter_port}"
-                harness = ClaudeCodeHarness()
                 await harness.install_cli(sb)
                 await swe.prepare_workspace(sb, workdir, md)
                 if args.shrink_problem:
@@ -170,10 +174,12 @@ async def _run_one_sample(
                         )
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
-            logger.exception("[infer:%s] failed instance=%s", index, instance_id)
+            logger.exception(
+                "[infer:%s] failed instance=%s agent=%s", index, instance_id, agent_spec.name
+            )
         finally:
-            traj_turns = adapter.pop_session_traj(session_id)
-            await adapter.drop_session(session_id, wait_timeout=10)
+            traj_turns = adapters.pop_session_traj(session_id)
+            await adapters.drop_session(session_id, wait_timeout=10)
 
         base_url, model = base._glm_endpoint()
         summary = {
@@ -181,14 +187,14 @@ async def _run_one_sample(
             "ok": bool(traj_turns) and error is None,
             "mode": "glm_only_tmax",
             "protocol": md.get("protocol"),
+            "agent": agent_spec.name,
+            "adapter_protocol": agent_spec.adapter_protocol,
             "index": index,
             "instance_id": instance_id,
             "session_id": session_id,
             "agent_exit_code": agent_exit_code,
             "turns": len(traj_turns),
-            "tool_use_turns": sum(
-                1 for t in traj_turns if t["anthropic_response"]["stop_reason"] == "tool_use"
-            ),
+            "tool_use_turns": base._count_tool_use_turns(traj_turns),
             "reward": reward,
             "eval_applied": applied,
             "eval": bool(args.eval),
@@ -208,7 +214,7 @@ async def _run_one_sample(
             summary=summary,
         )
         print(
-            f"[infer:{index}] done ok={summary['ok']} turns={summary['turns']} "
+            f"[infer:{index}] done agent={agent_spec.name} ok={summary['ok']} turns={summary['turns']} "
             f"reward={reward} exit={agent_exit_code} err={error}",
             flush=True,
         )
@@ -219,9 +225,7 @@ async def run_infer(args: argparse.Namespace) -> None:
     os.environ["SLIME_AGENT_OFFLOAD"] = "0"
     base._require_glm_env()
     smoke._setup_docker_env(network=args.network)
-    os.environ["SLIME_AGENT_NODE_TARBALL"] = str(args.node_tarball)
-    os.environ["SLIME_AGENT_CC_TARBALL"] = str(args.cc_tarball)
-    os.environ["SWE_AGENT"] = "claude_code"
+    base.setup_agent_tarball_envs(node_tarball=args.node_tarball, cc_tarball=args.cc_tarball)
     os.environ["SWE_CC_PROMPT"] = args.prompt
     if args.pull:
         os.environ["SLIME_AGENT_DOCKER_PULL"] = "1"
@@ -265,12 +269,12 @@ async def run_infer(args: argparse.Namespace) -> None:
     base_url, model = base._glm_endpoint()
     new_results: list[dict[str, Any]] = []
     if pending:
-        adapter = base.GlmOnlyAnthropicAdapter(
+        adapters = base.DualInferAdapters(
             enable_thinking=not args.no_thinking,
             reasoning_effort=args.reasoning_effort or None,
         )
         handle = run_app_in_thread(
-            adapter.app,
+            adapters.app,
             host=args.bind_host,
             port=args.bind_port,
             thread_name="infer-tmax-adapter",
@@ -285,7 +289,7 @@ async def run_infer(args: argparse.Namespace) -> None:
             tasks = [
                 _run_one_sample(
                     args=args,
-                    adapter=adapter,
+                    adapters=adapters,
                     adapter_port=handle.port,
                     index=index,
                     sample=sample,

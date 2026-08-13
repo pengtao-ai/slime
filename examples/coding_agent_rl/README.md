@@ -31,7 +31,11 @@ The slime training stack itself follows the standard setup. On top of that you n
 
 Standard slime JSONL with three keys. Rows may mix ScaleSWE and Tmax via
 ``metadata.protocol`` (``scaleswe`` default when omitted; ``tmax`` for
-terminal-task images):
+terminal-task images). Per-sample harness selection uses ``metadata.agent``
+(``claude_code`` / ``codex`` / ``pi`` / ``opencode`` / ``miniswe``; aliases
+``cc``, ``mini-swe-agent``). Missing ``agent`` falls back to ``SWE_AGENT``
+(default ``claude_code``). All agents except ``codex`` dial the Anthropic (CC)
+adapter; ``codex`` uses the OpenAI chat-completions route on the same adapter URL.
 
 ```jsonc
 {
@@ -39,6 +43,7 @@ terminal-task images):
   "label": "<instance_id or grader label>",
   "metadata": {
     "protocol": "scaleswe",  // or "tmax"; omit => scaleswe
+    "agent": "claude_code",  // or codex | pi | opencode | miniswe
     "image": "your-registry/swe-image:<tag>",  // sandbox image reference
     "workdir": "/workspace/<repo>",            // tmax: usually /home/user
     "problem_statement": "<issue body>",
@@ -53,6 +58,23 @@ terminal-task images):
 ```
 
 Wire it up with `--input-key prompt --label-key label --metadata-key metadata`.
+
+Multi-agent smoke (5 agents × 2 rows each):
+
+```bash
+python examples/coding_agent_rl/build_agents_smoke_jsonl.py
+# -> data/scaleswe_agents_smoke.jsonl
+# -> data/tmax_agents_smoke.jsonl
+```
+
+Host tarballs / wheels (set the ones you need for the agents in the jsonl):
+
+- `SLIME_AGENT_NODE_TARBALL` — Node 22 (npm CLIs)
+- `SLIME_AGENT_CC_TARBALL` — Claude Code
+- `SLIME_AGENT_CODEX_TARBALL` — Codex
+- `SLIME_AGENT_PI_TARBALL` — Pi
+- `SLIME_AGENT_OPENCODE_TARBALL` — OpenCode
+- `SLIME_AGENT_MINISWE_WHEEL` — mini-swe-agent
 
 ### Mixing ScaleSWE + Tmax
 

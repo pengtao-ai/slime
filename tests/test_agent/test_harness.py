@@ -159,6 +159,8 @@ def test_codex_write_config_base64_roundtrips_inline_base_url():
         assert 'base_url = "http://host:18001/v1"' in toml  # MUST be inline
         assert 'wire_api = "chat"' in toml
         assert 'model_provider = "slime"' in toml
+        assert 'approval_policy = "never"' in toml
+        assert 'sandbox_mode = "danger-full-access"' in toml
 
     asyncio.run(run_case())
 
@@ -179,6 +181,7 @@ def test_codex_launch_command_and_env():
         assert rc == 0
         body = next(v for k, v in sb.files.items() if k.endswith("run.sh"))
         assert "codex exec" in body and "do work" in body and "--skip-git-repo-check" in body
+        assert "--sandbox danger-full-access" in body
         env = captured["env"]
         assert env["OPENAI_API_KEY"] == "sess-cx"
         assert env["OPENAI_BASE_URL"] == "http://host:18001/v1"

@@ -48,7 +48,8 @@ from slime.agent.sandbox import make_sandbox  # noqa: E402
 from slime.utils.types import Sample  # noqa: E402
 
 from examples.coding_agent_rl import swe  # noqa: E402
-from examples.coding_agent_rl.generate import HARNESS_CLS  # noqa: E402
+from examples.coding_agent_rl.agents_registry import resolve_agent  # noqa: E402
+from examples.coding_agent_rl.generate import boot_agent_sandbox  # noqa: E402
 
 
 def _load_sample(path: Path, *, index: int = 0) -> Sample:
@@ -196,14 +197,15 @@ async def run_slime_path(
             await sb.__aenter__()
         print(f"[slime] sandbox_id={sb.sandbox_id}", flush=True)
 
+        harness = resolve_agent(md.get("agent")).harness_cls()
         with chrome_span(
             events,
             "install_cli",
             cat="outer",
             tid=tid,
-            args={"instance_id": instance_id, "harness": getattr(HARNESS_CLS, "name", HARNESS_CLS.__name__)},
+            args={"instance_id": instance_id, "harness": harness.name},
         ):
-            await HARNESS_CLS().install_cli(sb)
+            await harness.install_cli(sb)
 
         with chrome_span(
             events,
