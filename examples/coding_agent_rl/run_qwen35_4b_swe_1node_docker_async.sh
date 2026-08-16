@@ -77,7 +77,8 @@ export QWEN_GDN_BACKEND="${QWEN_GDN_BACKEND:-flashqla}"
 # Checkpointing.
 export SAVE_INTERVAL="${SAVE_INTERVAL:-10}"
 # Agent budget: 900 keeps step latency down; raise to 1200 if too many soft timeouts.
-export SWE_AGENT_TIME_BUDGET_SEC="${SWE_AGENT_TIME_BUDGET_SEC:-900}"
+export SWE_AGENT_TIME_BUDGET_SEC="${SWE_AGENT_TIME_BUDGET_SEC:-600}"
+export ADAPTER_MAX_TURNS_PER_SID="${ADAPTER_MAX_TURNS_PER_SID:-128}"
 export SWE_EVAL_TIMEOUT_SEC="${SWE_EVAL_TIMEOUT_SEC:-300}"
 
 # Train-only (load-debug-rollout-data): skip Docker sandbox checks; no SGLang.

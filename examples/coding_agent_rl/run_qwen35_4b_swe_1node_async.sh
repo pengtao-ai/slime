@@ -128,7 +128,7 @@ LOG_FILE="${LOG_DIR}/run.log"
 echo "======================================================================"
 echo "Async training log: ${LOG_FILE}"
 echo "RUN_ROOT=${RUN_ROOT}"
-echo "SAVE_DIR=${SAVE_DIR}  SAVE_INTERVAL=${SAVE_INTERVAL}"
+echo "SAVE_DIR=${SAVE_DIR}  LOAD=${SAVE_DIR}  SAVE_INTERVAL=${SAVE_INTERVAL}"
 echo "ACTOR_GPUS=${ACTOR_GPUS} ROLLOUT_GPUS=${ROLLOUT_GPUS} (TP=${TP_SIZE} PP=${PP_SIZE} CP=${CP_SIZE} DP=${DP_SIZE} seq=${SEQ_LENGTH} max_tokens/gpu=${MAX_TOKENS_PER_GPU})"
 echo "ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE} N_SAMPLES=${N_SAMPLES_PER_PROMPT} GLOBAL_BATCH=${GLOBAL_BATCH_SIZE}"
 echo "QWEN_GDN_BACKEND=${QWEN_GDN_BACKEND}"
@@ -139,9 +139,12 @@ if (( GLOBAL_BATCH_SIZE % DP_SIZE != 0 )); then
   exit 1
 fi
 
+# --load == --save: resume when SAVE_DIR has latest_checkpointed_iteration.txt;
+# otherwise slime falls back to --ref-load and start_rollout_id=0.
 CKPT_ARGS=(
    --hf-checkpoint "${HF_CHECKPOINT}"
    --ref-load "${REF_MODEL_PATH}"
+   --load "${SAVE_DIR}"
    --save "${SAVE_DIR}"
    --save-interval "${SAVE_INTERVAL}"
 )
@@ -165,10 +168,8 @@ ROLLOUT_ARGS=(
    --micro-batch-size ${MICRO_BATCH_SIZE:-1}
    --update-weights-interval "${UPDATE_WEIGHTS_INTERVAL}"
 )
-# help_seeking α only when the whole GRPO group failed (no-op unless env set).
-if [[ "${OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG:-}" =~ ^(1|true|yes|on)$ ]]; then
-  ROLLOUT_ARGS+=(--rollout-sample-filter-path examples.coding_agent_rl.offload.shape_group_help_seeking_rewards)
-fi
+# Compact filter + help_seeking α only when the whole GRPO group failed.
+ROLLOUT_ARGS+=(--rollout-sample-filter-path examples.coding_agent_rl.offload.compact_and_shape_group_help_seeking_rewards)
 if [[ -n "${LOAD_DEBUG_ROLLOUT_DATA}" ]]; then
   ROLLOUT_ARGS+=(--load-debug-rollout-data "${LOAD_DEBUG_ROLLOUT_DATA}")
 else
@@ -199,6 +200,7 @@ fi
 
 ALGO_ARGS=(
    --advantage-estimator grpo
+   --custom-advantage-function-path examples.coding_agent_rl.offload_turn_advantage.compute_turn_advantages
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
    --kl-coef 0.00
@@ -214,6 +216,9 @@ OPTIMIZER_ARGS=(
    --weight-decay 0.1
    --adam-beta1 0.9
    --adam-beta2 0.98
+   # Resume with a larger --num-rollout recomputes train_iters/lr_decay_steps
+   # (e.g. 100→200 ⇒ 3200→6400); Megatron asserts unless we override.
+   --override-opt-param-scheduler
 )
 
 SGLANG_ARGS=(
@@ -287,6 +292,8 @@ export ADAPTER_PORT="${ADAPTER_PORT:-18001}"
 export SWE_AGENT_TIME_BUDGET_SEC="${SWE_AGENT_TIME_BUDGET_SEC:-900}"
 export SWE_EVAL_TIMEOUT_SEC="${SWE_EVAL_TIMEOUT_SEC:-300}"
 export SWE_BOOT_CONCURRENCY
+# Adapter per-sid turn cap (429 + max_steps_reached → compact remove).
+export ADAPTER_MAX_TURNS_PER_SID="${ADAPTER_MAX_TURNS_PER_SID:-64}"
 # Higher = fewer TOKEN_FORK segments (more REALIGN / rewrite-merge); default was 1024.
 export SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS="${SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS:-160000}"
 
@@ -324,6 +331,7 @@ keys = (
     "SLIME_AGENT_OPENCODE_TARBALL", "SLIME_AGENT_MINISWE_WHEEL",
     "SWE_AGENT_TIME_BUDGET_SEC", "SWE_EVAL_TIMEOUT_SEC", "SWE_BOOT_CONCURRENCY",
     "ADAPTER_BIND_HOST", "ADAPTER_PORT",
+    "ADAPTER_MAX_TURNS_PER_SID",
     "SLIME_AGENT_CC_EXTRA_ARGS",
     "SLIME_AGENT_CC_EXTRA_ENVS",
     "SWE_CC_PROMPT",
@@ -340,10 +348,12 @@ keys = (
     "DASHSCOPE_API_KEY", "OPENAI_API_KEY",
     "DASHSCOPE_BASE_URL", "DASHSCOPE_MODEL",
     "OFFLOAD_EFFICIENCY_LAMBDA", "OFFLOAD_MAX_TOKENS",
-    "OFFLOAD_THINK_FORMAT_PENALTY",
+    "OFFLOAD_THINK_FORMAT_PENALTY", "OFFLOAD_MALFORMED_PENALTY",
     "OFFLOAD_REWARD_MODE", "OFFLOAD_SEEK_ALPHA",
     "OFFLOAD_SEEK_EMPTY_SCALE", "OFFLOAD_UNIQUE_SOLVER_BONUS",
     "OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG",
+    "OFFLOAD_COMPACT_ORPHAN_OPEN_K", "OFFLOAD_COMPACT_OPEN_CLOSE_RATIO",
+    "OFFLOAD_COMPACT_SPECIAL_TOKEN_RATIO", "OFFLOAD_COMPACT_SPECIAL_TOKEN_RUN",
     "OFFLOAD_STOP_TOKEN_ID", "ROLLOUT_STOP_TOKEN_IDS",
     "SLIME_AGENT_OFFLOAD_SYSTEM_APPEND",
     "SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS",

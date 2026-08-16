@@ -53,6 +53,18 @@ logger = logging.getLogger(__name__)
 logging.getLogger("e2b").setLevel(logging.WARNING)
 
 
+def _adapter_max_turns_per_sid() -> int | None:
+    """``ADAPTER_MAX_TURNS_PER_SID``; empty/≤0 → unlimited (None). Default 128."""
+    raw = (os.environ.get("ADAPTER_MAX_TURNS_PER_SID") or "128").strip()
+    if not raw:
+        return None
+    try:
+        n = int(raw)
+    except ValueError:
+        return 128
+    return n if n > 0 else None
+
+
 class _OffloadMixin:
     """Per-turn pipeline: agent -> SLM -> (optional GLM) -> complete reply -> agent.
 
@@ -282,12 +294,14 @@ class _AdapterService(metaclass=SingletonMeta):
                 "ADAPTER_PUBLIC_HOST (host sandboxes can reach) so the coding "
                 "agent can dial back to the Anthropic adapter."
             )
+        max_turns = _adapter_max_turns_per_sid()
         adapter_kwargs = dict(
             tokenizer=self.tokenizer,
             sglang_url=sglang_url,
             tool_parser=self.tool_parser,
             reasoning_parser=self.reasoning_parser,
             fork_threshold_tokens=CONFIG.fork_merge_threshold,
+            max_turns_per_sid=max_turns,
         )
         self.anthropic = CodingAnthropicAdapter(**adapter_kwargs)
         self.openai = CodingOpenAIAdapter(**adapter_kwargs)
@@ -518,29 +532,54 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             if session_obj is not None and getattr(session_obj, "offload_stats", None):
                 offload_stats = dict(session_obj.offload_stats)
             train_reward = solved
+            turn_rewards: list[float] = []
+            turn_costs: list[dict[str, Any]] = list(offload_stats.get("turn_costs") or [])
             if offload.offload_enabled():
                 usage = md.get("usage") if isinstance(md.get("usage"), dict) else None
+                completion_tokens = md.get("completion_tokens")
                 if offload.reward_mode() == "help_seeking":
                     # When OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG=1, defer α to
-                    # shape_group_help_seeking_rewards (group all-failed only).
-                    train_reward = offload.help_seeking_reward(
+                    # compact_and_shape_group_help_seeking_rewards (group all-failed only).
+                    shaped = offload.compute_turn_rewards(
                         solved,
                         offload_stats,
                         usage=usage,
+                        completion_tokens=completion_tokens,
+                        metadata=md,
                         empty_patch=empty_patch,
                         encourage_seek=not offload.seek_only_when_all_wrong(),
+                        protocol=md.get("protocol"),
                     )
                 else:
-                    train_reward = offload.cost_aware_reward(solved, offload_stats, usage=usage)
+                    shaped = offload.compute_turn_rewards(
+                        solved,
+                        offload_stats,
+                        usage=usage,
+                        completion_tokens=completion_tokens,
+                        metadata=md,
+                        empty_patch=empty_patch,
+                        encourage_seek=False,
+                        protocol=md.get("protocol"),
+                    )
+                train_reward = float(shaped["reward"])
+                turn_rewards = list(shaped.get("turn_rewards") or [])
+                turn_costs = list(shaped.get("turn_costs") or turn_costs)
                 logger.info(
                     "[coding_agent_rl] %s: solved=%.1f train_reward=%.4f empty_patch=%s "
-                    "reward_mode=%s offload=%s",
+                    "reward_mode=%s n_turns=%d offload=%s",
                     instance_id,
                     solved,
                     train_reward,
                     empty_patch,
                     offload.reward_mode(),
-                    offload_stats,
+                    len(turn_costs),
+                    {k: offload_stats.get(k) for k in (
+                        "offload_count",
+                        "offload_outside_think_count",
+                        "small_output_tokens",
+                        "glm_output_tokens",
+                        "max_steps_reached",
+                    )},
                 )
             if evaluation:
                 logger.info(
@@ -583,6 +622,10 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         "protocol": md.get("protocol"),
                         "agent": agent_spec.name,
                         "offload_stats": offload_stats,
+                        "turn_rewards": turn_rewards,
+                        "turn_costs": turn_costs,
+                        "max_steps_reached": bool(offload_stats.get("max_steps_reached")),
+                        "timeout": agent_exit_code < 0,
                         "timeline": timeline,
                         "turn_git_diffs": state.pop_turn_git_diffs(session_id),
                     },
@@ -601,13 +644,28 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 _attach_timeline(result_samples, timeline)
                 return result_samples
 
+            if offload.offload_enabled() and turn_rewards:
+                offload.attach_turn_advantage_metadata(
+                    samples, turn_rewards=turn_rewards, turn_costs=turn_costs
+                )
+
             for s in samples:
                 s.metadata = {
                     **(s.metadata or {}),
                     "agent_exit_code": agent_exit_code,
                     "agent": agent_spec.name,
                     "timeline": timeline,
+                    "timeout": agent_exit_code < 0 or bool((s.metadata or {}).get("timeout")),
+                    "max_steps_reached": bool(
+                        (s.metadata or {}).get("max_steps_reached")
+                        or offload_stats.get("max_steps_reached")
+                    ),
                 }
+                if getattr(s, "train_metadata", None) is None and (s.metadata or {}).get("turn_rewards"):
+                    s.train_metadata = {
+                        "turn_rewards": s.metadata.get("turn_rewards"),
+                        "turn_token_spans": s.metadata.get("turn_token_spans"),
+                    }
             if agent_exit_code != 0:
                 reason = "time budget exceeded" if agent_exit_code < 0 else f"CLI error (exit {agent_exit_code})"
                 logger.warning(

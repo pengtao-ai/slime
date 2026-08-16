@@ -25,6 +25,15 @@ call, the continuation may be tokenized and appended to ``turn.output_ids``
 with ``output_loss_mask=0`` so rollout dumps contain the full assistant turn
 without contributing to the policy loss (``SLIME_OFFLOAD_EMBED_IN_TRAJECTORY``).
 
+Train shaping (when ``SLIME_AGENT_OFFLOAD=1``):
+  - Per-turn costs in ``offload_stats["turn_costs"]``; ``r_i`` via
+    :func:`compute_turn_rewards` (baseline completion = ``metadata.completion_tokens / n``).
+  - Hard compact filter + group α:
+    :func:`compact_and_shape_group_help_seeking_rewards`.
+  - Turn-painted advantages:
+    ``examples.coding_agent_rl.offload_turn_advantage.compute_turn_advantages``.
+  - tmax ``empty_patch`` does **not** multiply ``empty_scale``.
+
 Enable with ``SLIME_AGENT_OFFLOAD=1`` (see ``generate.py`` Offload* adapters).
 """
 
@@ -94,10 +103,17 @@ DEFAULT_OFFLOAD_SWE_PROMPT = OFFLOAD_SYSTEM_PROMPT_APPEND
 
 # Train reward: subtract this once if any offload span appeared outside <think>.
 DEFAULT_OFFLOAD_THINK_FORMAT_PENALTY = 0.25
+# Extra per-turn penalty for malformed offload tags (orphan OPEN, bad N, etc.).
+DEFAULT_OFFLOAD_MALFORMED_PENALTY = 0.25
 # help_seeking_reward: partial credit when unsolved but the SLM asked for help in-think.
 DEFAULT_OFFLOAD_SEEK_ALPHA = 0.1
 DEFAULT_OFFLOAD_SEEK_EMPTY_SCALE = 0.5
 DEFAULT_OFFLOAD_UNIQUE_SOLVER_BONUS = 0.15
+# Compact filter defaults (hard remove_sample).
+DEFAULT_COMPACT_ORPHAN_OPEN_K = 8
+DEFAULT_COMPACT_OPEN_CLOSE_RATIO = 20.0
+DEFAULT_COMPACT_SPECIAL_TOKEN_RATIO = 0.5
+DEFAULT_COMPACT_SPECIAL_TOKEN_RUN = 32
 
 
 def offload_system_append_text() -> str:
@@ -167,6 +183,10 @@ def efficiency_lambda() -> float:
 
 def think_format_penalty() -> float:
     return float(os.environ.get("OFFLOAD_THINK_FORMAT_PENALTY", str(DEFAULT_OFFLOAD_THINK_FORMAT_PENALTY)))
+
+
+def malformed_penalty() -> float:
+    return float(os.environ.get("OFFLOAD_MALFORMED_PENALTY", str(DEFAULT_OFFLOAD_MALFORMED_PENALTY)))
 
 
 def reward_mode() -> str:
@@ -294,16 +314,117 @@ def _ensure_stats(session: Session) -> dict[str, Any]:
                 "glm_output_tokens": 0,
                 "last_offload_n": None,
                 "last_reasoning_effort": None,
+                "turn_costs": [],
+                "max_steps_reached": False,
             }
         )
+    stats.setdefault("turn_costs", [])
+    stats.setdefault("max_steps_reached", False)
     return stats
 
 
-def record_local_turn_tokens(session: Session, turn: TurnRecord) -> None:
-    """Accumulate per-round SLM prompt/output token counts for session cost."""
+def analyze_offload_tags(raw: str) -> dict[str, Any]:
+    """Count offload OPEN/CLOSE tags and classify format violations.
+
+    Valid complete span: ``<|llm_offload|>N<|/llm_offload|>`` with single digit N.
+    """
+    text = raw or ""
+    open_count = text.count(OFFLOAD_OPEN)
+    close_count = text.count(OFFLOAD_CLOSE)
+    valid = list(_OFFLOAD_SPAN_RE.finditer(text))
+    valid_count = len(valid)
+
+    # Consume matched valid spans; leftover OPEN/CLOSE are malformed/orphan.
+    consumed = [(m.start(), m.end()) for m in valid]
+    orphan_open = 0
+    malformed = 0
+    pos = 0
+    while True:
+        oi = text.find(OFFLOAD_OPEN, pos)
+        if oi < 0:
+            break
+        if any(s <= oi < e for s, e in consumed):
+            pos = oi + len(OFFLOAD_OPEN)
+            continue
+        # Incomplete or bad payload before CLOSE.
+        ci = text.find(OFFLOAD_CLOSE, oi + len(OFFLOAD_OPEN))
+        if ci < 0:
+            orphan_open += 1
+            pos = oi + len(OFFLOAD_OPEN)
+            continue
+        payload = text[oi + len(OFFLOAD_OPEN) : ci]
+        if not (len(payload) == 1 and payload.isdigit()):
+            malformed += 1
+        else:
+            # Digit span that somehow wasn't matched (shouldn't happen).
+            malformed += 1
+        pos = ci + len(OFFLOAD_CLOSE)
+
+    # CLOSE without a preceding unmatched OPEN in leftover stream.
+    leftover_close = max(0, close_count - valid_count - malformed)
+    # Prefer counting unmatched closes as malformed.
+    if leftover_close > 0:
+        malformed += leftover_close
+
+    # Longest consecutive OPEN spam (open markers with no close between).
+    max_open_run = 0
+    run = 0
+    scan = 0
+    while scan < len(text):
+        if text.startswith(OFFLOAD_OPEN, scan):
+            run += 1
+            max_open_run = max(max_open_run, run)
+            scan += len(OFFLOAD_OPEN)
+            continue
+        if text.startswith(OFFLOAD_CLOSE, scan):
+            run = 0
+            scan += len(OFFLOAD_CLOSE)
+            continue
+        scan += 1
+
+    special_marks = open_count + close_count
+    return {
+        "open_count": open_count,
+        "close_count": close_count,
+        "valid_count": valid_count,
+        "orphan_open_count": orphan_open,
+        "malformed_count": malformed,
+        "max_open_run": max_open_run,
+        "special_mark_count": special_marks,
+    }
+
+
+def record_local_turn_tokens(session: Session, turn: TurnRecord, *, raw_output: str = "") -> dict[str, Any]:
+    """Accumulate per-round SLM tokens and append a ``turn_costs`` ledger entry."""
     stats = _ensure_stats(session)
-    stats["small_prompt_tokens"] = int(stats.get("small_prompt_tokens", 0)) + len(turn.prompt_ids or [])
-    stats["small_output_tokens"] = int(stats.get("small_output_tokens", 0)) + len(turn.output_ids or [])
+    prompt_n = len(turn.prompt_ids or [])
+    # Called before GLM embed → output_ids are SLM-only.
+    out_n = len(turn.output_ids or [])
+    stats["small_prompt_tokens"] = int(stats.get("small_prompt_tokens", 0)) + prompt_n
+    stats["small_output_tokens"] = int(stats.get("small_output_tokens", 0)) + out_n
+
+    tag = analyze_offload_tags(raw_output)
+    outside = False
+    valid_offload = parse_valid_offload_directive(raw_output) is not None
+    if parse_offload_directive(raw_output) is not None and not valid_offload:
+        outside = True
+    entry: dict[str, Any] = {
+        "small_prompt_tokens": prompt_n,
+        "small_output_tokens": out_n,
+        "glm_input_tokens": 0,
+        "glm_output_tokens": 0,
+        "response_token_len": out_n,
+        "valid_offload": valid_offload,
+        "outside_think": outside,
+        "orphan_open_count": int(tag["orphan_open_count"]),
+        "malformed_count": int(tag["malformed_count"]),
+        "open_count": int(tag["open_count"]),
+        "close_count": int(tag["close_count"]),
+        "max_open_run": int(tag["max_open_run"]),
+        "special_mark_count": int(tag["special_mark_count"]),
+    }
+    stats["turn_costs"].append(entry)
+    return entry
 
 
 def _estimate_tokens(text: str) -> int:
@@ -318,7 +439,7 @@ def _record_glm_usage(
     messages: list[dict[str, Any]],
     content: str,
     think: str,
-) -> None:
+) -> tuple[int, int]:
     if usage:
         inp = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
         out = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
@@ -339,6 +460,7 @@ def _record_glm_usage(
         )
     stats["glm_input_tokens"] = int(stats.get("glm_input_tokens", 0)) + inp
     stats["glm_output_tokens"] = int(stats.get("glm_output_tokens", 0)) + out
+    return inp, out
 
 
 def _offload_prefix(raw: str) -> str:
@@ -919,19 +1041,21 @@ async def apply_offload_if_needed(
     if not offload_enabled():
         return reply
 
-    record_local_turn_tokens(session, turn)
+    turn_entry = record_local_turn_tokens(session, turn, raw_output=raw_output)
     parsed = parse_valid_offload_directive(raw_output)
     if parsed is None:
         # Complete span exists but not in <think> → format violation, no GLM.
         if parse_offload_directive(raw_output) is not None:
             stats = _ensure_stats(session)
             stats["offload_outside_think_count"] = int(stats.get("offload_outside_think_count", 0)) + 1
+            turn_entry["outside_think"] = True
             logger.info(
                 "[coding_agent_offload] sid=%s skip GLM: offload span outside <think> "
                 "(outside_think#%d)",
                 sid,
                 stats["offload_outside_think_count"],
             )
+        turn_entry["response_token_len"] = len(turn.output_ids or [])
         return reply
 
     n, _prefix = parsed
@@ -968,7 +1092,10 @@ async def apply_offload_if_needed(
         timing["n_offloads"] = int(timing.get("n_offloads", 0) or 0) + 1
     stats["last_offload_n"] = n
     stats["last_reasoning_effort"] = reasoning_effort
-    _record_glm_usage(stats, usage, messages=messages, content=content, think=think)
+    turn_entry["valid_offload"] = True
+    gin, gout = _record_glm_usage(stats, usage, messages=messages, content=content, think=think)
+    turn_entry["glm_input_tokens"] = gin
+    turn_entry["glm_output_tokens"] = gout
 
     logger.info(
         "[coding_agent_offload] sid=%s offload#%d N=%d thinking=%s effort=%s "
@@ -998,6 +1125,7 @@ async def apply_offload_if_needed(
         glm_content=content,
         glm_think=think,
     )
+    turn_entry["response_token_len"] = len(turn.output_ids or [])
     return amend_reply_with_offload(
         reply,
         raw_output=raw_output,
@@ -1016,6 +1144,45 @@ def actual_cost(stats: dict[str, Any]) -> float:
     )
 
 
+def turn_actual_cost(turn: dict[str, Any]) -> float:
+    return (
+        int(turn.get("small_prompt_tokens", 0)) * COST_SMALL_PROMPT
+        + int(turn.get("small_output_tokens", 0)) * COST_SMALL_OUTPUT
+        + int(turn.get("glm_input_tokens", 0)) * COST_GLM_INPUT
+        + int(turn.get("glm_output_tokens", 0)) * COST_GLM_OUTPUT
+    )
+
+
+def resolve_baseline_completion_tokens(
+    usage: dict[str, Any] | None = None,
+    *,
+    completion_tokens: int | float | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> int:
+    """Prefer metadata.completion_tokens, then usage, then default."""
+    if completion_tokens is not None:
+        return max(0, int(completion_tokens))
+    md = metadata or {}
+    if md.get("completion_tokens") is not None:
+        return max(0, int(md["completion_tokens"]))
+    if usage and usage.get("completion_tokens") is not None:
+        return max(0, int(usage["completion_tokens"]))
+    return _DEFAULT_BASELINE_COMPLETION_TOKENS
+
+
+def resolve_baseline_prompt_tokens(
+    usage: dict[str, Any] | None = None,
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> int:
+    md = metadata or {}
+    if md.get("prompt_tokens") is not None:
+        return max(0, int(md["prompt_tokens"]))
+    if usage and usage.get("prompt_tokens") is not None:
+        return max(0, int(usage["prompt_tokens"]))
+    return _DEFAULT_BASELINE_PROMPT_TOKENS
+
+
 def baseline_cost(usage: dict[str, Any] | None) -> float:
     if usage:
         prompt_t = int(usage.get("prompt_tokens") or _DEFAULT_BASELINE_PROMPT_TOKENS)
@@ -1026,11 +1193,48 @@ def baseline_cost(usage: dict[str, Any] | None) -> float:
     return prompt_t * COST_GLM_INPUT + completion_t * COST_GLM_OUTPUT
 
 
+def per_turn_baseline_cost(
+    *,
+    n_turns: int,
+    usage: dict[str, Any] | None = None,
+    completion_tokens: int | float | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> float:
+    """Per-turn baseline ``b_i``: prompt_default/n + (completion_tokens/n)*GLM_OUT."""
+    n = max(int(n_turns), 1)
+    prompt_t = resolve_baseline_prompt_tokens(usage, metadata=metadata)
+    comp_t = resolve_baseline_completion_tokens(
+        usage, completion_tokens=completion_tokens, metadata=metadata
+    )
+    return (prompt_t / n) * COST_GLM_INPUT + (comp_t / n) * COST_GLM_OUTPUT
+
+
 def cost_ratio(stats: dict[str, Any], usage: dict[str, Any] | None = None) -> float:
     base = baseline_cost(usage)
     if base <= 0:
         return 0.0
     return actual_cost(stats) / base
+
+
+def _protocol_is_tmax(protocol: str | None, metadata: dict[str, Any] | None = None) -> bool:
+    if protocol is not None:
+        return str(protocol).strip().lower() == "tmax"
+    md = metadata or {}
+    return str(md.get("protocol") or "").strip().lower() == "tmax"
+
+
+def _apply_empty_scale(
+    credit: float,
+    *,
+    empty_patch: bool,
+    empty_scale: float,
+    protocol: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> float:
+    """Scale α on empty_patch except for tmax (no meaningful git diff)."""
+    if not empty_patch or _protocol_is_tmax(protocol, metadata):
+        return credit
+    return credit * float(empty_scale)
 
 
 def cost_aware_reward(
@@ -1073,6 +1277,7 @@ def help_seeking_reward(
     unique_solver: bool = False,
     unique_bonus: float | None = None,
     encourage_seek: bool = True,
+    protocol: str | None = None,
 ) -> float:
     """Train reward that keeps a gradient toward offloading when stuck.
 
@@ -1082,20 +1287,12 @@ def help_seeking_reward(
     - unsolved, ``encourage_seek=False``: ``0`` (defer α to group shaping)
     - unsolved, no in-think offload: ``0``
     - unsolved, ``offload_count>0`` and no outside-think spans: ``α``
-      (scaled by ``empty_scale`` when ``empty_patch``)
+      (scaled by ``empty_scale`` when ``empty_patch``, **except tmax**)
     - unsolved with only outside-think offload: ``0`` (format still discouraged)
     - solved: ``1 - λ * cost_ratio`` (− format penalty if outside-think), then
       optional ``unique_bonus`` when this traj is the sole solver in its group
-      (caller must set ``unique_solver``; default unused at per-sample finish)
 
-    With ``OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG=1``, per-sample finish passes
-    ``encourage_seek=False`` and :func:`shape_group_help_seeking_rewards` grants
-    α only when every sibling session failed.
-
-    Enable via ``OFFLOAD_REWARD_MODE=help_seeking``. Knobs:
-    ``OFFLOAD_SEEK_ALPHA``, ``OFFLOAD_SEEK_EMPTY_SCALE``,
-    ``OFFLOAD_UNIQUE_SOLVER_BONUS``, ``OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG``,
-    plus the usual λ / format-penalty envs.
+    Prefer :func:`compute_turn_rewards` for per-turn shaping used in training.
     """
     st = stats or {}
     oc = int(st.get("offload_count", 0) or 0)
@@ -1106,12 +1303,11 @@ def help_seeking_reward(
     if float(solved) <= 0.0:
         if not encourage_seek or oc < 1 or outside > 0:
             return 0.0
-        credit = alpha_v
-        if empty_patch:
-            credit *= emp_scale
+        credit = _apply_empty_scale(
+            alpha_v, empty_patch=empty_patch, empty_scale=emp_scale, protocol=protocol
+        )
         return max(0.0, credit)
 
-    # Solved path: same efficiency / format shaping as cost_aware_reward.
     reward = cost_aware_reward(
         solved,
         st,
@@ -1123,6 +1319,260 @@ def help_seeking_reward(
         bonus = float(unique_bonus if unique_bonus is not None else unique_solver_bonus())
         reward += bonus
     return max(0.0, reward)
+
+
+def compute_turn_rewards(
+    solved: float,
+    stats: dict[str, Any] | None,
+    *,
+    usage: dict[str, Any] | None = None,
+    completion_tokens: int | float | None = None,
+    metadata: dict[str, Any] | None = None,
+    lam: float | None = None,
+    format_penalty: float | None = None,
+    malformed_pen: float | None = None,
+    alpha: float | None = None,
+    empty_patch: bool = False,
+    empty_scale: float | None = None,
+    encourage_seek: bool = True,
+    protocol: str | None = None,
+) -> dict[str, Any]:
+    """Per-turn rewards ``r_i`` and scalar ``mean(r_i)``.
+
+    Solved: ``r_i = max(0, 1 - λ * c_i/b_i - format - malformed)``.
+    Unsolved help_seeking: α' on valid in-think turns (unless deferred),
+    ``-β`` on malformed/orphan spam turns, else 0.
+    """
+    st = dict(stats or {})
+    turns: list[dict[str, Any]] = list(st.get("turn_costs") or [])
+    n = len(turns)
+    lam_v = float(lam if lam is not None else efficiency_lambda())
+    fmt_pen = float(format_penalty if format_penalty is not None else think_format_penalty())
+    mal_pen = float(malformed_pen if malformed_pen is not None else malformed_penalty())
+    alpha_v = float(alpha if alpha is not None else seek_alpha())
+    emp_scale = float(empty_scale if empty_scale is not None else seek_empty_scale())
+    proto = protocol if protocol is not None else (metadata or {}).get("protocol")
+
+    if n == 0:
+        # Fallback to legacy scalar when no turn ledger (compat).
+        if reward_mode() == "help_seeking":
+            r = help_seeking_reward(
+                solved,
+                st,
+                usage=usage,
+                lam=lam_v,
+                format_penalty=fmt_pen,
+                alpha=alpha_v,
+                empty_patch=empty_patch,
+                empty_scale=emp_scale,
+                encourage_seek=encourage_seek,
+                protocol=proto,
+            )
+        else:
+            r = cost_aware_reward(solved, st, usage=usage, lam=lam_v, format_penalty=fmt_pen)
+        return {"reward": float(r), "turn_rewards": [], "turn_costs": turns}
+
+    b_i = per_turn_baseline_cost(
+        n_turns=n, usage=usage, completion_tokens=completion_tokens, metadata=metadata
+    )
+    turn_rewards: list[float] = []
+
+    if float(solved) > 0.0:
+        for tc in turns:
+            c_i = turn_actual_cost(tc)
+            ratio = (c_i / b_i) if b_i > 0 else 0.0
+            r_i = 1.0 - lam_v * ratio
+            if tc.get("outside_think"):
+                r_i -= fmt_pen
+            mal = int(tc.get("malformed_count", 0) or 0) + int(tc.get("orphan_open_count", 0) or 0)
+            if mal > 0:
+                r_i -= mal_pen
+            turn_rewards.append(max(0.0, float(r_i)))
+    elif reward_mode() != "help_seeking":
+        # cost_aware: unsolved → all zeros (still record malformed as -β for advantage).
+        for tc in turns:
+            mal = int(tc.get("malformed_count", 0) or 0) + int(tc.get("orphan_open_count", 0) or 0)
+            if mal > 0 or int(tc.get("max_open_run", 0) or 0) >= 8:
+                turn_rewards.append(-mal_pen)
+            else:
+                turn_rewards.append(0.0)
+    else:
+        credit = _apply_empty_scale(
+            alpha_v, empty_patch=empty_patch, empty_scale=emp_scale, protocol=proto, metadata=metadata
+        )
+        for tc in turns:
+            mal = int(tc.get("malformed_count", 0) or 0) + int(tc.get("orphan_open_count", 0) or 0)
+            if mal > 0 or int(tc.get("max_open_run", 0) or 0) >= 8:
+                turn_rewards.append(-mal_pen)
+                continue
+            if (
+                encourage_seek
+                and tc.get("valid_offload")
+                and not tc.get("outside_think")
+            ):
+                turn_rewards.append(max(0.0, float(credit)))
+            else:
+                turn_rewards.append(0.0)
+
+    reward = float(sum(turn_rewards) / max(len(turn_rewards), 1))
+    return {"reward": reward, "turn_rewards": turn_rewards, "turn_costs": turns}
+
+
+def build_turn_token_spans(
+    response_length: int,
+    loss_mask: list[int] | None,
+    turn_costs: list[dict[str, Any]],
+    turn_rewards: list[float],
+) -> list[list[int]] | None:
+    """Map turns onto response indices via trainable-token proportions.
+
+    Returns ``[[start, end), ...]`` in response coordinates, or None to signal
+    broadcast fallback.
+    """
+    if not turn_costs or not turn_rewards or response_length <= 0:
+        return None
+    if len(turn_costs) != len(turn_rewards):
+        return None
+    mask = list(loss_mask) if loss_mask is not None else [1] * response_length
+    if len(mask) != response_length:
+        return None
+    trainable = [i for i, m in enumerate(mask) if int(m)]
+    if not trainable:
+        return None
+    weights = [max(1, int(tc.get("small_output_tokens", 0) or 0)) for tc in turn_costs]
+    total_w = sum(weights)
+    spans: list[list[int]] = []
+    cursor = 0
+    n_train = len(trainable)
+    for i, w in enumerate(weights):
+        remaining_turns = len(weights) - i
+        if remaining_turns == 1:
+            chunk = trainable[cursor:]
+        else:
+            n_tok = max(1, int(round(n_train * w / total_w)))
+            end = min(cursor + n_tok, n_train - (remaining_turns - 1))
+            end = max(cursor + 1, end)
+            chunk = trainable[cursor:end]
+            cursor = end
+        if not chunk:
+            spans.append([0, 0])
+        else:
+            spans.append([int(chunk[0]), int(chunk[-1]) + 1])
+    return spans
+
+
+def attach_turn_advantage_metadata(
+    samples: list[Any],
+    *,
+    turn_rewards: list[float],
+    turn_costs: list[dict[str, Any]],
+) -> None:
+    """Write turn_rewards / spans into sample.metadata and train_metadata."""
+    for sample in samples:
+        md = dict(getattr(sample, "metadata", None) or {})
+        md["turn_rewards"] = list(turn_rewards)
+        md["turn_costs"] = list(turn_costs)
+        spans = build_turn_token_spans(
+            int(getattr(sample, "response_length", 0) or 0),
+            getattr(sample, "loss_mask", None),
+            turn_costs,
+            turn_rewards,
+        )
+        if spans is not None:
+            md["turn_token_spans"] = spans
+        else:
+            md.pop("turn_token_spans", None)
+        sample.metadata = md
+        train_md = dict(getattr(sample, "train_metadata", None) or {})
+        train_md["turn_rewards"] = list(turn_rewards)
+        if spans is not None:
+            train_md["turn_token_spans"] = spans
+        else:
+            train_md.pop("turn_token_spans", None)
+        sample.train_metadata = train_md
+
+
+def _aggregate_tag_counts(stats: dict[str, Any]) -> dict[str, int]:
+    turns = list(stats.get("turn_costs") or [])
+    if turns:
+        return {
+            "open_count": sum(int(t.get("open_count", 0) or 0) for t in turns),
+            "close_count": sum(int(t.get("close_count", 0) or 0) for t in turns),
+            "orphan_open_count": sum(int(t.get("orphan_open_count", 0) or 0) for t in turns),
+            "malformed_count": sum(int(t.get("malformed_count", 0) or 0) for t in turns),
+            "max_open_run": max((int(t.get("max_open_run", 0) or 0) for t in turns), default=0),
+            "special_mark_count": sum(int(t.get("special_mark_count", 0) or 0) for t in turns),
+            "small_output_tokens": sum(int(t.get("small_output_tokens", 0) or 0) for t in turns),
+        }
+    return {
+        "open_count": 0,
+        "close_count": 0,
+        "orphan_open_count": 0,
+        "malformed_count": 0,
+        "max_open_run": 0,
+        "special_mark_count": 0,
+        "small_output_tokens": int(stats.get("small_output_tokens", 0) or 0),
+    }
+
+
+def compact_should_remove_sample(sample: Any) -> tuple[bool, str | None]:
+    """Return (remove, reason) for hard compact/overlong filters."""
+    from slime.utils.types import Sample as _Sample
+
+    md = getattr(sample, "metadata", None) or {}
+    status = getattr(sample, "status", None)
+    abort_reason = str(md.get("abort_reason") or "")
+
+    if status == getattr(_Sample.Status, "TRUNCATED", None) or str(status).endswith("TRUNCATED"):
+        return True, "truncated"
+    if md.get("timeout") or "timeout" in abort_reason.lower():
+        return True, "timeout"
+    if status == getattr(_Sample.Status, "ABORTED", None) and "timeout" in abort_reason.lower():
+        return True, "timeout"
+    if md.get("max_steps_reached") or stats_flag_max_steps(md) or abort_reason == "max_turns":
+        return True, "max_steps"
+
+    stats = md.get("offload_stats") or {}
+    tags = _aggregate_tag_counts(stats)
+    k = int(os.environ.get("OFFLOAD_COMPACT_ORPHAN_OPEN_K", str(DEFAULT_COMPACT_ORPHAN_OPEN_K)))
+    ratio_r = float(os.environ.get("OFFLOAD_COMPACT_OPEN_CLOSE_RATIO", str(DEFAULT_COMPACT_OPEN_CLOSE_RATIO)))
+    special_ratio = float(
+        os.environ.get("OFFLOAD_COMPACT_SPECIAL_TOKEN_RATIO", str(DEFAULT_COMPACT_SPECIAL_TOKEN_RATIO))
+    )
+    special_run = int(os.environ.get("OFFLOAD_COMPACT_SPECIAL_TOKEN_RUN", str(DEFAULT_COMPACT_SPECIAL_TOKEN_RUN)))
+
+    open_c = tags["open_count"]
+    close_c = tags["close_count"]
+    orphan = tags["orphan_open_count"]
+    if orphan >= k or (open_c >= k and close_c == 0):
+        return True, "orphan_open"
+    if open_c / max(close_c, 1) >= ratio_r and open_c >= k:
+        return True, "open_close_ratio"
+    if tags["max_open_run"] >= special_run:
+        return True, "special_token_run"
+    out_tok = max(1, tags["small_output_tokens"], int(getattr(sample, "response_length", 0) or 0))
+    if tags["special_mark_count"] / out_tok >= special_ratio and tags["special_mark_count"] >= k:
+        return True, "special_token_ratio"
+    return False, None
+
+
+def stats_flag_max_steps(md: dict[str, Any]) -> bool:
+    stats = md.get("offload_stats") or {}
+    return bool(stats.get("max_steps_reached"))
+
+
+def compact_filter_offload_samples(args: Any, groups: list) -> None:
+    """Hard-remove truncated / timeout / max-steps / tag-spam trajectories."""
+    del args
+    for group in groups:
+        for item in group:
+            for sample in _session_segments(item):
+                remove, reason = compact_should_remove_sample(sample)
+                if remove:
+                    sample.remove_sample = True
+                    md = dict(getattr(sample, "metadata", None) or {})
+                    md["compact_remove_reason"] = reason
+                    sample.metadata = md
 
 
 def _session_solved(metadata: dict[str, Any] | None) -> bool:
@@ -1140,21 +1590,18 @@ def _session_segments(group_item: Any) -> list[Any]:
 
 
 def shape_group_help_seeking_rewards(args: Any, groups: list) -> None:
-    """Rollout sample filter: grant help-seeking α only when the whole group failed.
+    """Grant help-seeking α on valid offload turns when the whole group failed.
 
-    Wire with ``--rollout-sample-filter-path examples.coding_agent_rl.offload.shape_group_help_seeking_rewards``.
-    No-op unless ``OFFLOAD_REWARD_MODE=help_seeking`` and
-    ``OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG`` is enabled.
-
-    Mutates ``sample.reward`` in place. ``args`` is unused but required by the
-    rollout-sample-filter contract.
+    Mutates ``turn_rewards`` / ``sample.reward`` in place. tmax does not apply
+    ``empty_scale`` on empty_patch.
     """
-    del args  # plugin signature
+    del args
     if reward_mode() != "help_seeking" or not seek_only_when_all_wrong():
         return
 
     alpha_v = seek_alpha()
     emp_scale = seek_empty_scale()
+    mal_pen = malformed_penalty()
 
     for group in groups:
         sessions = [_session_segments(item) for item in group]
@@ -1162,20 +1609,62 @@ def shape_group_help_seeking_rewards(args: Any, groups: list) -> None:
         if not sessions:
             continue
         if any(_session_solved(getattr(segs[0], "metadata", None)) for segs in sessions):
-            # Any sibling solved → do not encourage offload on failures.
             continue
 
         for segs in sessions:
-            md = getattr(segs[0], "metadata", None) or {}
+            md = dict(getattr(segs[0], "metadata", None) or {})
             stats = md.get("offload_stats") or {}
+            turn_rewards = list(md.get("turn_rewards") or [])
+            turn_costs = list(md.get("turn_costs") or stats.get("turn_costs") or [])
+            credit = _apply_empty_scale(
+                alpha_v,
+                empty_patch=bool(md.get("empty_patch")),
+                empty_scale=emp_scale,
+                protocol=md.get("protocol"),
+                metadata=md,
+            )
+            credit = max(0.0, float(credit))
+
+            if turn_costs and (not turn_rewards or len(turn_rewards) != len(turn_costs)):
+                turn_rewards = [0.0] * len(turn_costs)
+
+            if turn_costs and turn_rewards:
+                for i, tc in enumerate(turn_costs):
+                    mal = int(tc.get("malformed_count", 0) or 0) + int(tc.get("orphan_open_count", 0) or 0)
+                    if mal > 0:
+                        if turn_rewards[i] > -mal_pen:
+                            turn_rewards[i] = -mal_pen
+                        continue
+                    if tc.get("valid_offload") and not tc.get("outside_think"):
+                        if float(turn_rewards[i]) <= 0.0:
+                            turn_rewards[i] = credit
+                if turn_rewards:
+                    mean_r = float(sum(turn_rewards) / max(len(turn_rewards), 1))
+                    for sample in segs:
+                        smd = dict(getattr(sample, "metadata", None) or {})
+                        smd["turn_rewards"] = list(turn_rewards)
+                        smd["turn_costs"] = list(turn_costs)
+                        sample.metadata = smd
+                        tmd = dict(getattr(sample, "train_metadata", None) or {})
+                        tmd["turn_rewards"] = list(turn_rewards)
+                        if "turn_token_spans" in smd:
+                            tmd["turn_token_spans"] = smd["turn_token_spans"]
+                        sample.train_metadata = tmd
+                        if float(getattr(sample, "reward", 0.0) or 0.0) <= 0.0:
+                            sample.reward = mean_r
+                continue
+
+            # Legacy scalar path (no turn ledger).
             oc = int(stats.get("offload_count", 0) or 0)
             outside = int(stats.get("offload_outside_think_count", 0) or 0)
             if oc < 1 or outside > 0:
                 continue
-            credit = alpha_v
-            if md.get("empty_patch"):
-                credit *= emp_scale
-            credit = max(0.0, float(credit))
             for sample in segs:
                 if float(getattr(sample, "reward", 0.0) or 0.0) <= 0.0:
                     sample.reward = credit
+
+
+def compact_and_shape_group_help_seeking_rewards(args: Any, groups: list) -> None:
+    """Compact hard-filter then help-seeking group α shaping."""
+    compact_filter_offload_samples(args, groups)
+    shape_group_help_seeking_rewards(args, groups)

@@ -35,6 +35,9 @@ export NCCL_DEBUG=INFO
 export NCCL_CUMEM_ENABLE=0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+export ADAPTER_MAX_TURNS_PER_SID="${ADAPTER_MAX_TURNS_PER_SID:-50}"
+export SWE_AGENT_TIME_BUDGET_SEC="${SWE_AGENT_TIME_BUDGET_SEC:-600}"
+
 # TF32 (Ampere+): enable via env var so it overrides any internal PyTorch default.
 # This targets cuBLAS matmul; for cuDNN, prefer torch.backends.cudnn.allow_tf32 in code if needed.
 export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE="${TORCH_ALLOW_TF32_CUBLAS_OVERRIDE:-1}"
@@ -45,7 +48,7 @@ SLIME_DIR="${SLIME_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 export SAVE_INTERVAL="${SAVE_INTERVAL:-20}"
 # ---- mid-turn offload ----
 export SLIME_AGENT_OFFLOAD=1
-export OFFLOAD_EFFICIENCY_LAMBDA=0.1
+export OFFLOAD_EFFICIENCY_LAMBDA=0.5
 # help_seeking + only-all-wrong: α only if the whole GRPO group failed
 # (see offload.shape_group_help_seeking_rewards). Else do not encourage offload.
 # Set OFFLOAD_REWARD_MODE=cost_aware to restore the old "fail → 0" shaping.
@@ -55,6 +58,7 @@ export OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG=1
 export OFFLOAD_SEEK_ALPHA=0.1
 export OFFLOAD_SEEK_EMPTY_SCALE=0.5
 export OFFLOAD_UNIQUE_SOLVER_BONUS=0.15
+export ADAPTER_MAX_TURNS_PER_SID="${ADAPTER_MAX_TURNS_PER_SID:-50}"
 export DASHSCOPE_BASE_URL=http://208.64.254.187:8001/v1
 export DASHSCOPE_API_KEY=sk-6137d26281697017ef07ef4da0823dc16d32acaad253ecac
 export DASHSCOPE_MODEL=deepseek-v4-flash-0731
@@ -84,7 +88,7 @@ export SGLANG_KV_CACHE_DTYPE="${SGLANG_KV_CACHE_DTYPE:-fp8_e4m3}"
 # Pre-baked ScaleSWE agent images (Node22 + Claude Code + pre_commands).
 # Override with PROMPT_DATA=.../swe_train_scaleswe_200.jsonl for the raw bases.
 # export PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/data/swe_train_scaleswe_200_baked.jsonl}"
-export PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/data/mixed_reward1_agents.jsonl}"
+export PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/data/mixed_reward1_agents_first200_baked_shuffled.jsonl}"
 
 # Multi-agent CLI packages for mixed_*_agents.jsonl (codex/pi/opencode/miniswe).
 # Claude Code + Node are set in run_qwen35_4b_swe_1node_async.sh; these four must

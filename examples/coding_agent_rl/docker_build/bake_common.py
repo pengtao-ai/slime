@@ -6,12 +6,14 @@ import base64
 import json
 import lzma
 import os
+import re
 import shutil
 import subprocess
 import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -239,6 +241,131 @@ def remote_tag_exists(
         return False
     except Exception:
         return False
+
+
+def _parse_hub_datetime(value: str) -> datetime:
+    """Parse Hub ``last_updated`` (fractional seconds length varies)."""
+    text = value.replace("Z", "+00:00")
+    m = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?([+-]\d{2}:\d{2})", text)
+    if not m:
+        raise ValueError(f"unrecognized Hub datetime: {value!r}")
+    base, frac, off = m.group(1), m.group(2) or "", m.group(3)
+    if frac:
+        frac = (frac + "000000")[:7]  # '.' + 6 digits
+    return datetime.fromisoformat(base + frac + off)
+
+
+_hub_tag_mtime_lock = threading.Lock()
+_hub_tag_mtime_cache: dict[str, datetime | None] = {}
+_hub_jwt_lock = threading.Lock()
+_hub_jwt_cache: dict[str, str] = {}
+
+
+def _hub_jwt(username: str, password: str) -> str:
+    key = f"{username}:{password}"
+    with _hub_jwt_lock:
+        cached = _hub_jwt_cache.get(key)
+        if cached:
+            return cached
+    token = hub_login_token(username, password)
+    with _hub_jwt_lock:
+        _hub_jwt_cache[key] = token
+    return token
+
+
+def hub_tag_last_updated(
+    ref: str,
+    *,
+    username: str | None = None,
+    password: str | None = None,
+) -> datetime | None:
+    """Return Hub ``last_updated`` for ``ref``, or None if the tag is missing."""
+    try:
+        ns, repo, tag = parse_docker_hub_ref(ref)
+    except ValueError:
+        return None
+    cache_key = f"{ns}/{repo}:{tag}"
+    with _hub_tag_mtime_lock:
+        if cache_key in _hub_tag_mtime_cache:
+            return _hub_tag_mtime_cache[cache_key]
+
+    if not username or not password:
+        # Anonymous Hub tag GETs are flaky / rate-limited; fall back to exists-only.
+        exists = remote_tag_exists(ref, username=username, password=password)
+        with _hub_tag_mtime_lock:
+            _hub_tag_mtime_cache[cache_key] = datetime.now(timezone.utc) if exists else None
+            return _hub_tag_mtime_cache[cache_key]
+
+    try:
+        token = _hub_jwt(username, password)
+        url = (
+            f"https://hub.docker.com/v2/repositories/{ns}/{repo}/tags/"
+            f"{urllib.parse.quote(tag, safe='')}/"
+        )
+        req = urllib.request.Request(url, headers={"Authorization": f"JWT {token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                payload = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code != 401:
+                raise
+            with _hub_jwt_lock:
+                _hub_jwt_cache.pop(f"{username}:{password}", None)
+            token = _hub_jwt(username, password)
+            req = urllib.request.Request(url, headers={"Authorization": f"JWT {token}"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                payload = json.loads(resp.read().decode())
+        updated = _parse_hub_datetime(str(payload["last_updated"]))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            updated = None
+        else:
+            # On Hub API errors, treat as missing so bake rebuilds rather than skipping.
+            print(f"[bake] hub tag mtime failed for {ref}: HTTP {e.code}; will rebuild", flush=True)
+            updated = None
+    except Exception as e:
+        print(f"[bake] hub tag mtime failed for {ref}: {e}; will rebuild", flush=True)
+        updated = None
+
+    with _hub_tag_mtime_lock:
+        _hub_tag_mtime_cache[cache_key] = updated
+    return updated
+
+
+def should_skip_existing_remote_tag(
+    ref: str,
+    *,
+    username: str | None = None,
+    password: str | None = None,
+    max_age_hours: float | None = None,
+) -> bool:
+    """Whether ``--skip-existing`` should skip building ``ref``.
+
+    - ``max_age_hours is None``: skip whenever the tag exists (legacy behavior).
+    - otherwise: skip only if the Hub tag exists **and** ``last_updated`` is
+      within ``max_age_hours``; older tags are rebuilt.
+    """
+    if max_age_hours is None:
+        if remote_tag_exists(ref, username=username, password=password):
+            print(f"[bake] skip-existing {ref}", flush=True)
+            return True
+        return False
+
+    updated = hub_tag_last_updated(ref, username=username, password=password)
+    if updated is None:
+        return False
+    age = datetime.now(timezone.utc) - updated
+    if age > timedelta(hours=max_age_hours):
+        print(
+            f"[bake] rebuild-stale {ref} age={age.total_seconds()/3600:.1f}h > {max_age_hours:g}h",
+            flush=True,
+        )
+        return False
+    print(
+        f"[bake] skip-existing {ref} age={age.total_seconds()/3600:.1f}h <= {max_age_hours:g}h",
+        flush=True,
+    )
+    return True
 
 
 def hub_login_token(username: str, password: str) -> str:

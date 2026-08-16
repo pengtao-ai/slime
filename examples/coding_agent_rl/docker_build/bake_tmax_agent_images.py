@@ -33,9 +33,9 @@ from bake_common import (
     ensure_registry_auth_from_env,
     kaniko_build,
     parse_tag_prefix,
-    remote_tag_exists,
     render_dockerfile,
     resolve_kaniko_executor,
+    should_skip_existing_remote_tag,
     target_ref,
 )
 
@@ -155,6 +155,7 @@ def process_job(
     tag_prefix: str,
     push: bool,
     skip_existing: bool,
+    skip_existing_max_age_hours: float | None,
     generate_only: bool,
     kaniko_executor: str | None,
     hub_user: str | None,
@@ -173,8 +174,12 @@ def process_job(
         }
 
     skipped = False
-    if skip_existing and remote_tag_exists(ref, username=hub_user, password=hub_pass):
-        print(f"[bake] skip-existing {ref}", flush=True)
+    if skip_existing and should_skip_existing_remote_tag(
+        ref,
+        username=hub_user,
+        password=hub_pass,
+        max_age_hours=skip_existing_max_age_hours,
+    ):
         skipped = True
     else:
         executor = resolve_kaniko_executor(kaniko_executor)
@@ -238,6 +243,13 @@ def main() -> None:
         default=int(os.environ.get("BAKE_WORKERS", "1")),
     )
     p.add_argument("--skip-existing", action="store_true")
+    p.add_argument(
+        "--skip-existing-max-age-hours",
+        type=float,
+        default=None,
+        help="With --skip-existing: only skip Hub tags newer than this many hours; "
+        "older tags are rebuilt. Default: skip any existing tag.",
+    )
     p.add_argument("--no-push", action="store_true")
     p.add_argument(
         "--kaniko-executor",
@@ -301,6 +313,7 @@ def main() -> None:
                 tag_prefix=args.tag_prefix,
                 push=push,
                 skip_existing=args.skip_existing,
+                skip_existing_max_age_hours=args.skip_existing_max_age_hours,
                 generate_only=args.generate_only,
                 kaniko_executor=args.kaniko_executor or None,
                 hub_user=hub_user,

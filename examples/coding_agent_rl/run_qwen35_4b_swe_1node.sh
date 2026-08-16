@@ -91,9 +91,7 @@ ROLLOUT_ARGS=(
    --micro-batch-size 1
    --save-debug-rollout-data "${RUN_ROOT}/rollout_dumps/rollout_{rollout_id}.pt"
 )
-if [[ "${OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG:-}" =~ ^(1|true|yes|on)$ ]]; then
-  ROLLOUT_ARGS+=(--rollout-sample-filter-path examples.coding_agent_rl.offload.shape_group_help_seeking_rewards)
-fi
+ROLLOUT_ARGS+=(--rollout-sample-filter-path examples.coding_agent_rl.offload.compact_and_shape_group_help_seeking_rewards)
 
 PERF_ARGS=(
    --tensor-model-parallel-size ${TP_SIZE}
@@ -112,6 +110,7 @@ PERF_ARGS=(
 
 ALGO_ARGS=(
    --advantage-estimator grpo
+   --custom-advantage-function-path examples.coding_agent_rl.offload_turn_advantage.compute_turn_advantages
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
    --kl-coef 0.00
@@ -180,6 +179,7 @@ export ADAPTER_PORT="${ADAPTER_PORT:-18001}"
 export SWE_AGENT_TIME_BUDGET_SEC="${SWE_AGENT_TIME_BUDGET_SEC:-1800}"
 export SWE_EVAL_TIMEOUT_SEC="${SWE_EVAL_TIMEOUT_SEC:-600}"
 export SWE_BOOT_CONCURRENCY
+export ADAPTER_MAX_TURNS_PER_SID="${ADAPTER_MAX_TURNS_PER_SID:-128}"
 # Higher = fewer TOKEN_FORK segments (more REALIGN / rewrite-merge); default was 1024.
 export SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS="${SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS:-8192}"
 
@@ -227,6 +227,7 @@ keys = (
     "SLIME_AGENT_NODE_TARBALL", "SLIME_AGENT_CC_TARBALL",
     "SWE_AGENT_TIME_BUDGET_SEC", "SWE_EVAL_TIMEOUT_SEC", "SWE_BOOT_CONCURRENCY",
     "ADAPTER_BIND_HOST", "ADAPTER_PORT",
+    "ADAPTER_MAX_TURNS_PER_SID",
     "SLIME_AGENT_CC_EXTRA_ARGS",
     "SLIME_AGENT_CC_EXTRA_ENVS",
     "SWE_CC_PROMPT",
@@ -243,10 +244,12 @@ keys = (
     "DASHSCOPE_API_KEY", "OPENAI_API_KEY",
     "DASHSCOPE_BASE_URL", "DASHSCOPE_MODEL",
     "OFFLOAD_EFFICIENCY_LAMBDA", "OFFLOAD_MAX_TOKENS",
-    "OFFLOAD_THINK_FORMAT_PENALTY",
+    "OFFLOAD_THINK_FORMAT_PENALTY", "OFFLOAD_MALFORMED_PENALTY",
     "OFFLOAD_REWARD_MODE", "OFFLOAD_SEEK_ALPHA",
     "OFFLOAD_SEEK_EMPTY_SCALE", "OFFLOAD_UNIQUE_SOLVER_BONUS",
     "OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG",
+    "OFFLOAD_COMPACT_ORPHAN_OPEN_K", "OFFLOAD_COMPACT_OPEN_CLOSE_RATIO",
+    "OFFLOAD_COMPACT_SPECIAL_TOKEN_RATIO", "OFFLOAD_COMPACT_SPECIAL_TOKEN_RUN",
     "OFFLOAD_STOP_TOKEN_ID", "ROLLOUT_STOP_TOKEN_IDS",
     "SLIME_AGENT_OFFLOAD_SYSTEM_APPEND",
     "SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS",

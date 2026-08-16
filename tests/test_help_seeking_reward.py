@@ -126,5 +126,196 @@ def test_shape_group_fanout_segments(monkeypatch):
     assert other.reward == 0.0
 
 
+def test_tmax_empty_patch_does_not_scale_alpha():
+    st = _stats(oc=1)
+    r = offload.help_seeking_reward(
+        0.0, st, alpha=0.1, empty_patch=True, empty_scale=0.5, protocol="tmax"
+    )
+    assert r == pytest.approx(0.1)
+
+
+def test_scaleswe_empty_patch_scales_alpha():
+    st = _stats(oc=1)
+    r = offload.help_seeking_reward(
+        0.0, st, alpha=0.1, empty_patch=True, empty_scale=0.5, protocol="scaleswe"
+    )
+    assert r == pytest.approx(0.05)
+
+
+def _turn(*, valid=False, outside=False, orphan=0, mal=0, small_o=10, glm_o=0, opens=0, closes=0):
+    return {
+        "small_prompt_tokens": 100,
+        "small_output_tokens": small_o,
+        "glm_input_tokens": 50 if valid else 0,
+        "glm_output_tokens": glm_o if valid else 0,
+        "valid_offload": valid,
+        "outside_think": outside,
+        "orphan_open_count": orphan,
+        "malformed_count": mal,
+        "open_count": opens or (1 if valid else orphan),
+        "close_count": closes or (1 if valid else 0),
+        "max_open_run": orphan,
+        "special_mark_count": (opens or orphan) + (closes or (1 if valid else 0)),
+    }
+
+
+def test_compute_turn_rewards_solved_uses_completion_budget():
+    turns = [_turn(valid=True, small_o=100, glm_o=0), _turn(valid=False, small_o=100, glm_o=0)]
+    stats = {"turn_costs": turns, "offload_count": 1, "offload_outside_think_count": 0}
+    # completion_tokens=200, n=2 → budget 100 completion tokens/turn @ COST_GLM_OUTPUT
+    out = offload.compute_turn_rewards(
+        1.0,
+        stats,
+        completion_tokens=200,
+        metadata={"completion_tokens": 200},
+        lam=0.0,  # isolate cost term off
+    )
+    assert len(out["turn_rewards"]) == 2
+    assert out["reward"] == pytest.approx(1.0)
+
+
+def test_compute_turn_rewards_malformed_negative_unsolved(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    monkeypatch.setenv("OFFLOAD_MALFORMED_PENALTY", "0.25")
+    turns = [_turn(valid=True), _turn(orphan=3, opens=3)]
+    stats = {"turn_costs": turns, "offload_count": 1, "offload_outside_think_count": 0}
+    out = offload.compute_turn_rewards(
+        0.0, stats, alpha=0.1, encourage_seek=True, malformed_pen=0.25
+    )
+    assert out["turn_rewards"][0] == pytest.approx(0.1)
+    assert out["turn_rewards"][1] == pytest.approx(-0.25)
+
+
+def test_analyze_offload_tags_valid_and_orphan():
+    raw = "think <|llm_offload|>3<|/llm_offload|> ok <|llm_offload|>"
+    tags = offload.analyze_offload_tags(raw)
+    assert tags["valid_count"] == 1
+    assert tags["orphan_open_count"] >= 1
+    assert tags["open_count"] == 2
+    assert tags["close_count"] == 1
+
+
+def test_compact_removes_orphan_spam():
+    from slime.utils.types import Sample
+
+    turns = [_turn(orphan=10, opens=10, closes=0, small_o=20) for _ in range(2)]
+    stats = {
+        "turn_costs": turns,
+        "offload_count": 0,
+        "offload_outside_think_count": 0,
+        "small_output_tokens": 40,
+    }
+    s = Sample(
+        index=0,
+        prompt="p",
+        response="x",
+        response_length=40,
+        status=Sample.Status.COMPLETED,
+        metadata={"offload_stats": stats},
+    )
+    remove, reason = offload.compact_should_remove_sample(s)
+    assert remove
+    assert reason == "orphan_open"
+
+
+def test_compact_removes_timeout_and_max_steps():
+    from slime.utils.types import Sample
+
+    s1 = Sample(
+        index=0,
+        prompt="p",
+        response="",
+        response_length=0,
+        status=Sample.Status.ABORTED,
+        metadata={"abort_reason": "wall_clock_timeout", "timeout": True},
+    )
+    s2 = Sample(
+        index=1,
+        prompt="p",
+        response="",
+        response_length=0,
+        status=Sample.Status.COMPLETED,
+        metadata={"max_steps_reached": True, "offload_stats": {}},
+    )
+    assert offload.compact_should_remove_sample(s1)[0]
+    assert offload.compact_should_remove_sample(s2)[0]
+
+
+def test_compact_and_shape_group(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
+    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
+    from slime.utils.types import Sample
+
+    good = _sample(reward=0.0, solved=0.0, oc=1)
+    spam_stats = {
+        "turn_costs": [_turn(orphan=10, opens=10, closes=0)],
+        "offload_count": 0,
+        "offload_outside_think_count": 0,
+        "small_output_tokens": 20,
+    }
+    spam = Sample(
+        index=1,
+        prompt="p",
+        response="x",
+        response_length=20,
+        reward=0.0,
+        status=Sample.Status.COMPLETED,
+        metadata={
+            "solved": 0.0,
+            "grading_solved": False,
+            "empty_patch": False,
+            "offload_stats": spam_stats,
+        },
+    )
+    offload.compact_and_shape_group_help_seeking_rewards(None, [[good, spam]])
+    assert good.reward == pytest.approx(0.1)
+    assert spam.remove_sample is True
+
+
+def test_shape_group_tmax_empty_no_scale(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
+    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
+    monkeypatch.setenv("OFFLOAD_SEEK_EMPTY_SCALE", "0.5")
+    a = _sample(reward=0.0, solved=0.0, oc=1, empty_patch=True)
+    a.metadata["protocol"] = "tmax"
+    b = _sample(reward=0.0, solved=0.0, oc=0)
+    offload.shape_group_help_seeking_rewards(None, [[a, b]])
+    assert a.reward == pytest.approx(0.1)
+
+
+def test_turn_advantage_paints_residuals():
+    import torch
+
+    from examples.coding_agent_rl.offload_turn_advantage import compute_turn_advantages
+
+    kl = [torch.zeros(6)]
+    rollout_data = {
+        "kl": kl,
+        "rewards": [0.5],  # already group-demeaned A_s
+        "metadata": [
+            {
+                "turn_rewards": [1.0, 0.0],
+                "turn_token_spans": [[0, 3], [3, 6]],
+            }
+        ],
+    }
+    compute_turn_advantages(None, rollout_data)
+    adv = rollout_data["advantages"][0]
+    # mean_r = 0.5; residual +0.5 / -0.5
+    assert adv[0].item() == pytest.approx(1.0)
+    assert adv[3].item() == pytest.approx(0.0)
+
+
+def test_per_turn_baseline_uses_completion_over_n():
+    b = offload.per_turn_baseline_cost(n_turns=10, completion_tokens=4243, metadata={})
+    expected = (
+        offload._DEFAULT_BASELINE_PROMPT_TOKENS / 10 * offload.COST_GLM_INPUT
+        + 424.3 * offload.COST_GLM_OUTPUT
+    )
+    assert b == pytest.approx(expected)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

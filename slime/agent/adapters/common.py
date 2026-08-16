@@ -318,6 +318,11 @@ class BaseAdapter:
         prior = self._sid_turn_count.get(sid, 0)
         if prior >= cap:
             self.logger.warning("[%s] sid=%s exceeded max_turns_per_sid=%d; killing run", self.log_prefix, sid, cap)
+            session = self.store.get(sid)
+            if session is not None:
+                stats = session.offload_stats if isinstance(session.offload_stats, dict) else None
+                if stats is not None:
+                    stats["max_steps_reached"] = True
             return web.json_response(
                 {
                     "error": {
