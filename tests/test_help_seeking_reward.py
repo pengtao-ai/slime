@@ -183,7 +183,134 @@ def test_compute_turn_rewards_malformed_negative_unsolved(monkeypatch):
         0.0, stats, alpha=0.1, encourage_seek=True, malformed_pen=0.25
     )
     assert out["turn_rewards"][0] == pytest.approx(0.1)
+    # Flat −β (not scaled by orphan count).
     assert out["turn_rewards"][1] == pytest.approx(-0.25)
+
+
+def test_repair_incomplete_offload_second_open_as_close():
+    raw = f"{offload.OFFLOAD_OPEN}4{offload.OFFLOAD_OPEN}4{offload.OFFLOAD_OPEN}"
+    out = offload.repair_incomplete_offload(raw)
+    assert out is not None
+    assert out["n"] == 4
+    assert out["repaired_raw"].startswith(f"{offload.OFFLOAD_OPEN}4{offload.OFFLOAD_CLOSE}")
+    assert offload.parse_offload_directive(out["repaired_raw"]) == (4, "")
+
+
+def test_repair_incomplete_offload_no_digit_defaults_zero():
+    raw = f"{offload.OFFLOAD_OPEN}{offload.OFFLOAD_OPEN}x"
+    out = offload.repair_incomplete_offload(raw)
+    assert out is not None
+    assert out["n"] == 0
+    assert out["defaulted_digit"] is True
+    assert offload.parse_offload_directive(out["repaired_raw"])[0] == 0
+
+
+def test_repair_incomplete_offload_rejects_non_digit_payload():
+    junk = f"{offload.OFFLOAD_OPEN}abc{offload.OFFLOAD_OPEN}"
+    assert offload.repair_incomplete_offload(junk) is None
+    multi = f"{offload.OFFLOAD_OPEN}12{offload.OFFLOAD_OPEN}"
+    assert offload.repair_incomplete_offload(multi) is None
+    orphan_junk = f"{offload.OFFLOAD_OPEN}4x"
+    assert offload.repair_incomplete_offload(orphan_junk) is None
+
+
+def test_repair_incomplete_offload_orphan_to_eos():
+    raw = f"prefix {offload.OFFLOAD_OPEN}7"
+    out = offload.repair_incomplete_offload(raw)
+    assert out is not None
+    assert out["n"] == 7
+    assert out["repaired_raw"] == f"prefix {offload.OFFLOAD_OPEN}7{offload.OFFLOAD_CLOSE}"
+
+
+def test_repair_skips_already_valid():
+    raw = f"{offload.OFFLOAD_OPEN}3{offload.OFFLOAD_CLOSE} more"
+    assert offload.repair_incomplete_offload(raw) is None
+
+
+def test_compute_turn_rewards_solved_independent_is_one():
+    turns = [_turn(valid=False, small_o=50), _turn(valid=True, small_o=50, glm_o=20)]
+    stats = {"turn_costs": turns}
+    out = offload.compute_turn_rewards(
+        1.0, stats, completion_tokens=100, metadata={"completion_tokens": 100}, lam=0.5
+    )
+    assert out["turn_rewards"][0] == pytest.approx(1.0)
+    assert out["turn_rewards"][1] < 1.0
+
+
+def test_compute_turn_rewards_repaired_no_alpha_unsolved(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    repaired = _turn(valid=True)
+    repaired["repaired"] = True
+    clean = _turn(valid=True)
+    stats = {"turn_costs": [repaired, clean], "offload_count": 2}
+    out = offload.compute_turn_rewards(
+        0.0, stats, alpha=0.1, encourage_seek=True, malformed_pen=0.25
+    )
+    assert out["turn_rewards"][0] == pytest.approx(-0.25)
+    assert out["turn_rewards"][1] == pytest.approx(0.1)
+
+
+def test_compute_turn_rewards_repaired_solved_subtracts_beta():
+    repaired = _turn(valid=True, small_o=10, glm_o=0)
+    repaired["repaired"] = True
+    stats = {"turn_costs": [repaired]}
+    out = offload.compute_turn_rewards(
+        1.0,
+        stats,
+        completion_tokens=10,
+        metadata={"completion_tokens": 10},
+        lam=0.0,
+        malformed_pen=0.25,
+    )
+    assert out["turn_rewards"][0] == pytest.approx(0.75)
+
+
+def test_shape_group_skips_alpha_on_repaired(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
+    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
+    a = _sample(reward=0.0, solved=0.0, oc=1)
+    a.metadata["turn_costs"] = [{"valid_offload": True, "repaired": True, "outside_think": False,
+                                  "orphan_open_count": 0, "malformed_count": 0, "max_open_run": 0}]
+    a.metadata["turn_rewards"] = [0.0]
+    a.metadata["offload_stats"] = {"turn_costs": a.metadata["turn_costs"], "offload_count": 1}
+    b = _sample(reward=0.0, solved=0.0, oc=0)
+    offload.shape_group_help_seeking_rewards(None, [[a, b]])
+    assert a.reward == pytest.approx(-0.25)
+    assert b.reward == 0.0
+
+
+def test_truncate_offload_open_spam_consecutive():
+    spam = offload.OFFLOAD_OPEN * 5
+    cut, did = offload.truncate_offload_open_spam(spam, max_run=2, max_orphan=99)
+    assert did
+    assert cut == offload.OFFLOAD_OPEN
+    assert offload.analyze_offload_tags(cut)["orphan_open_count"] == 1
+
+
+def test_truncate_offload_open_spam_interleaved_orphans():
+    raw = (
+        f"{offload.OFFLOAD_OPEN}12{offload.OFFLOAD_OPEN}34"
+        f"{offload.OFFLOAD_OPEN}56"
+    )
+    cut, did = offload.truncate_offload_open_spam(raw, max_run=99, max_orphan=2)
+    assert did
+    assert cut.count(offload.OFFLOAD_OPEN) == 1
+    assert offload.OFFLOAD_OPEN + "12" == cut
+
+
+def test_truncate_offload_open_spam_ids():
+    oid, cid = 248077, 248078
+    ids = [1, oid, oid, oid, 2]
+    keep, did = offload.truncate_offload_open_spam_ids(
+        ids, open_id=oid, close_id=cid, max_run=2, max_orphan=99
+    )
+    assert did and keep == 2
+    ids2 = [oid, 99, oid, 99]  # two orphans
+    keep2, did2 = offload.truncate_offload_open_spam_ids(
+        ids2, open_id=oid, close_id=cid, max_run=99, max_orphan=2
+    )
+    assert did2 and keep2 == 2
 
 
 def test_analyze_offload_tags_valid_and_orphan():
@@ -193,6 +320,29 @@ def test_analyze_offload_tags_valid_and_orphan():
     assert tags["orphan_open_count"] >= 1
     assert tags["open_count"] == 2
     assert tags["close_count"] == 1
+
+
+def test_compact_removes_single_orphan():
+    from slime.utils.types import Sample
+
+    turns = [_turn(orphan=1, opens=1, closes=0, small_o=5)]
+    stats = {
+        "turn_costs": turns,
+        "offload_count": 0,
+        "offload_outside_think_count": 0,
+        "small_output_tokens": 5,
+    }
+    s = Sample(
+        index=0,
+        prompt="p",
+        response="x",
+        response_length=5,
+        status=Sample.Status.COMPLETED,
+        metadata={"offload_stats": stats},
+    )
+    remove, reason = offload.compact_should_remove_sample(s)
+    assert remove
+    assert reason == "orphan_open"
 
 
 def test_compact_removes_orphan_spam():

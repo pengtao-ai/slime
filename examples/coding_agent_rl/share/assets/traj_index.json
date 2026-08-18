@@ -1,0 +1,38 @@
+[
+  {
+    "file": "traj_scaleswe_ok_auth0_auth0-python_pr122.json",
+    "label": "ScaleSWE 成功（短）",
+    "protocol": "scaleswe",
+    "reward": 1.0,
+    "instance_id": "auth0_auth0-python_pr122",
+    "turns": 11,
+    "run": "infer_cc_glm_20260728_141118"
+  },
+  {
+    "file": "traj_scaleswe_fail_beetbox_beets_pr3661.json",
+    "label": "ScaleSWE 失败（空 patch）",
+    "protocol": "scaleswe",
+    "reward": 0.0,
+    "instance_id": "beetbox_beets_pr3661",
+    "turns": 10,
+    "run": "infer_cc_glm_20260728_141118"
+  },
+  {
+    "file": "traj_tmax_ok_task_000001_1a03ebc5.json",
+    "label": "Tmax 成功（短）",
+    "protocol": "tmax",
+    "reward": 1.0,
+    "instance_id": "task_000001_1a03ebc5",
+    "turns": 5,
+    "run": "infer_cc_tmax_20260807_162106"
+  },
+  {
+    "file": "traj_tmax_fail_task_000003_2a1af405.json",
+    "label": "Tmax 失败",
+    "protocol": "tmax",
+    "reward": 0.0,
+    "instance_id": "task_000003_2a1af405",
+    "turns": 17,
+    "run": "infer_cc_tmax_20260807_162106"
+  }
+]

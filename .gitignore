@@ -20,7 +20,7 @@ examples/coding_agent_rl/data/
 # C extensions
 *.so
 a_csv/
-
+examples/coding_agent_rl/docker_build/
 # Distribution / packaging
 .Python
 build/

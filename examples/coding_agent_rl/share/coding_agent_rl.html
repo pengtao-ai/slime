@@ -1,0 +1,1696 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Coding Agent RL · slime</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Outfit:wght@500;600;700&family=Source+Sans+3:wght@400;500;600;700&display=swap');
+
+:root {
+  --bg: #e8eef3;
+  --bg-deep: #dce5ec;
+  --ink: #122033;
+  --ink2: #2b3b4f;
+  --muted: #5b6b7c;
+  --line: #c5d0db;
+  --panel: #f7fafc;
+  --panel2: #eef3f7;
+  --sidebar: #122033;
+  --sidebar-text: #c9d5e2;
+  --sidebar-muted: #7f91a6;
+  --accent: #0b6e6a;
+  --accent-ink: #085652;
+  --teal: #0b6e6a;
+  --teal-soft: #d5ebe9;
+  --good: #1a6b4a;
+  --good-bg: #dff0e7;
+  --bad: #a33b3b;
+  --bad-bg: #f3e4e4;
+  --warn: #8a5a12;
+  --display: "Outfit", "Source Sans 3", "Noto Sans SC", "PingFang SC", sans-serif;
+  --sans: "Source Sans 3", "Noto Sans SC", "PingFang SC", "Hiragino Sans GB", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace;
+  --radius: 2px;
+  --side-w: 15.5rem;
+  --max: none;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; background: var(--bg); color: var(--ink); font-family: var(--sans); }
+body {
+  overflow: hidden;
+  background-color: var(--bg);
+  background-image:
+    linear-gradient(135deg, #f4f8fb 0%, transparent 42%),
+    linear-gradient(180deg, rgba(11,110,106,0.05), transparent 34%),
+    radial-gradient(circle at 1px 1px, rgba(18,40,55,0.07) 1px, transparent 0);
+  background-size: auto, auto, 20px 20px;
+}
+.app {
+  display: grid;
+  grid-template-columns: var(--side-w) 1fr;
+  height: 100%;
+  min-height: 100vh;
+}
+.sidebar {
+  background: var(--sidebar);
+  color: var(--sidebar-text);
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid #1c2d42;
+  z-index: 5;
+  min-height: 0;
+}
+.side-brand {
+  padding: 1.25rem 1.15rem 1rem;
+  border-bottom: 1px solid #24364d;
+}
+.side-brand .mark {
+  font-family: var(--display);
+  font-weight: 700;
+  font-size: 1.15rem;
+  color: #fff;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+}
+.side-brand .sub {
+  margin-top: 0.35rem;
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--sidebar-muted);
+}
+.side-nav {
+  flex: 1;
+  overflow: auto;
+  padding: 0.65rem 0.55rem 1rem;
+}
+.side-nav a {
+  display: grid;
+  grid-template-columns: 1.7rem 1fr;
+  gap: 0.45rem;
+  align-items: start;
+  padding: 0.42rem 0.55rem;
+  margin: 0.08rem 0;
+  border-radius: var(--radius);
+  color: var(--sidebar-text);
+  text-decoration: none;
+  font-size: 0.88rem;
+  line-height: 1.35;
+  border-left: 2px solid transparent;
+}
+.side-nav a:hover { background: rgba(255,255,255,0.05); color: #fff; }
+.side-nav a.active {
+  background: rgba(11,110,106,0.22);
+  border-left-color: #2ec4b6;
+  color: #fff;
+}
+.side-nav a .n {
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  color: var(--sidebar-muted);
+  padding-top: 0.18rem;
+}
+.side-nav a.active .n { color: #7fdad2; }
+.side-foot {
+  padding: 0.85rem 1rem 1.1rem;
+  border-top: 1px solid #24364d;
+  font-family: var(--mono);
+  font-size: 0.68rem;
+  color: var(--sidebar-muted);
+  line-height: 1.5;
+}
+.main {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.deck {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+.slide {
+  display: none;
+  position: absolute;
+  inset: 0;
+  padding: 1.6rem 2rem 4.2rem;
+  overflow: auto;
+  animation: in 220ms ease;
+}
+.slide.active { display: block; }
+@keyframes in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+.slide > * { max-width: none; }
+.slide > .diagram,
+.slide > .swim,
+.slide > .grid2,
+.slide > .grid3,
+.slide > .cols-12,
+.slide > .cols-21,
+.slide > table,
+.slide > .paint-demo,
+.slide > .formula,
+.slide > .eq-block,
+.slide > .note-box,
+.slide > .warn-box,
+.slide > .timeline,
+.slide > .traj-controls,
+.slide > .traj-meta { width: 100%; }
+.slide h1, .slide h2 {
+  font-family: var(--display);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 1.12;
+  color: var(--ink);
+  margin: 0 0 0.85rem;
+}
+.slide h1 { font-size: clamp(2.4rem, 4.2vw, 3.8rem); }
+.slide h2 { font-size: clamp(1.75rem, 2.6vw, 2.45rem); }
+.slide h3 {
+  font-family: var(--sans);
+  font-size: 0.92rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--accent-ink);
+  margin: 0 0 0.55rem;
+}
+.slide p, .slide li { line-height: 1.58; color: var(--ink2); font-size: 1.05rem; }
+.slide .lede {
+  font-size: 1.15rem;
+  color: var(--muted);
+  max-width: none;
+  line-height: 1.55;
+}
+.eyebrow {
+  display: inline-block;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--teal);
+  border-bottom: 2px solid var(--teal);
+  padding-bottom: 0.2rem;
+  margin-bottom: 1rem;
+}
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.15rem; }
+.grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0.9rem; }
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--radius);
+  padding: 1rem 1.1rem;
+}
+.card h3 { margin-top: 0; }
+.muted { color: var(--muted); }
+.mono { font-family: var(--mono); font-size: 0.9em; }
+.tag {
+  display: inline-block;
+  padding: 0.12rem 0.4rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel2);
+  color: var(--ink2);
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  margin-right: 0.3rem;
+}
+.tag.good { color: var(--good); background: var(--good-bg); border-color: #b9d4c4; }
+.tag.bad { color: var(--bad); background: var(--bad-bg); border-color: #e0c0bc; }
+.tag.warn { color: var(--warn); background: #f3ead7; border-color: #e0d2ad; }
+ul.tight { margin: 0.35rem 0 0; padding-left: 1.15rem; }
+ul.tight li { margin: 0.35rem 0; }
+table.cmp {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.95rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+}
+table.cmp th, table.cmp td {
+  border-bottom: 1px solid var(--line);
+  border-right: 1px solid var(--line);
+  padding: 0.65rem 0.75rem;
+  text-align: left;
+  vertical-align: top;
+}
+table.cmp th {
+  background: var(--bg-deep);
+  color: var(--ink);
+  font-weight: 700;
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+table.cmp td:last-child, table.cmp th:last-child { border-right: 0; }
+table.cmp tr:last-child td { border-bottom: 0; }
+table.cmp .hl td { background: var(--teal-soft); }
+.formula {
+  font-family: var(--mono);
+  font-size: 0.86rem;
+  background: #122033;
+  color: #e8eef3;
+  border-radius: var(--radius);
+  padding: 0.95rem 1.05rem;
+  margin: 0.85rem 0;
+  overflow-x: auto;
+  line-height: 1.5;
+}
+.flow {
+  display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center;
+  margin: 1rem 0;
+}
+.flow .box {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 0.5rem 0.75rem;
+  font-size: 0.9rem;
+}
+.flow .arrow { color: var(--accent); font-weight: 700; }
+.bars { display: grid; gap: 0.65rem; margin-top: 0.65rem; }
+.bar-row {
+  display: grid;
+  grid-template-columns: 7.2rem 1fr auto;
+  gap: 0.65rem;
+  align-items: center;
+  font-size: 0.92rem;
+}
+.bar-track {
+  height: 0.42rem;
+  background: var(--bg-deep);
+  border: 1px solid var(--line);
+  overflow: hidden;
+}
+.bar-fill { height: 100%; background: var(--teal); }
+.traj-controls { display: flex; flex-wrap: wrap; gap: 0.35rem; margin: 0.65rem 0 0.8rem; }
+.traj-controls button {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  color: var(--ink2);
+  border-radius: var(--radius);
+  padding: 0.4rem 0.7rem;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.88rem;
+}
+.traj-controls button.active {
+  background: var(--ink);
+  color: var(--panel);
+  border-color: var(--ink);
+}
+.traj-meta {
+  display: flex; flex-wrap: wrap; gap: 0.35rem;
+  margin-bottom: 0.7rem;
+  font-size: 0.88rem;
+  color: var(--muted);
+}
+.timeline {
+  max-height: calc(100vh - 22rem);
+  width: 100%;
+  overflow: auto;
+  border: 1px solid var(--line);
+  background: var(--panel);
+}
+#trajNote h3 { margin-top: 0; }
+#trajNote .note-takeaway {
+  margin-top: 0.7rem;
+  padding-top: 0.65rem;
+  border-top: 1px solid var(--line);
+  font-size: 0.95rem;
+  color: var(--ink2);
+}
+#trajNote .note-takeaway .callout-title { margin-bottom: 0.2rem; }
+.turn {
+  display: grid;
+  grid-template-columns: 3rem 1fr;
+  gap: 0.7rem;
+  padding: 0.7rem 0.9rem;
+  border-bottom: 1px solid var(--line);
+}
+.turn:last-child { border-bottom: 0; }
+.turn:nth-child(odd) { background: var(--panel2); }
+.turn-idx {
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  padding-top: 0.15rem;
+}
+.tool-chip {
+  display: inline-block;
+  margin: 0.1rem 0.25rem 0.1rem 0;
+  padding: 0.16rem 0.4rem;
+  background: var(--teal-soft);
+  border: 1px solid #b7d6d3;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--teal);
+}
+.paint-demo { display: grid; gap: 0.8rem; margin-top: 0.9rem; max-width: none; width: 100%; }
+.paint-row {
+  display: grid;
+  grid-template-columns: 7.2rem 1fr;
+  gap: 0.7rem;
+  align-items: center;
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+.seg {
+  display: grid;
+  grid-template-columns: 1.2fr 1fr 1.4fr;
+  gap: 4px;
+  height: 1.9rem;
+}
+.seg span {
+  display: flex; align-items: center; justify-content: center;
+  font-size: 0.7rem; font-family: var(--mono); color: #fff;
+}
+.seg .a { background: #0b6e6a; }
+.seg .b { background: #2f8f8a; }
+.seg .c { background: #1e4d7b; }
+.seg.flat span { background: #5b6b7c; }
+.seg.gae span:nth-child(1) { background: #1a6b4a; }
+.seg.gae span:nth-child(2) { background: #0b6e6a; }
+.seg.gae span:nth-child(3) { background: #1e4d7b; }
+.two-col-list {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.3rem 1.8rem;
+  padding-left: 1.1rem;
+}
+.footnote { margin-top: 1.2rem; font-size: 0.86rem; color: var(--muted); }
+.kbd {
+  font-family: var(--mono);
+  font-size: 0.78em;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  padding: 0.08rem 0.35rem;
+}
+.title-slide.active {
+  display: flex !important;
+  align-items: stretch;
+}
+.title-frame {
+  max-width: none !important;
+  width: 100%;
+  margin: auto 0;
+  padding: 0.5rem 0 1.5rem;
+  border-top: 4px solid var(--accent);
+}
+.title-slide .brand {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 1.2rem;
+}
+.title-slide .brand .sep { margin: 0 0.35rem; color: var(--line); }
+.title-slide h1 {
+  font-size: clamp(2.8rem, 6vw, 4.6rem);
+  margin-bottom: 0.9rem;
+}
+.title-slide .lede { font-size: 1.2rem; max-width: min(48rem, 100%); }
+.spine {
+  list-style: none;
+  padding: 0;
+  margin: 1.6rem 0 1.2rem;
+  display: grid;
+  gap: 0.35rem;
+  max-width: min(36rem, 100%);
+  counter-reset: spine;
+}
+.spine li {
+  display: grid;
+  grid-template-columns: 1.6rem 1fr;
+  gap: 0.65rem;
+  align-items: baseline;
+  font-size: 1rem;
+  color: var(--ink);
+  border-bottom: 1px solid var(--line);
+  padding: 0.4rem 0;
+}
+.spine li::before {
+  counter-increment: spine;
+  content: counter(spine, decimal-leading-zero);
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--accent);
+}
+.hint {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  color: var(--muted);
+  margin: 0;
+}
+.content-nav {
+  position: absolute;
+  left: 0; right: 0; bottom: 0;
+  height: 3.1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0 1.25rem;
+  background: rgba(247,250,252,0.94);
+  border-top: 1px solid var(--line);
+  backdrop-filter: blur(8px);
+  z-index: 4;
+}
+.content-nav button {
+  background: var(--ink);
+  color: #f7fafc;
+  border: none;
+  border-radius: var(--radius);
+  padding: 0.4rem 0.85rem;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.88rem;
+  font-weight: 600;
+}
+.content-nav button:hover { background: var(--accent); }
+.content-nav .progress {
+  flex: 1;
+  height: 0.22rem;
+  background: var(--bg-deep);
+  border: 1px solid var(--line);
+  overflow: hidden;
+}
+.content-nav .progress > i {
+  display: block; height: 100%; width: 0; background: var(--accent);
+}
+#pageLabel {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  min-width: 4.5rem;
+  text-align: right;
+}
+@media (max-width: 960px) {
+  .app { grid-template-columns: 1fr; }
+  .sidebar {
+    position: fixed;
+    inset: 0 auto 0 0;
+    width: min(18rem, 86vw);
+    transform: translateX(-105%);
+    transition: transform 200ms ease;
+  }
+  .sidebar.open { transform: none; }
+  .slide { padding: 1.5rem 1.1rem 4.5rem; }
+  .grid2, .grid3, .two-col-list { grid-template-columns: 1fr; }
+  .menu-btn { display: inline-flex !important; }
+}
+.menu-btn {
+  display: none;
+  position: fixed;
+  top: 0.7rem; left: 0.7rem;
+  z-index: 8;
+  background: var(--ink);
+  color: #fff;
+  border: none;
+  padding: 0.4rem 0.65rem;
+  font: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+.backdrop {
+  display: none;
+  position: fixed; inset: 0;
+  background: rgba(18,32,51,0.45);
+  z-index: 4;
+}
+.backdrop.show { display: block; }
+
+.diagram {
+  width: 100%;
+  max-width: none;
+  margin: 0.9rem 0 1.1rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  overflow: auto;
+}
+.diagram svg { display: block; width: 100%; height: auto; min-height: 12rem; }
+.diagram .lbl { font-family: var(--sans); fill: var(--ink); font-size: 13px; }
+.diagram .lbl-sm { font-family: var(--mono); fill: var(--muted); font-size: 11px; }
+.diagram .title { font-family: var(--display); font-weight: 700; fill: var(--ink); font-size: 14px; }
+.note-box {
+  background: var(--teal-soft);
+  border: 1px solid #b7d6d3;
+  border-left: 3px solid var(--teal);
+  padding: 0.75rem 0.95rem;
+  margin: 0.8rem 0;
+  font-size: 0.95rem;
+  color: var(--ink2);
+}
+.warn-box {
+  background: #f3ead7;
+  border: 1px solid #e0d2ad;
+  border-left: 3px solid var(--warn);
+  padding: 0.75rem 0.95rem;
+  margin: 0.8rem 0;
+  font-size: 0.95rem;
+}
+.cols-12 { display: grid; grid-template-columns: 1.15fr 0.85fr; gap: 1.1rem; align-items: start; }
+.cols-21 { display: grid; grid-template-columns: 0.9fr 1.1fr; gap: 1.1rem; align-items: start; }
+.dense li { margin: 0.28rem 0; font-size: 0.98rem; }
+.dense { padding-left: 1.1rem; margin: 0.4rem 0; }
+.mini-table { font-size: 0.88rem; }
+.mini-table th, .mini-table td { padding: 0.45rem 0.55rem; }
+.table-scroll {
+  width: 100%;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  margin: 0.55rem 0 1rem;
+}
+.table-scroll table.cmp { border: 0; margin: 0; font-size: 0.78rem; }
+.table-scroll table.cmp th,
+.table-scroll table.cmp td {
+  padding: 0.4rem 0.5rem;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.table-scroll table.cmp th:first-child,
+.table-scroll table.cmp td:first-child {
+  position: sticky;
+  left: 0;
+  background: var(--bg-deep);
+  z-index: 1;
+  max-width: 16rem;
+  white-space: normal;
+  word-break: break-all;
+}
+.table-scroll table.cmp td:first-child { background: var(--panel); font-family: var(--mono); font-size: 0.72rem; }
+.table-scroll table.cmp .hl td:first-child { background: var(--teal-soft); }
+.result-h3 {
+  margin: 0.2rem 0 0.35rem !important;
+  text-transform: none !important;
+  letter-spacing: 0 !important;
+  font-size: 1rem !important;
+  color: var(--ink) !important;
+}
+.step-list { list-style: none; padding: 0; margin: 0.5rem 0; }
+.step-list li {
+  display: grid;
+  grid-template-columns: 2rem 1fr;
+  gap: 0.65rem;
+  margin: 0.45rem 0;
+  align-items: start;
+}
+.step-list .sn {
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--accent);
+  padding-top: 0.15rem;
+}
+.eq-block {
+  font-family: var(--mono);
+  font-size: 0.9rem;
+  background: #122033;
+  color: #e8eef3;
+  padding: 0.9rem 1rem;
+  margin: 0.7rem 0;
+  line-height: 1.55;
+}
+.callout-title {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent-ink);
+  margin-bottom: 0.25rem;
+}
+.split-proto {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  margin: 0.8rem 0;
+}
+.split-proto > div { padding: 1rem; }
+.split-proto > div + div { border-left: 1px solid var(--line); }
+.split-proto h3 { margin: 0 0 0.6rem; }
+@media (max-width: 960px) {
+  .cols-12, .cols-21, .split-proto { grid-template-columns: 1fr; }
+  .split-proto > div + div { border-left: 0; border-top: 1px solid var(--line); }
+}
+
+.swim { width:100%; max-width:none; border:1px solid var(--line); background:var(--panel); margin:0.8rem 0; }
+.swim-row { display:grid; grid-template-columns:7rem 1fr; border-bottom:1px solid var(--line); }
+.swim-row:last-child { border-bottom:0; }
+.swim-lab {
+  background:var(--bg-deep); padding:0.7rem 0.65rem; font-family:var(--mono);
+  font-size:0.72rem; color:var(--muted); letter-spacing:0.04em; text-transform:uppercase;
+  border-right:1px solid var(--line);
+}
+.swim-body { padding:0.65rem 0.8rem; font-size:0.92rem; color:var(--ink2); }
+.swim-body .pipe { display:flex; flex-wrap:wrap; gap:0.3rem; align-items:center; margin-top:0.35rem; }
+.swim-body .n {
+  background:var(--panel2); border:1px solid var(--line); padding:0.28rem 0.5rem;
+  font-size:0.82rem; font-family:var(--mono);
+}
+.swim-body .n.hi { background:var(--teal-soft); border-color:#0b6e6a; color:var(--accent-ink); }
+.swim-body .arr { color:var(--accent); font-weight:700; }
+.kv { display:grid; grid-template-columns:9.5rem 1fr; gap:0.35rem 0.75rem; font-size:0.92rem; margin:0.5rem 0; }
+.kv dt { font-family:var(--mono); font-size:0.78rem; color:var(--muted); }
+.kv dd { margin:0; color:var(--ink2); }
+.slide .lede.wide { max-width:none; }
+.pill-row { display:flex; flex-wrap:wrap; gap:0.35rem; margin:0.6rem 0; }
+.pill {
+  font-family:var(--mono); font-size:0.72rem; padding:0.22rem 0.5rem;
+  background:var(--panel); border:1px solid var(--line); color:var(--ink2);
+}
+</style>
+</head>
+<body>
+<button type="button" class="menu-btn" id="menuBtn">目录</button>
+<div class="backdrop" id="backdrop"></div>
+<div class="app">
+  <aside class="sidebar" id="sidebar">
+    <div class="side-brand">
+      <div class="mark">Coding Agent RL</div>
+      <div class="sub">slime / coding_agent_rl</div>
+    </div>
+    <nav class="side-nav" id="sideNav" aria-label="章节导航"></nav>
+    <div class="side-foot">← → 翻页<br>点击条目跳转</div>
+  </aside>
+  <div class="main">
+    <div class="deck" id="deck">
+
+<section class="slide title-slide active" data-title="封面">
+  <div class="title-frame">
+    <div class="brand">slime<span class="sep">/</span>coding_agent_rl</div>
+    <h1>Coding<br>Agent RL</h1>
+    <p class="lede">面向算法工程师：Dataset · 多 Harness · Trajectory Reward Credit（Turn-paint / GiGPO-SWE / ARPO）· Train / Infer —— 对照代码路径讲清「稀疏结局如何落到 token」。</p>
+    <ol class="spine">
+      <li>ScaleSWE / Tmax 与真实轨迹</li>
+      <li>Agent 运行时与 Offload</li>
+      <li>Reward Credit 四层 + 对照</li>
+      <li>Async 训练 / 推理与取舍</li>
+    </ol>
+    <p class="hint">左侧目录跳转 · ← → 翻页</p>
+  </div>
+</section>
+
+<section class="slide" data-title="动机">
+  <div class="eyebrow">Why</div>
+  <h2>Coding-Agent RL 难在哪：从「可验证答案」到「可验证轨迹」</h2>
+  <p class="lede wide">单轮 Math/Code RLVR 的信用分配近似等于整段 response；SWE agent 把同一问题拆成数十 turn 的工具环，结局稀疏、中间不可直接评分。</p>
+  <div class="grid2">
+    <div class="card">
+      <h3>单轮 RLVR</h3>
+      <ul class="dense">
+        <li>一次采样 → 一次可验证奖励（对/错）</li>
+        <li>credit ≈ 整段 response 广播</li>
+        <li>无长期工具环；状态短</li>
+        <li>GRPO / RLOO 广播通常够用</li>
+        <li>失败样本仍有「答错」的清晰信号</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>SWE Coding-Agent</h3>
+      <ul class="dense">
+        <li>数十 turn：Read / Edit / Bash / Grep / Agent…</li>
+        <li>稀疏终局：patch 测过才 0/1（大量失败轨迹）</li>
+        <li>黑盒 harness + 白盒 token（Adapter 捕获）</li>
+        <li>subagent / compaction → fan-out 多 Sample</li>
+        <li>可选 mid-turn offload（SLM↔GLM）改变成本结构</li>
+      </ul>
+    </div>
+  </div>
+  <div class="diagram"><svg viewBox="0 0 860 250" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="m0" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#0b6e6a"/></marker></defs>
+  <text class="title" x="20" y="24">若不做细粒度 credit，训练会撞到什么墙？</text>
+  <rect x="20" y="50" width="190" height="80" fill="#f3e4e4" stroke="#a33b3b"/>
+  <text class="lbl" x="35" y="75">失败组方差塌缩</text>
+  <text class="lbl-sm" x="35" y="95">全 0 → GRPO A_s≈0</text>
+  <text class="lbl-sm" x="35" y="112">无学习梯度</text>
+  <rect x="230" y="50" width="190" height="80" fill="#f3ead7" stroke="#8a5a12"/>
+  <text class="lbl" x="245" y="75">成功轨迹内噪声</text>
+  <text class="lbl-sm" x="245" y="95">乱探索 turn 与有效 Edit</text>
+  <text class="lbl-sm" x="245" y="112">共享同一 A_s</text>
+  <rect x="440" y="50" width="190" height="80" fill="#eef3f7" stroke="#c5d0db"/>
+  <text class="lbl" x="455" y="75">不可证 token</text>
+  <text class="lbl-sm" x="455" y="95">模板 / tool obs / GLM</text>
+  <text class="lbl-sm" x="455" y="112">若当模型产出会污染</text>
+  <rect x="650" y="50" width="190" height="80" fill="#eef3f7" stroke="#c5d0db"/>
+  <text class="lbl" x="665" y="75">Fan-out 放大</text>
+  <text class="lbl-sm" x="665" y="95">K 条 Sample 同 reward</text>
+  <text class="lbl-sm" x="665" y="112">不当归一 → 梯度×K</text>
+  <path d="M115,130 V160 H430 V180" stroke="#0b6e6a" fill="none" marker-end="url(#m0)"/>
+  <path d="M325,130 V150 H430" stroke="#0b6e6a" fill="none"/>
+  <path d="M535,130 V150 H430" stroke="#0b6e6a" fill="none"/>
+  <path d="M745,130 V150 H430" stroke="#0b6e6a" fill="none"/>
+  <rect x="300" y="180" width="260" height="50" fill="#d5ebe9" stroke="#0b6e6a"/>
+  <text class="lbl" x="330" y="210">→ Trajectory Reward Credit 专章</text>
+  </svg></div>
+  <div class="note-box"><div class="callout-title">本讲主线</div>稀疏结局 <strong>R(τ)</strong> → shaping 得到 turn 级 r_i → GRPO A_s → turn paint → fan-out 归一 → loss_mask。再对照 GiGPO-SWE（diff 聚类）与 ARPO（熵分支）。</div>
+</section>
+
+<section class="slide" data-title="总览架构">
+  <div class="eyebrow">Architecture</div>
+  <h2>系统总览：从 JSONL 到权重更新</h2>
+  <p class="lede wide">真实 coding agent 在沙箱修 bug → Adapter 捕获每轮 token/logprob → 协议验题 shaping → GRPO（+ turn paint）更新 SLM；可选 mid-turn offload。</p>
+  <div class="diagram"><svg viewBox="0 0 860 460" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#0b6e6a"/></marker></defs>
+  <text class="title" x="20" y="22">Layer A · slime 训练外环</text>
+  <rect x="20" y="40" width="115" height="48" fill="#eef3f7" stroke="#c5d0db"/><text class="lbl" x="32" y="60">JSONL</text><text class="lbl-sm" x="32" y="76">prompt+meta</text>
+  <rect x="155" y="40" width="125" height="48" fill="#eef3f7" stroke="#c5d0db"/><text class="lbl" x="168" y="60">DataSource</text><text class="lbl-sm" x="168" y="76">×n_samples</text>
+  <rect x="300" y="40" width="145" height="48" fill="#d5ebe9" stroke="#0b6e6a"/><text class="lbl" x="315" y="60">generate()</text><text class="lbl-sm" x="315" y="76">coding_agent_rl</text>
+  <rect x="465" y="40" width="125" height="48" fill="#eef3f7" stroke="#c5d0db"/><text class="lbl" x="478" y="60">filter/shape</text><text class="lbl-sm" x="478" y="76">group compact</text>
+  <rect x="610" y="40" width="115" height="48" fill="#d5ebe9" stroke="#0b6e6a"/><text class="lbl" x="622" y="60">GRPO+paint</text><text class="lbl-sm" x="622" y="76">advantages</text>
+  <rect x="745" y="40" width="95" height="48" fill="#122033"/><text class="lbl" x="758" y="60" style="fill:#fff">PG loss</text><text class="lbl-sm" x="758" y="76" style="fill:#9bb0c4">clip</text>
+  <line x1="135" y1="64" x2="153" y2="64" stroke="#0b6e6a" marker-end="url(#a)"/>
+  <line x1="280" y1="64" x2="298" y2="64" stroke="#0b6e6a" marker-end="url(#a)"/>
+  <line x1="445" y1="64" x2="463" y2="64" stroke="#0b6e6a" marker-end="url(#a)"/>
+  <line x1="590" y1="64" x2="608" y2="64" stroke="#0b6e6a" marker-end="url(#a)"/>
+  <line x1="725" y1="64" x2="743" y2="64" stroke="#0b6e6a" marker-end="url(#a)"/>
+  <text class="title" x="20" y="120">Layer B · generate() 内部时序（一次 sample）</text>
+  <rect x="20" y="140" width="95" height="44" fill="#f7fafc" stroke="#c5d0db"/><text class="lbl" x="32" y="166">boot sb</text>
+  <rect x="130" y="140" width="100" height="44" fill="#f7fafc" stroke="#c5d0db"/><text class="lbl" x="140" y="158">prepare</text><text class="lbl-sm" x="140" y="174">workspace</text>
+  <rect x="250" y="140" width="110" height="44" fill="#d5ebe9" stroke="#0b6e6a"/><text class="lbl" x="265" y="158">harness.run</text><text class="lbl-sm" x="265" y="174">agent loop</text>
+  <rect x="380" y="140" width="70" height="44" fill="#f7fafc" stroke="#c5d0db"/><text class="lbl" x="392" y="166">diff?</text>
+  <rect x="470" y="140" width="100" height="44" fill="#f7fafc" stroke="#c5d0db"/><text class="lbl" x="485" y="158">grade</text><text class="lbl-sm" x="485" y="174">scaleswe/tmax</text>
+  <rect x="590" y="140" width="115" height="44" fill="#f7fafc" stroke="#c5d0db"/><text class="lbl" x="600" y="158">finish_sess</text><text class="lbl-sm" x="600" y="174">list[Sample]</text>
+  <rect x="725" y="140" width="115" height="44" fill="#0b6e6a"/><text class="lbl" x="735" y="158" style="fill:#fff">attach meta</text><text class="lbl-sm" x="735" y="174" style="fill:#d5ebe9">r_i / spans</text>
+  <line x1="115" y1="162" x2="128" y2="162" stroke="#0b6e6a" marker-end="url(#a)"/>
+  <line x1="230" y1="162" x2="248" y2="162" stroke="#0b6e6a" marker-end="url(#a)"/>
+  <line x1="360" y1="162" x2="378" y2="162" stroke="#0b6e6a" marker-end="url(#a)"/>
+  <line x1="450" y1="162" x2="468" y2="162" stroke="#0b6e6a" marker-end="url(#a)"/>
+  <line x1="570" y1="162" x2="588" y2="162" stroke="#0b6e6a" marker-end="url(#a)"/>
+  <line x1="705" y1="162" x2="723" y2="162" stroke="#0b6e6a" marker-end="url(#a)"/>
+  <text class="title" x="20" y="220">Layer C · 每 turn 闭环（harness ↔ Adapter ↔ SGLang）</text>
+  <rect x="30" y="245" width="140" height="78" fill="#122033"/><text class="lbl" x="48" y="275" style="fill:#e8eef3">Coding Agent</text><text class="lbl-sm" x="48" y="293" style="fill:#9bb0c4">cc/pi/opencode…</text><text class="lbl-sm" x="48" y="308" style="fill:#9bb0c4">工具环 · HTTP</text>
+  <rect x="210" y="245" width="175" height="78" fill="#0b6e6a"/><text class="lbl" x="225" y="270" style="fill:#fff">Adapter._run_turn</text><text class="lbl-sm" x="225" y="288" style="fill:#d5ebe9">template · offload?</text><text class="lbl-sm" x="225" y="303" style="fill:#d5ebe9">record_turn · git_diff</text>
+  <rect x="425" y="245" width="155" height="78" fill="#1e4d7b"/><text class="lbl" x="440" y="275" style="fill:#fff">SGLang /generate</text><text class="lbl-sm" x="440" y="293" style="fill:#c9d9ea">output_ids</text><text class="lbl-sm" x="440" y="308" style="fill:#c9d9ea">return_logprob</text>
+  <rect x="620" y="245" width="200" height="78" fill="#f7fafc" stroke="#c5d0db"/><text class="lbl" x="635" y="270">TrajectoryManager</text><text class="lbl-sm" x="635" y="288">tree · fork · leaf</text><text class="lbl-sm" x="635" y="303">→ Samples + rollout_id</text>
+  <path d="M170,284 H208" stroke="#0b6e6a" marker-end="url(#a)"/>
+  <path d="M385,284 H423" stroke="#0b6e6a" marker-end="url(#a)"/>
+  <path d="M503,323 C503,355 300,355 300,323" stroke="#0b6e6a" fill="none" marker-end="url(#a)"/>
+  <path d="M385,284 C520,220 700,220 720,245" stroke="#5b6b7c" fill="none" stroke-dasharray="4 3" marker-end="url(#a)"/>
+  <text class="lbl-sm" x="250" y="370">tool obs / next user（回 agent）</text>
+  <text class="lbl-sm" x="560" y="220">token segments（虚线）</text>
+  <text class="lbl-sm" x="20" y="410">关键入口：examples/coding_agent_rl/generate.py · slime/agent/adapters · trajectory.py · offload_turn_advantage.py</text>
+  <text class="lbl-sm" x="20" y="430">训练环：train.py（sync）/ train_async.py（rollout∥train）· Ray rollout_mask_sums 防 fan-out 放大</text>
+  </svg></div>
+</section>
+
+<section class="slide" data-title="Dataset Schema">
+  <div class="eyebrow">Dataset</div>
+  <h2>JSONL Schema：字段语义与加载路径</h2>
+  <div class="cols-12">
+    <div>
+      <pre class="formula">{
+  "prompt": [{"role":"user","content":"..."}],
+  "label": "&lt;instance_id&gt;",
+  "metadata": {
+    "protocol": "scaleswe|tmax",
+    "agent": "claude_code|pi|opencode|miniswe",
+    "image": "...", "workdir": "...",
+    "problem_statement": "...",
+    // scaleswe: swepro | eval_cmd | f2p…
+    // tmax: test_sh（延期写入）
+  }
+}</pre>
+      <div class="swim">
+        <div class="swim-row"><div class="swim-lab">Load</div><div class="swim-body">--prompt-data → RolloutDataSource<br><div class="pipe"><span class="n">input key</span><span class="arr">→</span><span class="n">label</span><span class="arr">→</span><span class="n hi">metadata</span><span class="arr">→</span><span class="n">× n_samples</span></div></div></div>
+        <div class="swim-row"><div class="swim-lab">Render</div><div class="swim-body">coding 路径通常<strong>不</strong>在 Dataset 预渲染 chat template；真正渲染在 Adapter 每 turn 的模板函数。</div></div>
+        <div class="swim-row"><div class="swim-lab">Group</div><div class="swim-body">同 prompt 的 n 条构成 GRPO 组；group_index 用于日志/timeline。</div></div>
+      </div>
+    </div>
+    <div>
+      <h3>关键字段</h3>
+      <dl class="kv">
+        <dt>protocol</dt><dd>决定 grade 路径（新箱 patch vs 同箱终态）</dd>
+        <dt>agent</dt><dd>走 agents_registry；缺省 SWE_AGENT</dd>
+        <dt>image/workdir</dt><dd>sandbox 镜像与仓库根；缺则 abort</dd>
+        <dt>evaluability</dt><dd>缺少验题字段 → unevaluatable abort</dd>
+      </dl>
+      <div class="card" style="margin-top:0.7rem">
+        <h3>转换脚本</h3>
+        <ul class="dense">
+          <li><span class="mono">convert_scaleswe_to_slime.py</span></li>
+          <li><span class="mono">convert_tmax_to_slime.py</span></li>
+          <li>可 <span class="mono">cat | shuf</span> 混合训练</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="slide" data-title="ScaleSWE vs Tmax">
+  <div class="eyebrow">Dataset</div>
+  <h2>两种协议：任务形态、验题与防作弊点</h2>
+  <div class="diagram"><svg viewBox="0 0 860 380" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="b" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#0b6e6a"/></marker></defs>
+  <text class="title" x="20" y="22">验题路径对比（防作弊接口不同）</text>
+  <rect x="20" y="45" width="400" height="310" fill="#f7fafc" stroke="#c5d0db"/>
+  <text class="title" x="36" y="72">ScaleSWE · 修 issue → patch</text>
+  <rect x="45" y="95" width="105" height="40" fill="#d5ebe9" stroke="#0b6e6a"/><text class="lbl" x="58" y="119">agent 沙箱</text>
+  <rect x="175" y="95" width="90" height="40" fill="#eef3f7" stroke="#c5d0db"/><text class="lbl" x="190" y="119">git_diff</text>
+  <rect x="290" y="90" width="110" height="50" fill="#f3ead7" stroke="#8a5a12"/><text class="lbl" x="302" y="110">空 patch?</text><text class="lbl-sm" x="302" y="126">YES → reward 0</text>
+  <line x1="150" y1="115" x2="173" y2="115" stroke="#0b6e6a" marker-end="url(#b)"/>
+  <line x1="265" y1="115" x2="288" y2="115" stroke="#0b6e6a" marker-end="url(#b)"/>
+  <rect x="120" y="175" width="160" height="52" fill="#122033"/><text class="lbl" x="135" y="195" style="fill:#fff">新干净 eval 沙箱</text><text class="lbl-sm" x="135" y="212" style="fill:#9bb0c4">apply + f2p/swepro</text>
+  <rect x="310" y="183" width="80" height="36" fill="#1a6b4a"/><text class="lbl" x="328" y="205" style="fill:#fff">0 / 1</text>
+  <path d="M220,135 V175" stroke="#0b6e6a" marker-end="url(#b)"/>
+  <line x1="280" y1="201" x2="308" y2="201" stroke="#0b6e6a" marker-end="url(#b)"/>
+  <text class="lbl-sm" x="45" y="260">测题不在 agent 可见工作区</text>
+  <text class="lbl-sm" x="45" y="278">防：改测试 / 偷看 golden / 污染环境</text>
+  <text class="lbl-sm" x="45" y="306">代码：swe.grade_* · generate 分支 !tmax</text>
+  <text class="lbl-sm" x="45" y="324">空 patch：强制 solved=0（永不 α）</text>
+  <rect x="440" y="45" width="400" height="310" fill="#f7fafc" stroke="#c5d0db"/>
+  <text class="title" x="456" y="72">Tmax · 终端/文件终态</text>
+  <rect x="470" y="95" width="115" height="40" fill="#d5ebe9" stroke="#0b6e6a"/><text class="lbl" x="485" y="119">agent 沙箱</text>
+  <rect x="610" y="95" width="130" height="40" fill="#eef3f7" stroke="#c5d0db"/><text class="lbl" x="622" y="110">写 test_sh</text><text class="lbl-sm" x="622" y="126">（结束后才写）</text>
+  <rect x="760" y="95" width="60" height="40" fill="#1a6b4a"/><text class="lbl" x="772" y="119" style="fill:#fff">0/1</text>
+  <line x1="585" y1="115" x2="608" y2="115" stroke="#0b6e6a" marker-end="url(#b)"/>
+  <line x1="740" y1="115" x2="758" y2="115" stroke="#0b6e6a" marker-end="url(#b)"/>
+  <text class="lbl-sm" x="470" y="175">同一沙箱验终态；不依赖 git patch</text>
+  <text class="lbl-sm" x="470" y="193">防：episode 中看不到 verifier 内容</text>
+  <text class="lbl-sm" x="470" y="220">可选 reward.txt 做稠密信号</text>
+  <text class="lbl-sm" x="470" y="248">空 patch 规则不适用</text>
+  <text class="lbl-sm" x="470" y="280">代码：swe.grade_tmax_inplace</text>
+  <text class="lbl-sm" x="470" y="306">credit 对象是「操作序列」而非 diff</text>
+  <text class="lbl-sm" x="470" y="324">对 GiGPO-diff 适配性弱于 ScaleSWE</text>
+  </svg></div>
+  <table class="cmp mini-table">
+    <tr><th></th><th>ScaleSWE</th><th>Tmax</th></tr>
+    <tr><td>目标</td><td>可 apply 的 git patch</td><td>文件系统 / 服务终态</td></tr>
+    <tr><td>验题沙箱</td><td><strong>全新</strong>沙箱 apply+测</td><td><strong>同一</strong> agent 沙箱</td></tr>
+    <tr><td>测题可见性</td><td>eval 箱才有 harness</td><td>agent 退出后才写 test_sh</td></tr>
+    <tr><td>失败常见形</td><td>空 patch / apply 失败 / 测不过</td><td>未达终态 / 超时 / 错答</td></tr>
+  </table>
+</section>
+
+<section class="slide" data-title="真实轨迹">
+  <div class="eyebrow">Trajectory</div>
+  <h2>真实轨迹：按样例切换解读与时间线</h2>
+  <p class="muted">样例来自 <span class="mono">infer_cc_glm_20260728_141118</span>（ScaleSWE）与 <span class="mono">infer_cc_tmax_20260807_162106</span>（Tmax）。点击 tab 同步切换解读要点与 turn 时间线。</p>
+  <div class="traj-controls" id="trajBtns"></div>
+  <div class="traj-meta" id="trajMeta"></div>
+  <div class="card" id="trajNote" style="margin:0.7rem 0 0.9rem"></div>
+  <div class="timeline" id="trajTimeline"></div>
+</section>
+
+<section class="slide" data-title="Agent 矩阵">
+  <div class="eyebrow">Agent</div>
+  <h2>多 Harness，同一 Adapter 合同</h2>
+  <p class="lede wide"><span class="mono">agents_registry.resolve_agent</span>：metadata.agent → harness 类 + adapter 协议。除 codex（OpenAI）外，本矩阵均走 Anthropic Messages 兼容口。</p>
+  <table class="cmp">
+    <tr><th>展示名</th><th>注册名 / 别名</th><th>Adapter</th><th>运行时要点</th></tr>
+    <tr><td>Claude Code</td><td class="mono">claude_code / cc</td><td>anthropic</td><td>默认；ANTHROPIC_BASE_URL→adapter</td></tr>
+    <tr><td>Pi</td><td class="mono">pi</td><td>anthropic</td><td>同协议，不同 CLI/工具面</td></tr>
+    <tr><td>OpenCode</td><td class="mono">opencode</td><td>anthropic</td><td>同上</td></tr>
+    <tr><td>SWE-agent</td><td class="mono">miniswe / mini-swe-agent</td><td>anthropic</td><td>轻量 SWE harness</td></tr>
+  </table>
+  <div class="diagram" style="margin-top:0.8rem"><svg viewBox="0 0 860 160" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="ag" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#0b6e6a"/></marker></defs>
+  <text class="title" x="20" y="24">路由：metadata.agent → harness.run ↔ Adapter HTTP</text>
+  <rect x="20" y="50" width="130" height="50" fill="#eef3f7" stroke="#c5d0db"/><text class="lbl" x="40" y="80">metadata.agent</text>
+  <rect x="180" y="50" width="150" height="50" fill="#d5ebe9" stroke="#0b6e6a"/><text class="lbl" x="195" y="72">resolve_agent()</text><text class="lbl-sm" x="195" y="88">别名归一化</text>
+  <rect x="360" y="50" width="150" height="50" fill="#122033"/><text class="lbl" x="380" y="80" style="fill:#fff">harness_cls()</text>
+  <rect x="540" y="50" width="140" height="50" fill="#0b6e6a"/><text class="lbl" x="555" y="72" style="fill:#fff">adapter_url</text><text class="lbl-sm" x="555" y="88" style="fill:#d5ebe9">session 协议</text>
+  <rect x="710" y="50" width="130" height="50" fill="#1e4d7b"/><text class="lbl" x="725" y="80" style="fill:#fff">SGLang</text>
+  <line x1="150" y1="75" x2="178" y2="75" stroke="#0b6e6a" marker-end="url(#ag)"/>
+  <line x1="330" y1="75" x2="358" y2="75" stroke="#0b6e6a" marker-end="url(#ag)"/>
+  <line x1="510" y1="75" x2="538" y2="75" stroke="#0b6e6a" marker-end="url(#ag)"/>
+  <line x1="680" y1="75" x2="708" y2="75" stroke="#0b6e6a" marker-end="url(#ag)"/>
+  <text class="lbl-sm" x="20" y="130">训练比较的是「同一 SLM + 不同 agent runtime」；下面 pass@1 是强模型评测口径，≠ RL mean_reward。</text>
+  </svg></div>
+</section>
+
+<section class="slide" data-title="Agent 解决率">
+  <div class="eyebrow">Agent · Eval</div>
+  <h2>强模型 × Harness pass@1</h2>
+  <p class="muted">用户给定评测表；用于说明 harness 能力上界与协议难度差（Tmax 普遍更高）。读表时分开「agent 工程能力」与「SLM RL 曲线」。</p>
+  <div class="grid2">
+    <div><h3>ScaleSWE</h3><div class="bars" id="barsScaleswe"></div></div>
+    <div><h3>Tmax</h3><div class="bars" id="barsTmax"></div></div>
+  </div>
+  <table class="cmp mini-table" style="margin-top:1rem">
+    <tr><th>Agent</th><th>scaleswe</th><th>tmax</th><th>读数提示</th></tr>
+    <tr><td>pi</td><td>85.6% (507/592)</td><td>90.4% (723/800)</td><td>两协议最高之一</td></tr>
+    <tr><td>miniswe</td><td>78.5% (1225/1560)</td><td>91.8% (651/709)</td><td>Tmax 极强；ScaleSWE 中游</td></tr>
+    <tr><td>claude_code</td><td>78.9% (1042/1321)</td><td>84.7% (766/904)</td><td>默认训练 harness</td></tr>
+    <tr><td>opencode</td><td>73.1% (1217/1664)</td><td>79.2% (902/1139)</td><td>相对偏低</td></tr>
+  </table>
+</section>
+
+<section class="slide" data-title="String-in Token-out">
+  <div class="eyebrow">Runtime</div>
+  <h2>String-in / Token-out：可证训练目标</h2>
+  <div class="diagram"><svg viewBox="0 0 860 400" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="c" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#0b6e6a"/></marker></defs>
+  <text class="title" x="20" y="22">_run_turn 主路径 + offload 分支 + mask 归属</text>
+  <rect x="20" y="45" width="125" height="48" fill="#122033"/><text class="lbl" x="35" y="73" style="fill:#fff">HTTP msgs</text>
+  <rect x="165" y="45" width="135" height="48" fill="#eef3f7" stroke="#c5d0db"/><text class="lbl" x="178" y="65">chat template</text><text class="lbl-sm" x="178" y="81">→ prompt_ids</text>
+  <rect x="320" y="45" width="150" height="48" fill="#1e4d7b"/><text class="lbl" x="335" y="65" style="fill:#fff">SGLang generate</text><text class="lbl-sm" x="335" y="81" style="fill:#c9d9ea">ids + logprob</text>
+  <rect x="490" y="45" width="130" height="48" fill="#eef3f7" stroke="#c5d0db"/><text class="lbl" x="505" y="65">parse tools /</text><text class="lbl-sm" x="505" y="81">reasoning</text>
+  <rect x="640" y="45" width="100" height="48" fill="#0b6e6a"/><text class="lbl" x="655" y="65" style="fill:#fff">offload?</text><text class="lbl-sm" x="655" y="81" style="fill:#d5ebe9">分支</text>
+  <rect x="760" y="45" width="80" height="48" fill="#f7fafc" stroke="#c5d0db"/><text class="lbl" x="772" y="73">reply</text>
+  <line x1="145" y1="69" x2="163" y2="69" stroke="#0b6e6a" marker-end="url(#c)"/>
+  <line x1="300" y1="69" x2="318" y2="69" stroke="#0b6e6a" marker-end="url(#c)"/>
+  <line x1="470" y1="69" x2="488" y2="69" stroke="#0b6e6a" marker-end="url(#c)"/>
+  <line x1="620" y1="69" x2="638" y2="69" stroke="#0b6e6a" marker-end="url(#c)"/>
+  <line x1="740" y1="69" x2="758" y2="69" stroke="#0b6e6a" marker-end="url(#c)"/>
+  <path d="M690,93 V120 H250 V145" stroke="#0b6e6a" fill="none" marker-end="url(#c)"/>
+  <rect x="80" y="145" width="240" height="58" fill="#d5ebe9" stroke="#0b6e6a"/>
+  <text class="lbl" x="95" y="168">think 内 &lt;|llm_offload|&gt;N</text>
+  <text class="lbl-sm" x="95" y="186">调 GLM → 合并 assistant；只训 SLM ids</text>
+  <rect x="360" y="145" width="240" height="58" fill="#f3e4e4" stroke="#a33b3b"/>
+  <text class="lbl" x="375" y="168">think 外 offload</text>
+  <text class="lbl-sm" x="375" y="186">不调 GLM + format penalty</text>
+  <rect x="640" y="145" width="180" height="58" fill="#eef3f7" stroke="#c5d0db"/>
+  <text class="lbl" x="655" y="168">无 offload</text>
+  <text class="lbl-sm" x="655" y="186">直接返回 SLM 回复</text>
+  <text class="title" x="20" y="240">训练 token 归属（credit 边界）</text>
+  <rect x="20" y="260" width="170" height="42" fill="#1a6b4a"/><text class="lbl" x="40" y="285" style="fill:#fff">mask=1 · SLM output</text>
+  <rect x="210" y="260" width="190" height="42" fill="#5b6b7c"/><text class="lbl" x="225" y="285" style="fill:#fff">mask=0 · 模板/tool obs</text>
+  <rect x="420" y="260" width="170" height="42" fill="#5b6b7c"/><text class="lbl" x="440" y="285" style="fill:#fff">mask=0 · GLM 文本</text>
+  <rect x="610" y="260" width="230" height="42" fill="#eef3f7" stroke="#c5d0db"/><text class="lbl" x="625" y="285">+ capture turn_git_diff</text>
+  <text class="lbl-sm" x="20" y="330">训练目标 = SGLang 返回的 output_ids，不对 response 字符串再 tokenize。</text>
+  <text class="lbl-sm" x="20" y="350">前缀漂移：fork 新分支或 wipe 不可证段 —— 没有 provenance 就不反传。</text>
+  <text class="lbl-sm" x="20" y="370">后续 turn 的 tool/user 文本以 mask=0 拼上，保证上下文连续但 credit 不泄漏。</text>
+  </svg></div>
+</section>
+
+<section class="slide" data-title="Offload">
+  <div class="eyebrow">Offload</div>
+  <h2>Mid-turn LLM Offload：在 Adapter 内完成，不是 post-hoc RM</h2>
+  <div class="diagram"><svg viewBox="0 0 860 340" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="of" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#0b6e6a"/></marker></defs>
+  <text class="title" x="20" y="22">单 turn：agent → SLM → (GLM?) → 完整 reply → agent</text>
+  <rect x="20" y="50" width="100" height="50" fill="#122033"/><text class="lbl" x="40" y="80" style="fill:#fff">agent</text>
+  <rect x="150" y="50" width="110" height="50" fill="#0b6e6a"/><text class="lbl" x="175" y="80" style="fill:#fff">SLM</text>
+  <rect x="300" y="40" width="160" height="70" fill="#f3ead7" stroke="#8a5a12"/><text class="lbl" x="315" y="65">think gate</text><text class="lbl-sm" x="315" y="85">in-think?</text><text class="lbl-sm" x="315" y="100">tag 合法?</text>
+  <rect x="500" y="50" width="110" height="50" fill="#1e4d7b"/><text class="lbl" x="525" y="80" style="fill:#fff">GLM</text>
+  <rect x="650" y="50" width="180" height="50" fill="#d5ebe9" stroke="#0b6e6a"/><text class="lbl" x="670" y="80">合并 assistant</text>
+  <line x1="120" y1="75" x2="148" y2="75" stroke="#0b6e6a" marker-end="url(#of)"/>
+  <line x1="260" y1="75" x2="298" y2="75" stroke="#0b6e6a" marker-end="url(#of)"/>
+  <line x1="460" y1="75" x2="498" y2="75" stroke="#0b6e6a" marker-end="url(#of)"/>
+  <line x1="610" y1="75" x2="648" y2="75" stroke="#0b6e6a" marker-end="url(#of)"/>
+  <path d="M380,110 V150 H175 V100" stroke="#a33b3b" fill="none" stroke-dasharray="4 3"/>
+  <text class="lbl-sm" x="200" y="165" style="fill:#a33b3b">非法：不调 GLM + format pen</text>
+  <path d="M740,100 V190 H60 V75" stroke="#0b6e6a" fill="none" marker-end="url(#of)"/>
+  <text class="lbl-sm" x="80" y="205">回 agent 继续工具环</text>
+  <text class="title" x="20" y="245">与 reward / 训练的耦合</text>
+  <text class="lbl" x="20" y="270">成本 c_i/b_i → cost-aware · 合法求助 → help-seeking α · malformed/orphan → −β</text>
+  <text class="lbl" x="20" y="295">只训本地 output_ids；GLM 嵌入段后续 loss_mask=0</text>
+  <text class="lbl-sm" x="20" y="320">实现：examples/coding_agent_rl/offload.py（system 追加用法，不改 SWE_PROMPT 本体）</text>
+  </svg></div>
+  <ol class="step-list">
+    <li><span class="sn">01</span><span>system 追加 offload 用法说明</span></li>
+    <li><span class="sn">02</span><span>SLM 在 think 内发 <span class="mono">&lt;|llm_offload|&gt;N&lt;|/llm_offload|&gt;</span></span></li>
+    <li><span class="sn">03</span><span>Adapter 调 GLM，合并为一条 assistant 回 agent</span></li>
+    <li><span class="sn">04</span><span>turn_costs 记账 → compute_turn_rewards 塑形</span></li>
+  </ol>
+</section>
+
+<section class="slide" data-title="Credit 总览">
+  <div class="eyebrow">Trajectory Reward Credit</div>
+  <h2>稀疏结局如何落到 token？四层管线</h2>
+  <div class="diagram"><svg viewBox="0 0 860 420" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="d" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#0b6e6a"/></marker></defs>
+  <text class="title" x="20" y="22">本例已落地：Turn-painted GRPO</text>
+  <rect x="20" y="45" width="185" height="78" fill="#122033"/><text class="lbl" x="38" y="70" style="fill:#fff">L1 环境 solved</text><text class="lbl-sm" x="38" y="88" style="fill:#9bb0c4">cost / help_seeking</text><text class="lbl-sm" x="38" y="104" style="fill:#9bb0c4">→ r_i , mean(r)</text>
+  <rect x="235" y="45" width="185" height="78" fill="#0b6e6a"/><text class="lbl" x="253" y="70" style="fill:#fff">L2 turn residual</text><text class="lbl-sm" x="253" y="88" style="fill:#d5ebe9">A_t=A_s+(r_i−r̄)</text><text class="lbl-sm" x="253" y="104" style="fill:#d5ebe9">画到 token spans</text>
+  <rect x="450" y="45" width="185" height="78" fill="#1e4d7b"/><text class="lbl" x="468" y="70" style="fill:#fff">L3 fan-out</text><text class="lbl-sm" x="468" y="88" style="fill:#c9d9ea">全额 reward ×K</text><text class="lbl-sm" x="468" y="104" style="fill:#c9d9ea">共享 rollout_id</text>
+  <rect x="665" y="45" width="175" height="78" fill="#1a6b4a"/><text class="lbl" x="683" y="70" style="fill:#fff">L4 loss_mask</text><text class="lbl-sm" x="683" y="88" style="fill:#dff0e7">只训可证</text><text class="lbl-sm" x="683" y="104" style="fill:#dff0e7">output_ids</text>
+  <line x1="205" y1="84" x2="233" y2="84" stroke="#0b6e6a" marker-end="url(#d)"/>
+  <line x1="420" y1="84" x2="448" y2="84" stroke="#0b6e6a" marker-end="url(#d)"/>
+  <line x1="635" y1="84" x2="663" y2="84" stroke="#0b6e6a" marker-end="url(#d)"/>
+  <text class="title" x="20" y="160">数值小例子：3 turns，A_s=0.4，r=[0.9,0.3,0.6]</text>
+  <text class="lbl-sm" x="20" y="180">r̄=0.6 → residual=[+0.3,−0.3,0] → A=[0.7,0.1,0.4] 画在各 turn span</text>
+  <rect x="20" y="200" width="250" height="36" fill="#0b6e6a"/><text class="lbl" x="90" y="222" style="fill:#fff">turn0  A=0.7</text>
+  <rect x="280" y="200" width="180" height="36" fill="#5b6b7c"/><text class="lbl" x="320" y="222" style="fill:#fff">turn1  A=0.1</text>
+  <rect x="470" y="200" width="220" height="36" fill="#2f8f8a"/><text class="lbl" x="520" y="222" style="fill:#fff">turn2  A=0.4</text>
+  <text class="lbl-sm" x="20" y="260">对比 GRPO 广播：整段全是 0.4 —— 无法区分高成本乱求助 turn 与有效编辑 turn</text>
+  <text class="title" x="20" y="300">上游 / 下游</text>
+  <text class="lbl" x="20" y="325">上游 GRPO：同 prompt G 条 · A_s = R_s − mean(R)（可选 /std）—— rewards 进 custom 前已 demean</text>
+  <text class="lbl" x="20" y="348">下游 loss：PPO-clip PG；rollout_mask_sums 按 rollout 归一</text>
+  <text class="lbl-sm" x="20" y="375">对照方法：GiGPO-SWE（跨 traj diff 聚类）· ARPO（熵触发分支归因）—— 改的是不同接口</text>
+  <text class="lbl-sm" x="20" y="395">代码：offload.compute_turn_rewards · offload_turn_advantage.compute_turn_advantages</text>
+  </svg></div>
+</section>
+
+<section class="slide" data-title="L1 Reward 塑形">
+  <div class="eyebrow">Credit · L1</div>
+  <h2>从 solved 到 turn_rewards：决策树</h2>
+  <div class="diagram"><svg viewBox="0 0 860 400" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="r1" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#0b6e6a"/></marker></defs>
+  <text class="title" x="20" y="22">compute_turn_rewards（对齐 offload.py）</text>
+  <rect x="340" y="40" width="160" height="40" fill="#122033"/><text class="lbl" x="375" y="64" style="fill:#fff">solved &gt; 0 ?</text>
+  <path d="M340,60 H200" stroke="#0b6e6a" marker-end="url(#r1)"/>
+  <path d="M500,60 H640" stroke="#0b6e6a" marker-end="url(#r1)"/>
+  <text class="lbl-sm" x="250" y="52">Y</text>
+  <text class="lbl-sm" x="580" y="52">N</text>
+  <rect x="80" y="90" width="240" height="70" fill="#d5ebe9" stroke="#0b6e6a"/>
+  <text class="lbl" x="95" y="115">已解 · 按 turn</text>
+  <text class="lbl-sm" x="95" y="133">无 offload → r_i=1</text>
+  <text class="lbl-sm" x="95" y="148">有 offload → 1−λ·c/b −fmt −β?</text>
+  <rect x="520" y="90" width="280" height="70" fill="#eef3f7" stroke="#c5d0db"/>
+  <text class="lbl" x="535" y="115">未解 · 看 reward_mode</text>
+  <text class="lbl-sm" x="535" y="133">cost_aware → 0 或 −β</text>
+  <text class="lbl-sm" x="535" y="148">help_seeking → 见下行</text>
+  <rect x="480" y="190" width="340" height="90" fill="#f3ead7" stroke="#8a5a12"/>
+  <text class="lbl" x="495" y="215">help_seeking · unsolved</text>
+  <text class="lbl-sm" x="495" y="235">合法 in-think offload → α′（可 empty_scale）</text>
+  <text class="lbl-sm" x="495" y="252">repaired / orphan / malformed → −β</text>
+  <text class="lbl-sm" x="495" y="269">else 0；可 all-wrong 才发 α</text>
+  <rect x="80" y="200" width="280" height="70" fill="#122033"/>
+  <text class="lbl" x="95" y="225" style="fill:#fff">标量 train_reward</text>
+  <text class="lbl-sm" x="95" y="245" style="fill:#9bb0c4">= mean(r_i)</text>
+  <text class="lbl-sm" x="95" y="260" style="fill:#9bb0c4">再 build_turn_token_spans</text>
+  <path d="M200,160 V200" stroke="#0b6e6a" marker-end="url(#r1)"/>
+  <path d="M660,160 V190" stroke="#0b6e6a" marker-end="url(#r1)"/>
+  <text class="lbl-sm" x="20" y="320">空 patch：ScaleSWE 永不 solved；α 可乘 empty_scale，Tmax 不 scale。</text>
+  <text class="lbl-sm" x="20" y="340">group：shape_group_help_seeking_rewards · compact timeout/spam</text>
+  <text class="lbl-sm" x="20" y="360">attach_turn_advantage_metadata → metadata.turn_rewards + turn_token_spans</text>
+  <text class="lbl-sm" x="20" y="380">无 turn ledger 时回落 legacy 标量 reward（兼容路径）</text>
+  </svg></div>
+</section>
+
+<section class="slide" data-title="L2 Turn Paint">
+  <div class="eyebrow">Credit · L2</div>
+  <h2>Turn residual painting：组间相对 + 轨迹内相对</h2>
+  <div class="eq-block"># rollout_data["rewards"] 已是 GRPO 组内 demean 后的 A_s
+A_t[span_i] = A_s + (r_i − mean_j r_j)
+# span：build_turn_token_spans 按 trainable token 比例切分 response</div>
+  <div class="diagram"><svg viewBox="0 0 860 220" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="p2" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#0b6e6a"/></marker></defs>
+  <text class="title" x="20" y="22">paint 流水线</text>
+  <rect x="20" y="50" width="140" height="50" fill="#eef3f7" stroke="#c5d0db"/><text class="lbl" x="40" y="80">A_s (GRPO)</text>
+  <rect x="190" y="50" width="150" height="50" fill="#eef3f7" stroke="#c5d0db"/><text class="lbl" x="205" y="72">turn_rewards</text><text class="lbl-sm" x="205" y="88">r_i 列表</text>
+  <rect x="370" y="50" width="160" height="50" fill="#eef3f7" stroke="#c5d0db"/><text class="lbl" x="385" y="72">turn_token_spans</text><text class="lbl-sm" x="385" y="88">[start,end)</text>
+  <rect x="560" y="50" width="140" height="50" fill="#0b6e6a"/><text class="lbl" x="580" y="80" style="fill:#fff">paint A_t</text>
+  <rect x="730" y="50" width="110" height="50" fill="#122033"/><text class="lbl" x="748" y="80" style="fill:#fff">PG</text>
+  <line x1="160" y1="75" x2="188" y2="75" stroke="#0b6e6a" marker-end="url(#p2)"/>
+  <line x1="340" y1="75" x2="368" y2="75" stroke="#0b6e6a" marker-end="url(#p2)"/>
+  <line x1="530" y1="75" x2="558" y2="75" stroke="#0b6e6a" marker-end="url(#p2)"/>
+  <line x1="700" y1="75" x2="728" y2="75" stroke="#0b6e6a" marker-end="url(#p2)"/>
+  <text class="lbl-sm" x="20" y="130">缺 spans 或缺对齐 → fallback：整段广播 A_s（安全降级）</text>
+  <text class="lbl-sm" x="20" y="150">returns = advantages.clone()；无 critic / 非 GAE</text>
+  <text class="lbl-sm" x="20" y="180">相对 vanilla GRPO：保留组间相对，额外获得轨迹内相对（压低畸形/高成本 turn）</text>
+  <text class="lbl-sm" x="20" y="200">入口：--custom-advantage-function-path …offload_turn_advantage.compute_turn_advantages</text>
+  </svg></div>
+  <div class="paint-demo">
+    <div class="paint-row"><span>GRPO 广播</span><div class="seg flat"><span>A_s</span><span>A_s</span><span>A_s</span></div></div>
+    <div class="paint-row"><span>Turn paint</span><div class="seg"><span class="a">A_s+δ₁</span><span class="b">A_s+δ₂</span><span class="c">A_s+δ₃</span></div></div>
+  </div>
+</section>
+
+<section class="slide" data-title="L3 Fan-out">
+  <div class="eyebrow">Credit · L3</div>
+  <h2>Fan-out：全额 reward + rollout 级归一</h2>
+  <div class="diagram"><svg viewBox="0 0 860 320" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="fo" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#0b6e6a"/></marker></defs>
+  <text class="title" x="20" y="22">消息树 → 多条 Sample（subagent / compaction / 前缀 fork）</text>
+  <rect x="360" y="45" width="100" height="36" fill="#122033"/><text class="lbl" x="385" y="67" style="fill:#fff">root</text>
+  <rect x="200" y="110" width="100" height="36" fill="#eef3f7" stroke="#c5d0db"/><text class="lbl" x="225" y="132">branch A</text>
+  <rect x="420" y="110" width="100" height="36" fill="#eef3f7" stroke="#c5d0db"/><text class="lbl" x="445" y="132">branch B</text>
+  <rect x="120" y="180" width="90" height="36" fill="#0b6e6a"/><text class="lbl" x="135" y="202" style="fill:#fff">leaf₁</text>
+  <rect x="240" y="180" width="90" height="36" fill="#0b6e6a"/><text class="lbl" x="255" y="202" style="fill:#fff">leaf₂</text>
+  <rect x="430" y="180" width="90" height="36" fill="#0b6e6a"/><text class="lbl" x="445" y="202" style="fill:#fff">leaf₃</text>
+  <path d="M410,81 V100 H250 V110" stroke="#0b6e6a" fill="none"/>
+  <path d="M410,81 V100 H470 V110" stroke="#0b6e6a" fill="none"/>
+  <path d="M250,146 V170 H165 V180" stroke="#0b6e6a" fill="none"/>
+  <path d="M250,146 V170 H285 V180" stroke="#0b6e6a" fill="none"/>
+  <path d="M470,146 V180" stroke="#0b6e6a" fill="none"/>
+  <rect x="580" y="100" width="250" height="120" fill="#f7fafc" stroke="#c5d0db"/>
+  <text class="lbl" x="595" y="125">get_trajectory</text>
+  <text class="lbl-sm" x="595" y="145">每条 Sample.reward = 全额 R</text>
+  <text class="lbl-sm" x="595" y="163">共享 rollout_id</text>
+  <text class="lbl-sm" x="595" y="181">README 旧写 reward/K</text>
+  <text class="lbl-sm" x="595" y="199">→ 以代码为准：全额</text>
+  <text class="lbl" x="20" y="250">防放大：rollout_mask_sums 按 rollout 聚合 loss，避免 K 条独立当 K 次更新</text>
+  <text class="lbl-sm" x="20" y="275">若做错：全额且当独立 rollout → 梯度×K；均分 reward/K → 长链分段被压扁</text>
+  <text class="lbl-sm" x="20" y="295">本例选择：全额 credit + mask 归一（保留每条链信号，控制总更新量）</text>
+  </svg></div>
+</section>
+
+<section class="slide" data-title="L4 loss_mask">
+  <div class="eyebrow">Credit · L4</div>
+  <h2>Token provenance = credit 边界</h2>
+  <div class="grid3">
+    <div class="card"><h3>mask=1</h3><p>SGLang 采样的 SLM <span class="mono">output_ids</span> + logprob</p></div>
+    <div class="card"><h3>mask=0</h3><p>模板 · tool obs · user · GLM 嵌入文本</p></div>
+    <div class="card"><h3>wipe / fork</h3><p>前缀不可证 → 不反传或新开链</p></div>
+  </div>
+  <div class="diagram"><svg viewBox="0 0 860 180" xmlns="http://www.w3.org/2000/svg">
+  <text class="title" x="20" y="24">一段「看起来连续」的对话 token 流</text>
+  <rect x="20" y="50" width="120" height="40" fill="#5b6b7c"/><text class="lbl" x="40" y="74" style="fill:#fff">sys/tmpl</text>
+  <rect x="145" y="50" width="150" height="40" fill="#1a6b4a"/><text class="lbl" x="170" y="74" style="fill:#fff">SLM turn0</text>
+  <rect x="300" y="50" width="140" height="40" fill="#5b6b7c"/><text class="lbl" x="325" y="74" style="fill:#fff">tool obs</text>
+  <rect x="445" y="50" width="150" height="40" fill="#1a6b4a"/><text class="lbl" x="470" y="74" style="fill:#fff">SLM turn1</text>
+  <rect x="600" y="50" width="110" height="40" fill="#5b6b7c"/><text class="lbl" x="620" y="74" style="fill:#fff">GLM</text>
+  <rect x="715" y="50" width="125" height="40" fill="#1a6b4a"/><text class="lbl" x="735" y="74" style="fill:#fff">SLM cont</text>
+  <text class="lbl-sm" x="20" y="120">绿 = 可训；灰 = 上下文但无梯度。字符串连续 ≠ token 级可证。</text>
+  <text class="lbl-sm" x="20" y="145">slime 选择：保 agent 上下文，credit 只给有 logprob 来源的段。</text>
+  </svg></div>
+  <div class="warn-box">没有 provenance 就不给学习信号 —— 这是 credit 的硬边界，也是 Adapter 设计的核心不变量。</div>
+</section>
+
+<section class="slide" data-title="Credit方法对比">
+  <div class="eyebrow">Credit · Compare</div>
+  <h2>Credit方法对比</h2>
+  <p class="muted">共同起点：结局级 GRPO。后面四页各给<strong>一个具体 case</strong>（本例 / 论文图示）。</p>
+  <table class="cmp mini-table">
+    <tr><th>方法</th><th>细粒度从哪来</th><th>Case 来源</th><th>本仓库</th></tr>
+    <tr class="hl"><td><strong>Turn-paint</strong></td><td>单 traj 内 r_i residual</td><td>本例 offload 轨迹</td><td>已落地</td></tr>
+    <tr><td><strong>GiGPO </strong></td><td>跨 traj 相同 env state</td><td>论文 Fig.3 WebShop</td><td>对照</td></tr>
+    <tr><td><strong>GiGPO→SWE</strong></td><td>跨 traj 相似 git diff</td><td>SWE 适配设想 case</td><td>方案</td></tr>
+    <tr><td><strong>ARPO</strong></td><td>熵触发 branch + 归因</td><td>论文 Fig.1/4 tool 后熵</td><td>对照</td></tr>
+  </table>
+  <div class="note-box" style="margin-top:1rem"><div class="callout-title">怎么读后面四页</div>每页 = 方法一句话 + <strong>一个 case</strong>。不要和「总览」重复堆定义。</div>
+</section>
+
+<section class="slide" data-title="Turn-paint 例子">
+  <div class="eyebrow">Credit · Turn-paint · Case</div>
+  <h2>本例 Case：同一次成功里，乱 offload 被压、有效 Edit 被抬</h2>
+  <p class="muted">来源：本仓库 Turn-painted GRPO（非独立论文）。对齐 <span class="mono">offload_turn_advantage</span>：A_t = A_s + (r_i − r̄)。</p>
+  <div class="cols-12">
+    <div>
+      <table class="cmp mini-table">
+        <tr><th>turn</th><th>动作</th><th>规则 r_i</th></tr>
+        <tr><td>#0</td><td>Read PROBLEM</td><td>0.5</td></tr>
+        <tr><td>#1</td><td>think 内乱 offload（高成本）</td><td>0.1</td></tr>
+        <tr><td>#2</td><td>Edit 正确 API + 测过</td><td>0.9</td></tr>
+      </table>
+      <div class="eq-block" style="margin-top:0.7rem">A_s = +0.3（组内相对失败轨迹）
+r̄ = 0.5
+A = [0.3, −0.1, 0.7]</div>
+    </div>
+    <div>
+      <div class="diagram"><svg viewBox="0 0 400 220" xmlns="http://www.w3.org/2000/svg">
+      <text class="title" x="10" y="22">涂在 turn spans 上</text>
+      <text class="lbl-sm" x="10" y="42">GRPO 广播：整段全是 0.3</text>
+      <rect x="10" y="55" width="120" height="28" fill="#5b6b7c"/><text class="lbl" x="45" y="74" style="fill:#fff">0.3</text>
+      <rect x="135" y="55" width="120" height="28" fill="#5b6b7c"/><text class="lbl" x="170" y="74" style="fill:#fff">0.3</text>
+      <rect x="260" y="55" width="120" height="28" fill="#5b6b7c"/><text class="lbl" x="295" y="74" style="fill:#fff">0.3</text>
+      <text class="lbl-sm" x="10" y="110">Turn-paint：</text>
+      <rect x="10" y="120" width="120" height="36" fill="#2f8f8a"/><text class="lbl" x="40" y="142" style="fill:#fff">0.3</text>
+      <rect x="135" y="120" width="120" height="36" fill="#a33b3b"/><text class="lbl" x="155" y="142" style="fill:#fff">−0.1</text>
+      <rect x="260" y="120" width="120" height="36" fill="#0b6e6a"/><text class="lbl" x="285" y="142" style="fill:#fff">0.7</text>
+      <text class="lbl-sm" x="10" y="180">#1 乱求助被压；#2 有效 Edit 抬高</text>
+      <text class="lbl-sm" x="10" y="200">不跨 traj 成组 —— 只看本轨迹内相对</text>
+      </svg></div>
+    </div>
+  </div>
+  <div class="warn-box"><div class="callout-title">Case 要点</div>结局都是成功时，纯 GRPO 无法区分「乱求助 turn」与「真正改对代码的 turn」；Turn-paint 用轨迹内规则分补这一刀。</div>
+</section>
+
+<section class="slide" data-title="GiGPO ">
+  <div class="eyebrow">Credit · GiGPO · Case</div>
+  <h2>GiGPO  Case：WebShop 搜索结果页（论文 Fig.3）</h2>
+  <p class="muted"><span class="mono">arXiv:2505.10978</span> §4.2 / Figure 3。Anchor = 同一 search results 页面；比较从该页出发的不同动作。</p>
+  <div class="diagram"><svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="gw" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#0b6e6a"/></marker></defs>
+  <text class="title" x="20" y="22">共享 anchor state：搜索结果页（红框页）</text>
+  <rect x="40" y="50" width="360" height="130" fill="#f7fafc" stroke="#c5d0db"/>
+  <text class="title" x="55" y="75">τ₁ 成功</text>
+  <text class="lbl" x="55" y="100">① 点 2nd Item（错）→ 返回</text>
+  <text class="lbl" x="55" y="120">② 再点 1st Item（对）→ 购买成功</text>
+  <text class="lbl-sm" x="55" y="145">折扣回报：1st Item &gt; 2nd Item</text>
+  <rect x="440" y="50" width="380" height="130" fill="#f7fafc" stroke="#c5d0db"/>
+  <text class="title" x="455" y="75">τ₂ 失败</text>
+  <text class="lbl" x="455" y="100">① 点 Next Page</text>
+  <text class="lbl" x="455" y="120">② 找不到目标 → R=0</text>
+  <text class="lbl-sm" x="455" y="145">同页动作进入同一 step 组</text>
+  <rect x="120" y="210" width="620" height="70" fill="#122033"/>
+  <text class="lbl" x="145" y="240" style="fill:#fff">同组相对优势排序（论文原文）：</text>
+  <text class="lbl" x="145" y="262" style="fill:#d5ebe9">Aˢ(1st Item) &gt; Aˢ(2nd Item) &gt; Aˢ(Next Page)</text>
+  <text class="lbl-sm" x="20" y="310">公式：A = Aᴱ(τ) + ω·Aˢ(a|s̃)；R_t 用 γ 折扣回报，不是只看即时 r_t</text>
+  <text class="lbl-sm" x="20" y="330">关键：不额外 rollout；靠「相同页面/房间」自然复现成组。SWE 难做 bit-identical → 见下一页。</text>
+  <text class="lbl-sm" x="20" y="350">评测场景：ALFWorld / WebShop；相对 GRPO 有显著增益</text>
+  </svg></div>
+</section>
+
+<section class="slide" data-title="GiGPO SWE">
+  <div class="eyebrow">Credit · GiGPO→SWE · Case</div>
+  <h2>SWE 适配 Case：用 turn git diff 当「代码状态」</h2>
+  <p class="muted">方案介绍（非论文原 case）。承接 GiGPO macro+micro；micro 键从 env state 换成相似 <span class="mono">git diff</span> 簇。</p>
+  <div class="diagram"><svg viewBox="0 0 860 380" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="gs" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#0b6e6a"/></marker></defs>
+  <text class="title" x="20" y="22">假想：同 issue「给 Connections 加 delete_user_by_email」</text>
+  <rect x="20" y="50" width="260" height="120" fill="#eef3f7" stroke="#c5d0db"/>
+  <text class="lbl" x="35" y="75">traj A（成功）</text>
+  <text class="lbl-sm" x="35" y="95">t0 Read 题 → diff=∅</text>
+  <text class="lbl-sm" x="35" y="112">t1 Edit connections.py</text>
+  <text class="lbl-sm" x="35" y="129">t2 加 test → pytest 绿</text>
+  <rect x="300" y="50" width="260" height="120" fill="#eef3f7" stroke="#c5d0db"/>
+  <text class="lbl" x="315" y="75">traj B（成功但绕路）</text>
+  <text class="lbl-sm" x="315" y="95">t0 Read 题 → diff=∅</text>
+  <text class="lbl-sm" x="315" y="112">t1 乱 Bash / 空转</text>
+  <text class="lbl-sm" x="315" y="129">t2 才 Edit 同文件</text>
+  <rect x="580" y="50" width="260" height="120" fill="#f3e4e4" stroke="#a33b3b"/>
+  <text class="lbl" x="595" y="75">traj C（失败）</text>
+  <text class="lbl-sm" x="595" y="95">t0 Read → diff=∅</text>
+  <text class="lbl-sm" x="595" y="112">t1 Edit 错文件</text>
+  <text class="lbl-sm" x="595" y="129">空/错 patch → R=0</text>
+  <text class="title" x="20" y="200">聚类后 micro 组在比什么</text>
+  <text class="lbl" x="20" y="225">簇「读完题未改」(diff≈∅)：比较下一步 —— A.Edit vs B.空转 vs C.改错文件</text>
+  <text class="lbl" x="20" y="250">簇「已改对 connections.py」：比较收尾动作（加测 / 提交）的相对回报</text>
+  <text class="lbl-sm" x="20" y="280">钩子：capture_turn_git_diff → metadata.turn_git_diffs（已有）；聚类训练未落地</text>
+  <text class="lbl-sm" x="20" y="300">相对原文 WebShop：页面可精确相等；SWE 用 normalize(diff) 近似「代码进展」</text>
+  <text class="lbl-sm" x="20" y="320">相对 Turn-paint：本页强调<strong>跨 traj</strong>同簇相对；Turn-paint 只在单 traj 内</text>
+  <text class="lbl-sm" x="20" y="350">风险：diff 噪声、稀疏簇、Tmax 终态任务上 diff 代理弱</text>
+  </svg></div>
+</section>
+
+<section class="slide" data-title="ARPO">
+  <div class="eyebrow">Credit · ARPO · Case</div>
+  <h2>ARPO Case：tool 返回后熵升高 → 局部再采样（论文 Fig.1/4）</h2>
+  <p class="muted"><span class="mono">arXiv:2507.19849</span>。观察：search/Python 等 tool feedback 后，随后 10–50 token 熵尖峰；轨迹级 GRPO 忽略这一步级不确定性。</p>
+  <div class="diagram"><svg viewBox="0 0 860 360" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="ar" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#0b6e6a"/></marker></defs>
+  <text class="title" x="20" y="22">Case 流程（深搜 / 多轮 tool agent）</text>
+  <rect x="30" y="50" width="150" height="50" fill="#122033"/><text class="lbl" x="55" y="80" style="fill:#fff">question q</text>
+  <rect x="210" y="50" width="160" height="50" fill="#eef3f7" stroke="#c5d0db"/><text class="lbl" x="225" y="70">global samples</text><text class="lbl-sm" x="225" y="86">先采 N 条整轨迹</text>
+  <rect x="400" y="50" width="170" height="50" fill="#f3ead7" stroke="#8a5a12"/><text class="lbl" x="415" y="70">tool feedback</text><text class="lbl-sm" x="415" y="86">熵 ΔH↑</text>
+  <rect x="600" y="40" width="220" height="70" fill="#0b6e6a"/><text class="lbl" x="620" y="65" style="fill:#fff">若 P_t=α+β·ΔH &gt; τ</text><text class="lbl-sm" x="620" y="85" style="fill:#d5ebe9">Branch(Z) 局部再采样</text>
+  <line x1="180" y1="75" x2="208" y2="75" stroke="#0b6e6a" marker-end="url(#ar)"/>
+  <line x1="370" y1="75" x2="398" y2="75" stroke="#0b6e6a" marker-end="url(#ar)"/>
+  <line x1="570" y1="75" x2="598" y2="75" stroke="#0b6e6a" marker-end="url(#ar)"/>
+  <text class="title" x="20" y="150">Hard attribution（论文 Fig.4(b)）</text>
+  <rect x="30" y="170" width="380" height="80" fill="#d5ebe9" stroke="#0b6e6a"/>
+  <text class="lbl" x="45" y="195">共享前缀 token</text>
+  <text class="lbl-sm" x="45" y="215">A_shared = mean(含该前缀的 d 条叶子 A)</text>
+  <text class="lbl-sm" x="45" y="233">鼓励「共同路径」吸收组平均信号</text>
+  <rect x="450" y="170" width="380" height="80" fill="#eef3f7" stroke="#c5d0db"/>
+  <text class="lbl" x="465" y="195">分支后缀 token</text>
+  <text class="lbl-sm" x="465" y="215">A_i = (R_i − mean R) / std</text>
+  <text class="lbl-sm" x="465" y="233">各自叶子相对优势，区分 tool 后行为</text>
+  <text class="lbl-sm" x="20" y="280">论文报告：深搜等任务上，用约一半 tool-call 预算仍可超过轨迹级 RL</text>
+  <text class="lbl-sm" x="20" y="300">与本例差异：本例 fan-out 来自 agent 树（subagent/compaction），非熵触发；credit 用 turn 规则</text>
+  <text class="lbl-sm" x="20" y="330">与 GiGPO 差异：ARPO 改 rollout 预算分配；GiGPO 事后按 state 成组、不额外采样</text>
+  </svg></div>
+</section>
+
+<section class="slide" data-title="训练流程">
+
+  <div class="eyebrow">Train</div>
+  <h2>训练环：Sync / Async 与单步内部</h2>
+  <div class="diagram"><svg viewBox="0 0 860 380" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="g" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#0b6e6a"/></marker></defs>
+  <text class="title" x="20" y="22">Async（train_async）：rollout 与 train 时间重叠，扛 agent 长尾</text>
+  <rect x="30" y="50" width="170" height="55" fill="#0b6e6a"/><text class="lbl" x="60" y="72" style="fill:#fff">rollout t</text><text class="lbl-sm" x="60" y="90" style="fill:#d5ebe9">agent 长尾</text>
+  <rect x="240" y="50" width="170" height="55" fill="#1e4d7b"/><text class="lbl" x="260" y="72" style="fill:#fff">train on t−1</text><text class="lbl-sm" x="260" y="90" style="fill:#c9d9ea">并行重叠</text>
+  <rect x="450" y="50" width="170" height="55" fill="#122033"/><text class="lbl" x="465" y="72" style="fill:#fff">update_weights</text><text class="lbl-sm" x="465" y="90" style="fill:#9bb0c4">→ SGLang</text>
+  <rect x="660" y="50" width="170" height="55" fill="#eef3f7" stroke="#c5d0db"/><text class="lbl" x="680" y="72">rollout t+1</text><text class="lbl-sm" x="680" y="90">新权重</text>
+  <line x1="200" y1="77" x2="238" y2="77" stroke="#0b6e6a" marker-end="url(#g)"/>
+  <line x1="410" y1="77" x2="448" y2="77" stroke="#0b6e6a" marker-end="url(#g)"/>
+  <line x1="620" y1="77" x2="658" y2="77" stroke="#0b6e6a" marker-end="url(#g)"/>
+  <text class="title" x="20" y="140">单步 train 内部</text>
+  <rect x="20" y="160" width="110" height="44" fill="#f7fafc" stroke="#c5d0db"/><text class="lbl" x="40" y="186">samples</text>
+  <rect x="150" y="160" width="120" height="44" fill="#f7fafc" stroke="#c5d0db"/><text class="lbl" x="165" y="186">logprobs</text>
+  <rect x="290" y="160" width="150" height="44" fill="#d5ebe9" stroke="#0b6e6a"/><text class="lbl" x="305" y="178">advantages</text><text class="lbl-sm" x="305" y="194">GRPO+paint</text>
+  <rect x="460" y="160" width="140" height="44" fill="#0b6e6a"/><text class="lbl" x="480" y="186" style="fill:#fff">policy_loss</text>
+  <rect x="620" y="160" width="120" height="44" fill="#122033"/><text class="lbl" x="640" y="186" style="fill:#fff">optim</text>
+  <rect x="760" y="160" width="80" height="44" fill="#eef3f7" stroke="#c5d0db"/><text class="lbl" x="775" y="186">sync</text>
+  <line x1="130" y1="182" x2="148" y2="182" stroke="#0b6e6a" marker-end="url(#g)"/>
+  <line x1="270" y1="182" x2="288" y2="182" stroke="#0b6e6a" marker-end="url(#g)"/>
+  <line x1="440" y1="182" x2="458" y2="182" stroke="#0b6e6a" marker-end="url(#g)"/>
+  <line x1="600" y1="182" x2="618" y2="182" stroke="#0b6e6a" marker-end="url(#g)"/>
+  <line x1="740" y1="182" x2="758" y2="182" stroke="#0b6e6a" marker-end="url(#g)"/>
+  <text class="lbl" x="20" y="240">配置要点</text>
+  <text class="lbl-sm" x="20" y="265">--advantage-estimator grpo · custom-advantage-function-path · kl_coef=0 · eps_clip≈0.2/0.28</text>
+  <text class="lbl-sm" x="20" y="285">filter：compact_and_shape_group_help_seeking_rewards（timeout/spam + α shaping）</text>
+  <text class="lbl-sm" x="20" y="305">命名：GRPO 组相对优势 + PPO-style clipped PG；不是带 value model 的 PPO-GAE</text>
+  <text class="lbl-sm" x="20" y="325">Sync 路径：train.py 顺序 rollout→train；长尾 agent 时 GPU 易空转 → 偏好 async</text>
+  <text class="lbl-sm" x="20" y="350">脚本示例：run_pyrodash4b_swe_offload_*_async_agents.sh 等</text>
+  </svg></div>
+</section>
+
+<section class="slide" data-title="推理流程">
+  <div class="eyebrow">Infer</div>
+  <h2>推理 / Eval：三条路径</h2>
+  <div class="diagram"><svg viewBox="0 0 860 280" xmlns="http://www.w3.org/2000/svg">
+  <defs><marker id="inf" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#0b6e6a"/></marker></defs>
+  <text class="title" x="20" y="22">训练中 eval vs 离线 traj dump</text>
+  <rect x="30" y="55" width="240" height="100" fill="#f7fafc" stroke="#c5d0db"/>
+  <text class="lbl" x="45" y="80">训练中 evaluation=True</text>
+  <text class="lbl-sm" x="45" y="100">同一 generate()</text>
+  <text class="lbl-sm" x="45" y="118">记 solved；不做 offload shaping</text>
+  <text class="lbl-sm" x="45" y="136">进 eval metrics</text>
+  <rect x="310" y="55" width="240" height="100" fill="#d5ebe9" stroke="#0b6e6a"/>
+  <text class="lbl" x="325" y="80">离线 ScaleSWE</text>
+  <text class="lbl-sm" x="325" y="100">infer_cc_offload_traj.py</text>
+  <text class="lbl-sm" x="325" y="118">无 Ray/Megatron</text>
+  <text class="lbl-sm" x="325" y="136">CC→Adapter→远端 LLM</text>
+  <rect x="590" y="55" width="240" height="100" fill="#eef3f7" stroke="#c5d0db"/>
+  <text class="lbl" x="605" y="80">离线 Tmax</text>
+  <text class="lbl-sm" x="605" y="100">infer_cc_tmax_traj.py</text>
+  <text class="lbl-sm" x="605" y="118">protocol=tmax 验题</text>
+  <text class="lbl-sm" x="605" y="136">写 turns/summary/patch</text>
+  <text class="lbl-sm" x="30" y="195">本讲轨迹样例：infer_cc_glm_20260728_141118 · infer_cc_tmax_20260807_162106</text>
+  <text class="lbl-sm" x="30" y="215">对照 run：infer_cc_dsv4flash_20260806_141118</text>
+  <text class="lbl-sm" x="30" y="245">产出：runs/&lt;run&gt;/iXXX_*/turns.jsonl · summary.json · patch.diff</text>
+  </svg></div>
+  <table class="cmp mini-table">
+    <tr><th>模式</th><th>入口</th><th>与 train 差异</th></tr>
+    <tr><td>训练中 eval</td><td class="mono">generate(..., evaluation=True)</td><td>记 solved；不做 offload shaping</td></tr>
+    <tr><td>离线 ScaleSWE</td><td class="mono">infer_cc_offload_traj.py</td><td>无训练环；可换远端 LLM</td></tr>
+    <tr><td>离线 Tmax</td><td class="mono">infer_cc_tmax_traj.py</td><td>同结构，protocol=tmax</td></tr>
+  </table>
+</section>
+
+<section class="slide" data-title="设计取舍">
+  <div class="eyebrow">Design</div>
+  <h2>工程与算法取舍（为什么这样选）</h2>
+  <table class="cmp mini-table">
+    <tr><th>取舍</th><th>选择</th><th>动机</th></tr>
+    <tr><td>Agent 边界</td><td>黑盒 harness + 白盒 Adapter</td><td>复用成熟 CLI，不重写 agent</td></tr>
+    <tr><td>验题</td><td>新箱 / 延期 test_sh</td><td>防作弊（改测、偷看）</td></tr>
+    <tr><td>空 patch</td><td>强制 0</td><td>避免「空改动」骗分</td></tr>
+    <tr><td>Offload</td><td>think-gated</td><td>限制乱求助；可记成本</td></tr>
+    <tr><td>失败信号</td><td>help-seeking α</td><td>缓解全 0 塌缩</td></tr>
+    <tr><td>Credit</td><td>Turn-painted GRPO</td><td>无额外采样协议成本</td></tr>
+    <tr><td>Fan-out</td><td>全额 + mask 归一</td><td>保信号、控放大</td></tr>
+    <tr><td>训练调度</td><td>Async</td><td>扛 agent 长尾 latency</td></tr>
+    <tr><td>GiGPO</td><td>方案+钩子</td><td>先介绍；聚类训练另议</td></tr>
+    <tr><td>指标</td><td>分开 pass@1 / mean_reward</td><td>强模型上界 ≠ SLM RL</td></tr>
+  </table>
+</section>
+
+<section class="slide" data-title="结果">
+  <div class="eyebrow">Results</div>
+  <h2>评测结果：SWE-bench Verified · Terminal-Bench</h2>
+  <p class="muted">正确数 / 正确率；调用率 = 触发 LLM offload 的题数；token / cost 为汇总口径。表可左右滑动。</p>
+
+  <h3 class="result-h3">SWE-bench Verified（500）</h3>
+  <div class="table-scroll">
+    <table class="cmp">
+      <tr>
+        <th>模型</th><th>正确数</th><th>调用率</th><th>调用次数</th><th>总轮次</th>
+        <th>SLM prompt</th><th>SLM output</th><th>LLM input</th><th>LLM output</th>
+        <th>slm_cost</th><th>llm_cost</th><th>cost_sum</th>
+      </tr>
+      <tr>
+        <td>deeepseek_all_nolimit_maxthinking(dp)</td>
+        <td>417/500</td><td>500/500</td><td>21961</td><td>21961</td>
+        <td>0</td><td>0</td><td>589486490</td><td>8674872</td>
+        <td>0</td><td>270.91</td><td>270.91</td>
+      </tr>
+      <tr class="hl">
+        <td>0731_112705/iter_0000049(dp)</td>
+        <td>416/500</td><td>500/500</td><td>23608</td><td>24217</td>
+        <td>545788086</td><td>881959</td><td>568196996</td><td>21484004</td>
+        <td>16.63</td><td>278.58</td><td>295.21</td>
+      </tr>
+      <tr>
+        <td>0811_182147/iter_0000059(dp)</td>
+        <td>386/500</td><td>500/500</td><td>17191</td><td>17218</td>
+        <td>289726335</td><td>251352</td><td>313243408</td><td>14807021</td>
+        <td>8.76</td><td>157.52</td><td>166.28</td>
+      </tr>
+      <tr>
+        <td>0813_130742/iter_0000059(dp)</td>
+        <td>383/500</td><td>500/500</td><td>19401</td><td>19537</td>
+        <td>359236820</td><td>235834</td><td>375196560</td><td>14104874</td>
+        <td>10.85</td><td>183.85</td><td>194.7</td>
+      </tr>
+      <tr>
+        <td>0813_130742/iter_0000079(dp)</td>
+        <td>399/500</td><td>500/500</td><td>20811</td><td>20864</td>
+        <td>398795625</td><td>94352</td><td>423858910</td><td>12236364</td>
+        <td>11.99</td><td>202.77</td><td>214.76</td>
+      </tr>
+      <tr>
+        <td>qwen3.5_4b_all_nnnnnew</td>
+        <td>208/500</td><td>0/500</td><td>0</td><td>61642</td>
+        <td>2748956978</td><td>19336449</td><td>0</td><td>0</td>
+        <td>88.08</td><td>0</td><td>88.08</td>
+      </tr>
+    </table>
+  </div>
+
+  <h3 class="result-h3">Terminal-Bench</h3>
+  <div class="table-scroll">
+    <table class="cmp">
+      <tr>
+        <th>模型</th><th>正确率</th><th>调用率</th><th>调用次数</th><th>总轮次</th>
+        <th>SLM prompt</th><th>SLM output</th><th>LLM input</th><th>LLM output</th>
+        <th>slm_cost</th><th>llm_cost</th><th>cost_sum</th>
+      </tr>
+      <tr>
+        <td>deepseek-v4-flash-0731-tb2(dp)</td>
+        <td>58.43%</td><td>89/89</td><td>3266</td><td>3266</td>
+        <td>0</td><td>0</td><td>154757688</td><td>3745024</td>
+        <td>0</td><td>73.07</td><td>73.07</td>
+      </tr>
+      <tr>
+        <td>deepseek-v4-flash-0731-tb21(dp)</td>
+        <td>59.55%</td><td>89/89</td><td>3124</td><td>3124</td>
+        <td>0</td><td>0</td><td>158526523</td><td>4616722</td>
+        <td>0</td><td>75.89</td><td>75.89</td>
+      </tr>
+      <tr>
+        <td>0806_141324/iter_0000049(dp)</td>
+        <td>43.82%</td><td>89/89</td><td>2435</td><td>3049</td>
+        <td>54511671</td><td>1086090</td><td>70588212</td><td>2426311</td>
+        <td>1.95</td><td>34.29</td><td>36.24</td>
+      </tr>
+      <tr>
+        <td>qwen3.5-4b-tb2</td>
+        <td>8.99%</td><td>0/89</td><td>0</td><td>7591</td>
+        <td>383441656</td><td>4524886</td><td>0</td><td>0</td>
+        <td>12.82</td><td>0</td><td>12.82</td>
+      </tr>
+      <tr>
+        <td>qwen3.5-4b-tb2-thinking_0816</td>
+        <td>15.73%</td><td>0/89</td><td>0</td><td>5863</td>
+        <td>243273222</td><td>1316917</td><td>0</td><td>0</td>
+        <td>7.68</td><td>0</td><td>7.68</td>
+      </tr>
+      <tr>
+        <td>deepseek-v4-flash-0731-tb2-thinkmax(dp)_0816</td>
+        <td>65.17%</td><td>89/89</td><td>3523</td><td>3523</td>
+        <td>0</td><td>0</td><td>255762613</td><td>6729832</td>
+        <td>0</td><td>121.49</td><td>121.49</td>
+      </tr>
+      <tr class="hl">
+        <td>0731_112705/iter_0000049(dp)_0816</td>
+        <td>39.33%</td><td>86/89</td><td>2180</td><td>2184</td>
+        <td>51738714</td><td>1214579</td><td>57427510</td><td>2323347</td>
+        <td>1.9</td><td>28.36</td><td>30.26</td>
+      </tr>
+      <tr>
+        <td>0811_182147/iter_0000059(dp)_0816</td>
+        <td>41.57%</td><td>87/89</td><td>2062</td><td>2064</td>
+        <td>46966507</td><td>1984497</td><td>57163696</td><td>2177151</td>
+        <td>1.98</td><td>28.05</td><td>30.03</td>
+      </tr>
+      <tr>
+        <td>0813_130742/iter_0000059(dp)_0816</td>
+        <td>42.70%</td><td>87/89</td><td>2249</td><td>2249</td>
+        <td>51468273</td><td>2392856</td><td>56431688</td><td>1869309</td>
+        <td>2.24</td><td>27.32</td><td>29.55</td>
+      </tr>
+    </table>
+  </div>
+  <p class="footnote">(dp) = 带 LLM offload；无 (dp) / 调用率 0 = 纯 SLM。高亮行为同系列 checkpoint 对照锚点。</p>
+</section>
+
+<section class="slide" data-title="收尾">
+  <div class="eyebrow">Takeaway</div>
+  <h2>带走五句话</h2>
+  <ol class="dense" style="font-size:1.05rem;line-height:1.75">
+    <li><strong>协议决定验题</strong>：ScaleSWE 新箱 patch vs Tmax 同箱终态，防作弊点不同。</li>
+    <li><strong>Credit 是多层的</strong>：结局 shaping → turn paint → fan-out 归一 → loss_mask。</li>
+    <li><strong>对照清接口</strong>：Turn-paint（落地）· GiGPO （anchor state）· GiGPO-diff（方案）· ARPO（熵分支）。</li>
+    <li><strong>口径分开</strong>：强模型 harness pass@1 ≠ RL 训练 mean_reward。</li>
+    <li><strong>实现真相</strong>：fan-out 全额 reward + mask 归一；以代码为准，不以旧 README 为准。</li>
+  </ol>
+  <p class="lede" style="margin-top:1.3rem">文件：<span class="mono">examples/coding_agent_rl/share/coding_agent_rl.html</span></p>
+</section>
+
+    </div>
+    <div class="content-nav">
+      <button type="button" id="prevBtn">上一页</button>
+      <div class="progress"><i id="prog"></i></div>
+      <span id="pageLabel">01 / 01</span>
+      <button type="button" id="nextBtn">下一页</button>
+    </div>
+  </div>
+</div>
+<script>
+
+const TRAJ_DATA = [{"label": "ScaleSWE 成功（短）", "run": "infer_cc_glm_20260728_141118", "dir": "i041_auth0_auth0-python_pr122", "protocol": "scaleswe", "instance_id": "auth0_auth0-python_pr122", "agent": null, "reward": 1.0, "turns": 11, "tool_use_turns": 10, "elapsed_sec": 210.083, "patch_chars": 1781, "eval_applied": true, "dashscope_model": "glm-5.2-fp8", "mode": "glm_only", "prompt": "Read PROBLEM_STATEMENT.md and fix the issue. Use tools as needed.", "patch_preview": "diff --git a/auth0/v3/management/connections.py b/auth0/v3/management/connections.py\nindex 95cc4c4..5cad10c 100644\n--- a/auth0/v3/management/connections.py\n+++ b/auth0/v3/management/connections.py\n@@ -92,6 +92,17 @@ class Connections(object):\n \n         return self.client.delete(self._url(id))\n \n+    def delete_user_by_email(self, id, email):\n+        \"\"\"Deletes a specified connection user by its email.\n+\n+        Args:\n+           id (str): The id of the connection (must be a database connection).\n+\n+           email (str): The email of the user to delete.\n+        \"\"\"\n+        url = self._url('%s/users' % id)\n+        return self.client.delete(url, params={'email': email})\n+\n     def update(self, id, body):\n         \"\"\"Modifies a connection.\n \ndiff --git a/auth0/v3/test/management/test_connections.py b/auth0/v3/test/management/test_connections.py\nindex 2b9a829..0647133 100644\n--- a/auth0/v3/test/management/test_connections.py\n+++ b/auth0/v3/test/management/test_connections.py\n@@ -113,6 +113,19 @@ class TestConnection(unittest.TestCase):\n             'https://domain/api/v2/connections/this-id'\n         )\n \n+    @mock.patch('auth0.v3.management.connections.RestClient')\n+    def tes\n…", "turn_timeline": [{"turn_index": 0, "stop_reason": "tool_use", "tools": [{"name": "Read", "args_preview": "{\"file_path\": \"/workspace/auth0-python/PROBLEM_STATEMENT.md\"}"}], "reasoning": "Let me start by reading the PROBLEM_STATEMENT.md file to understand what issue I need to fix.", "elapsed_sec": 1.015, "prompt_tokens": 18620, "completion_tokens": 42}, {"turn_index": 1, "stop_reason": "tool_use", "tools": [{"name": "Bash", "args_preview": "{\"command\": \"find /workspace/auth0-python -type f -name \\\"*.py\\\" | grep -i connection | he…"}], "reasoning": "Let me explore the repository structure to understand the codebase and find the Connections class.", "elapsed_sec": 2.679, "prompt_tokens": 18904, "completion_tokens": 61}, {"turn_index": 2, "stop_reason": "tool_use", "tools": [{"name": "Read", "args_preview": "{\"file_path\": \"/workspace/auth0-python/auth0/v3/management/connections.py\"}"}], "reasoning": "", "elapsed_sec": 0.564, "prompt_tokens": 18997, "completion_tokens": 24}, {"turn_index": 3, "stop_reason": "tool_use", "tools": [{"name": "Read", "args_preview": "{\"file_path\": \"/workspace/auth0-python/auth0/v3/test/management/test_connections.py\"}"}], "reasoning": "Now let me look at the existing test file to understand the testing conventions.", "elapsed_sec": 1.831, "prompt_tokens": 19941, "completion_tokens": 40}, {"turn_index": 4, "stop_reason": "tool_use", "tools": [{"name": "Read", "args_preview": "{\"file_path\": \"/workspace/auth0-python/auth0/v3/management/rest.py\"}"}], "reasoning": "Now let me look at the RestClient to understand the `delete` method signature and how params can be passed.", "elapsed_sec": 1.253, "prompt_tokens": 21254, "completion_tokens": 45}, {"turn_index": 5, "stop_reason": "tool_use", "tools": [{"name": "Bash", "args_preview": "{\"command\": \"ls /workspace/auth0-python/auth0/v3/management/\", \"description\": \"List manage…"}], "reasoning": "Now I understand the structure. The `delete` method of RestClient accepts a `params` argument. So I need to:\n\n1. Add a `delete_user_by_email(self, id, email)` method to the `Connections` class.\n2. The endpoint is `DELETE…", "elapsed_sec": 6.571, "prompt_tokens": 22635, "completion_tokens": 253}, {"turn_index": 6, "stop_reason": "tool_use", "tools": [{"name": "Read", "args_preview": "{\"file_path\": \"/workspace/auth0-python/auth0/v3/management/users.py\"}"}], "reasoning": "", "elapsed_sec": 0.594, "prompt_tokens": 22968, "completion_tokens": 23}, {"turn_index": 7, "stop_reason": "tool_use", "tools": [{"name": "Edit", "args_preview": "{\"replace_all\": false, \"file_path\": \"/workspace/auth0-python/auth0/v3/management/connectio…"}], "reasoning": "Now I understand the patterns. Let me implement the `delete_user_by_email` method in the `Connections` class. I'll add it after the `delete` method.\n\nThe URL should be `https://{domain}/api/v2/connections/{id}/users` and…", "elapsed_sec": 7.489, "prompt_tokens": 24813, "completion_tokens": 303}, {"turn_index": 8, "stop_reason": "tool_use", "tools": [{"name": "Edit", "args_preview": "{\"replace_all\": false, \"file_path\": \"/workspace/auth0-python/auth0/v3/test/management/test…"}], "reasoning": "Now let me add a test for the new method, following the conventions of the existing tests.", "elapsed_sec": 7.851, "prompt_tokens": 25157, "completion_tokens": 267}, {"turn_index": 9, "stop_reason": "tool_use", "tools": [{"name": "Bash", "args_preview": "{\"command\": \"python -m pytest auth0/v3/test/management/test_connections.py -v 2>&1 | tail …"}], "reasoning": "The reminder is about task tools. This task is small and nearly done - I've made the edits. Let me run the tests to verify rather than create tasks. The task is straightforward (add a method + test), so task tracking isn…", "elapsed_sec": 4.891, "prompt_tokens": 25166, "completion_tokens": 129}, {"turn_index": 10, "stop_reason": "end_turn", "tools": [], "reasoning": "All 6 tests pass, including the new `test_delete_user_by_email`.\n\n## Summary\n\nI added the `delete_user_by_email` method to the `Connections` management client per the feature request in `PROBLEM_STATEMENT.md`.\n\n**`auth0/…", "elapsed_sec": 9.892, "prompt_tokens": 25527, "completion_tokens": 276}]}, {"label": "ScaleSWE 失败（空 patch）", "run": "infer_cc_glm_20260728_141118", "dir": "i001_beetbox_beets_pr3661", "protocol": "scaleswe", "instance_id": "beetbox_beets_pr3661", "agent": null, "reward": 0.0, "turns": 10, "tool_use_turns": 8, "elapsed_sec": 427.113, "patch_chars": 0, "eval_applied": false, "dashscope_model": "glm-5.2-fp8", "mode": "glm_only", "prompt": "Read PROBLEM_STATEMENT.md and fix the issue. Use tools as needed.", "patch_preview": null, "turn_timeline": [{"turn_index": 0, "stop_reason": "tool_use", "tools": [{"name": "Read", "args_preview": "{\"file_path\": \"/workspace/beets/PROBLEM_STATEMENT.md\"}"}], "reasoning": "Let me start by reading the PROBLEM_STATEMENT.md file to understand the issue I need to fix.", "elapsed_sec": 2.531, "prompt_tokens": 18619, "completion_tokens": 54}, {"turn_index": 1, "stop_reason": "tool_use", "tools": [{"name": "Bash", "args_preview": "{\"command\": \"ls -la /workspace/beets/\", \"description\": \"List files in beets root directory…"}, {"name": "Read", "args_preview": "{\"file_path\": \"/workspace/beets/setup.py\"}"}, {"name": "Read", "args_preview": "{\"file_path\": \"/workspace/beets/tox.ini\"}"}], "reasoning": "Let me understand the project structure first. This is the `beets` project. I need to:\n\n1. Switch from `nose` to `pytest` as the primary test runner.\n2. Move test dependencies from `tests_require` in `setup.py` to `extra…", "elapsed_sec": 7.187, "prompt_tokens": 18952, "completion_tokens": 204}, {"turn_index": 2, "stop_reason": "tool_use", "tools": [{"name": "Read", "args_preview": "{\"file_path\": \"/workspace/beets/.coveragerc\"}"}, {"name": "Read", "args_preview": "{\"file_path\": \"/workspace/beets/setup.cfg\"}"}, {"name": "Read", "args_preview": "{\"file_path\": \"/workspace/beets/appveyor.yml\"}"}, {"name": "Read", "args_preview": "{\"file_path\": \"/workspace/beets/codecov.yml\"}"}, {"name": "Bash", "args_preview": "{\"command\": \"find /workspace/beets/.github -type f | head -50 && echo \\\"---TEST DIR---\\\" &…"}], "reasoning": "Let me continue exploring the relevant configuration files. Let me look at:\n- `.coveragerc`\n- `setup.cfg`\n- `.github` (CI workflows)\n- `appveyor.yml`\n- `test/` directory structure, especially `test/testall.py`\n- `codecov…", "elapsed_sec": 8.116, "prompt_tokens": 22186, "completion_tokens": 192}, {"turn_index": 3, "stop_reason": "tool_use", "tools": [{"name": "Bash", "args_preview": "{\"command\": \"cd /workspace/beets && echo \\\"===testall===\\\" && cat test/testall.py 2>/dev/n…"}, {"name": "Read", "args_preview": "{\"file_path\": \"/workspace/beets/.github/workflows/ci.yaml\"}"}, {"name": "Read", "args_preview": "{\"file_path\": \"/workspace/beets/.github/workflows/integration_test.yaml\"}"}], "reasoning": "Let me continue exploring the project. I need to understand:\n1. The test setup (`test/testall.py`)\n2. The CI workflows\n3. How tests use nose (e.g., nose tools, `nose.SkipTest`, etc.)\n\nLet me look at the test files for no…", "elapsed_sec": 5.183, "prompt_tokens": 24700, "completion_tokens": 205}, {"turn_index": 4, "stop_reason": "tool_use", "tools": [{"name": "Bash", "args_preview": "{\"command\": \"echo \\\"===nose imports/usages in test===\\\" && grep -rn \\\"import nose\\\\|from n…"}], "reasoning": "Now let me search for nose usage across the test files - things like `nose.SkipTest`, `nose.tools`, `@nottest`, etc.", "elapsed_sec": 6.231, "prompt_tokens": 26476, "completion_tokens": 230}, {"turn_index": 5, "stop_reason": "tool_use", "tools": [{"name": "Bash", "args_preview": "{\"command\": \"echo \\\"===gstplayer nose ref===\\\" && grep -n \\\"nose\\\" beetsplug/bpd/gstplayer…"}, {"name": "Bash", "args_preview": "{\"command\": \"echo \\\"===unittest usages===\\\" && grep -rln \\\"unittest\\\" test/ | head; echo \\…"}], "reasoning": "Interesting - so the test files actually use `unittest.SkipTest`, not nose's. Let me check the bpd/gstplayer.py and _common.py references to nose, and search for `helper` usage of nose. Let me also check the helper.py fi…", "elapsed_sec": 10.937, "prompt_tokens": 26799, "completion_tokens": 435}, {"turn_index": 6, "stop_reason": "tool_use", "tools": [{"name": "Bash", "args_preview": "{\"command\": \"echo \\\"===.harness dir===\\\" && ls -la /workspace/beets/.harness/ 2>/dev/null …"}], "reasoning": "So the situation is:\n- Tests use `unittest` (not nose tools). There's no `nose.tools`, `eq_`, `ok_`, `@nottest` usage.\n- The only actual nose dependency is the test runner itself (nose commands in tox.ini) and the `[nose…", "elapsed_sec": 43.892, "prompt_tokens": 27820, "completion_tokens": 1806}, {"turn_index": 7, "stop_reason": "tool_use", "tools": [{"name": "Bash", "args_preview": "{\"command\": \"echo \\\"===trajectory first lines===\\\"; head -c 800 /workspace/beets/.harness/…"}], "reasoning": "Let me check the trajectory.jsonl to understand if there are expected changes or reference patches. This is a harness file that might contain the expected solution trajectory. Let me peek at it briefly.\n\nActually, let me…", "elapsed_sec": 10.272, "prompt_tokens": 28033, "completion_tokens": 477}, {"turn_index": 8, "stop_reason": "end_turn", "tools": [], "reasoning": "The trajectory.jsonl is just a record of my own session. Not relevant for the solution.\n\nNow I have a full understanding. Let me summarize the scope:\n\nThe tests use `unittest` (with `suite()` functions, `unittest.main(de…", "elapsed_sec": 79.003, "prompt_tokens": 28786, "completion_tokens": 4096}, {"turn_index": 9, "stop_reason": "end_turn", "tools": [], "reasoning": "Let me continue. I have a good understanding of the situation now. Let me summarize what I've found:\n\n1. **setup.py**:\n   - Has `test_suite='test.testall.suite'` (line 67) - deprecated `setup.py test` mechanism\n   - Has …", "elapsed_sec": 57.61, "prompt_tokens": 28532, "completion_tokens": 4096}]}, {"label": "Tmax 成功（短）", "run": "infer_cc_tmax_20260807_162106", "dir": "i002_task_000001_1a03ebc5", "protocol": "tmax", "instance_id": "task_000001_1a03ebc5", "agent": null, "reward": 1.0, "turns": 5, "tool_use_turns": 4, "elapsed_sec": 189.764, "patch_chars": 0, "eval_applied": true, "dashscope_model": "deepseek-v4-flash-0731", "mode": "glm_only_tmax", "prompt": "Read PROBLEM_STATEMENT.md in the current directory and resolve the task. Use tools as needed. When finished, print a one-line summary and exit.", "patch_preview": null, "turn_timeline": [{"turn_index": 0, "stop_reason": "tool_use", "tools": [{"name": "Read", "args_preview": "{\"file_path\": \"/home/user/PROBLEM_STATEMENT.md\"}"}], "reasoning": "Let me read the problem statement first.", "elapsed_sec": 1.71, "prompt_tokens": 19133, "completion_tokens": 63}, {"turn_index": 1, "stop_reason": "tool_use", "tools": [{"name": "Read", "args_preview": "{\"file_path\": \"/home/user/data.csv\"}"}], "reasoning": "", "elapsed_sec": 1.994, "prompt_tokens": 19601, "completion_tokens": 49}, {"turn_index": 2, "stop_reason": "tool_use", "tools": [{"name": "Bash", "args_preview": "{\"command\": \"cd /home/user && python3 -c \\\"\\nimport pandas as pd\\nimport numpy as np\\nfrom…"}], "reasoning": "Let me write a Python script to do the analysis.", "elapsed_sec": 11.691, "prompt_tokens": 24737, "completion_tokens": 377}, {"turn_index": 3, "stop_reason": "tool_use", "tools": [{"name": "Write", "args_preview": "{\"file_path\": \"/home/user/answer.txt\", \"content\": \"Highest correlated pair: f4, f5\\nCloses…"}], "reasoning": "", "elapsed_sec": 3.119, "prompt_tokens": 25180, "completion_tokens": 87}, {"turn_index": 4, "stop_reason": "end_turn", "tools": [], "reasoning": "Done. Analyzed `/home/user/data.csv` (Pearson correlation matrix, unscaled PCA to 2 components, Euclidean nearest-neighbor to item_0) and wrote results to `/home/user/answer.txt`:\n\n- **Highest correlated pair: f4, f5** (…", "elapsed_sec": 2.177, "prompt_tokens": 25303, "completion_tokens": 84}]}, {"label": "Tmax 失败", "run": "infer_cc_tmax_20260807_162106", "dir": "i006_task_000003_2a1af405", "protocol": "tmax", "instance_id": "task_000003_2a1af405", "agent": null, "reward": 0.0, "turns": 17, "tool_use_turns": 16, "elapsed_sec": 445.676, "patch_chars": 0, "eval_applied": true, "dashscope_model": "deepseek-v4-flash-0731", "mode": "glm_only_tmax", "prompt": "Read PROBLEM_STATEMENT.md in the current directory and resolve the task. Use tools as needed. When finished, print a one-line summary and exit.", "patch_preview": null, "turn_timeline": [{"turn_index": 0, "stop_reason": "tool_use", "tools": [{"name": "Read", "args_preview": "{\"file_path\": \"/home/user/PROBLEM_STATEMENT.md\"}"}], "reasoning": "I'll read the problem statement first.", "elapsed_sec": 1.361, "prompt_tokens": 19133, "completion_tokens": 62}, {"turn_index": 1, "stop_reason": "tool_use", "tools": [{"name": "Bash", "args_preview": "{\"command\": \"ls -la /app/ 2>&1; echo \\\"---\\\"; ls -la /home/user/ 2>&1; echo \\\"---\\\"; file …"}, {"name": "Bash", "args_preview": "{\"command\": \"which python3 pip3 ffmpeg whisper 2>&1; echo \\\"---flask/fastapi---\\\"; python3…"}], "reasoning": "I'll start by examining the environment: the audio file, the database, and available tooling.", "elapsed_sec": 9.479, "prompt_tokens": 19908, "completion_tokens": 276}, {"turn_index": 2, "stop_reason": "tool_use", "tools": [{"name": "Bash", "args_preview": "{\"command\": \"cd /app && python3 -c \\\"\\nimport sqlite3, json\\nc = sqlite3.connect('backup_c…"}, {"name": "Bash", "args_preview": "{\"command\": \"python3 -c \\\"\\ndata = open('/app/alert_019.wav','rb').read()\\nprint('len', le…"}], "reasoning": "No ffmpeg, no whisper, no flask/fastapi. Let me inspect the database and the audio file. Let me examine the audio file bytes to understand what kind of audio it is. Maybe I can install whisper. Let me first look at the d…", "elapsed_sec": 14.111, "prompt_tokens": 20573, "completion_tokens": 463}, {"turn_index": 3, "stop_reason": "tool_use", "tools": [{"name": "Bash", "args_preview": "{\"command\": \"timeout 15 pip3 install --quiet flask 2>&1 | tail -5; echo \\\"exit: $?\\\"; echo…"}], "reasoning": "The WAV is a PCM 16-bit mono audio file. There's no embedded text; it's actual speech audio. I need to transcribe it. Let me check network access and whether I can install whisper or other tools.\n\nLet me check for speech…", "elapsed_sec": 8.27, "prompt_tokens": 22509, "completion_tokens": 260}, {"turn_index": 4, "stop_reason": "tool_use", "tools": [{"name": "Bash", "args_preview": "{\"command\": \"python3 -c \\\"\\ndata=open('/app/alert_019.wav','rb').read()\\nimport struct\\n# …"}, {"name": "Bash", "args_preview": "{\"command\": \"timeout 300 pip3 install --quiet faster-whisper 2>&1 | tail -8; echo \\\"exit $…"}], "reasoning": "Network works, flask installed. Now I need to transcribe the audio. Let me install a speech-to-text tool. Options: openai-whisper (heavy, needs torch), faster-whisper, vosk, or speechrecognition. Let me try faster-whispe…", "elapsed_sec": 16.852, "prompt_tokens": 22939, "completion_tokens": 587}, {"turn_index": 5, "stop_reason": "tool_use", "tools": [{"name": "Bash", "args_preview": "{\"command\": \"cd /tmp && python3 -c \\\"\\nfrom faster_whisper import WhisperModel\\nmodel = Wh…"}], "reasoning": "faster-whisper installed. Now let me transcribe the audio with a small model.", "elapsed_sec": 4.915, "prompt_tokens": 23783, "completion_tokens": 227}, {"turn_index": 6, "stop_reason": "tool_use", "tools": [{"name": "Bash", "args_preview": "{\"command\": \"cd /tmp && python3 -c \\\"\\nfrom faster_whisper import WhisperModel\\nfor sz in …"}], "reasoning": "The transcription gives:\n- Tenant ID: \"Alpha 774\" → likely ALPHA-774 (matches DB)\n- Auth token: \"Bravo 992 secure\"\n\nHmm. Let me get more detail. \"Bravo 992 secure\" - NATO phonetics. Could the token be \"BRAVO-992\"? But \"s…", "elapsed_sec": 12.781, "prompt_tokens": 24072, "completion_tokens": 475}, {"turn_index": 7, "stop_reason": "tool_use", "tools": [{"name": "Bash", "args_preview": "{\"command\": \"cd /app && python3 -c \\\"\\nimport sqlite3\\nc=sqlite3.connect('backup_catalog.d…"}], "reasoning": "Consistent. Tenant ID = \"ALPHA-774\" → DB has \"ALPHA-774\". Token = \"Bravo 992 secure\". \n\nThe token: \"Bravo 992 secure\". The word \"secure\" might just be the end of the message (\"...to use is Bravo 992, secure\"). Or it's pa…", "elapsed_sec": 52.8, "prompt_tokens": 24635, "completion_tokens": 2788}, {"turn_index": 8, "stop_reason": "tool_use", "tools": [{"name": "Write", "args_preview": "{\"file_path\": \"/home/user/recovery_api.py\", \"content\": \"#!/usr/bin/env python3\\n\\\"\\\"\\\"\\nEm…"}], "reasoning": "Now I'll write the Flask API service.", "elapsed_sec": 24.495, "prompt_tokens": 27477, "completion_tokens": 1182}, {"turn_index": 9, "stop_reason": "tool_use", "tools": [{"name": "Write", "args_preview": "{\"file_path\": \"/home/user/recovery_api.py\", \"content\": \"#!/usr/bin/env python3\\n\\\"\\\"\\\"\\nEm…"}], "reasoning": "I made a mess in the code — there's leftover garbage code (the first grouping loop with the unreachable function). Let me rewrite cleanly.", "elapsed_sec": 28.685, "prompt_tokens": 28793, "completion_tokens": 1033}, {"turn_index": 10, "stop_reason": "tool_use", "tools": [{"name": "Bash", "args_preview": "{\"command\": \"cd /home/user && python3 -m py_compile recovery_api.py && echo \\\"compile OK\\\"…"}], "reasoning": "Now let me start the service in the background and test it.", "elapsed_sec": 2.943, "prompt_tokens": 29865, "completion_tokens": 143}, {"turn_index": 11, "stop_reason": "tool_use", "tools": [{"name": "Bash", "args_preview": "{\"command\": \"cd /home/user && python3 -c \\\"\\nimport json, urllib.request, urllib.error\\nBA…"}], "reasoning": "Service is up. Now let me run end-to-end tests covering auth, filtering, sorting, pagination, and the JSON schema.", "elapsed_sec": 7.539, "prompt_tokens": 30123, "completion_tokens": 339}, {"turn_index": 12, "stop_reason": "tool_use", "tools": [{"name": "Bash", "args_preview": "{\"command\": \"python3 -c \\\"\\nimport json, urllib.request\\nBASE='http://127.0.0.1:8080/api/b…"}], "reasoning": "Sorting works: pg_2 (2023-10-03) before pg_1 (2023-10-01), mg_1 (2023-10-02). Schema correct. Now test pagination and other tenant.", "elapsed_sec": 8.343, "prompt_tokens": 30711, "completion_tokens": 492}, {"turn_index": 13, "stop_reason": "tool_use", "tools": [{"name": "Bash", "args_preview": "{\"command\": \"python3 -c \\\"\\nimport json, urllib.request, urllib.error\\nBASE='http://127.0.…"}], "reasoning": "Import ordering bug in my test script only. Let me fix it.", "elapsed_sec": 7.036, "prompt_tokens": 31268, "completion_tokens": 423}, {"turn_index": 14, "stop_reason": "tool_use", "tools": [{"name": "Write", "args_preview": "{\"file_path\": \"/home/user/service_ready.txt\", \"content\": \"READY\"}"}], "reasoning": "All tests pass:\n- Auth: no-auth 401, wrong token 401, correct token 200\n- BETA-111 works (size_mb 9.54 = 10000000/1048576 = 9.5367... = 9.54 correct)\n- Pagination: page1 limit2 returns 2 records (pg_2, mg_1), page2 retur…", "elapsed_sec": 5.987, "prompt_tokens": 31969, "completion_tokens": 301}, {"turn_index": 15, "stop_reason": "tool_use", "tools": [{"name": "Bash", "args_preview": "{\"command\": \"python3 -c \\\"\\nimport urllib.request\\nr=urllib.request.urlopen('http://127.0.…"}], "reasoning": "", "elapsed_sec": 5.629, "prompt_tokens": 32308, "completion_tokens": 178}, {"turn_index": 16, "stop_reason": "end_turn", "tools": [], "reasoning": "The service is confirmed running on port 8080 (an unauthenticated request correctly returns 401), and `/home/user/service_ready.txt` contains `READY`.\n\n## Summary\n\nBuilt and launched a Flask recovery API on `0.0.0.0:8080…", "elapsed_sec": 10.688, "prompt_tokens": 32752, "completion_tokens": 318}]}];
+
+const AGENT_RATES = {
+  scaleswe: [
+    {name:'pi', pct:85.6, n:'507/592'},
+    {name:'miniswe', pct:78.5, n:'1225/1560'},
+    {name:'claude_code', pct:78.9, n:'1042/1321'},
+    {name:'opencode', pct:73.1, n:'1217/1664'},
+  ],
+  tmax: [
+    {name:'pi', pct:90.4, n:'723/800'},
+    {name:'miniswe', pct:91.8, n:'651/709'},
+    {name:'claude_code', pct:84.7, n:'766/904'},
+    {name:'opencode', pct:79.2, n:'902/1139'},
+  ],
+};
+
+const slides = [...document.querySelectorAll('.slide')];
+const sideNav = document.getElementById('sideNav');
+let idx = 0;
+
+function show(i) {
+  idx = Math.max(0, Math.min(slides.length - 1, i));
+  slides.forEach((s, j) => s.classList.toggle('active', j === idx));
+  document.getElementById('prog').style.width = ((idx + 1) / slides.length * 100) + '%';
+  document.getElementById('pageLabel').textContent =
+    String(idx + 1).padStart(2,'0') + ' / ' + String(slides.length).padStart(2,'0');
+  sideNav.querySelectorAll('a').forEach((a, j) => a.classList.toggle('active', j === idx));
+  const active = sideNav.querySelector('a.active');
+  if (active) active.scrollIntoView({ block: 'nearest' });
+  history.replaceState(null, '', '#' + (idx + 1));
+  closeMenu();
+}
+
+function buildSideNav() {
+  sideNav.innerHTML = '';
+  slides.forEach((s, i) => {
+    const a = document.createElement('a');
+    a.href = '#' + (i + 1);
+    a.innerHTML = '<span class="n">' + String(i + 1).padStart(2,'0') + '</span><span>' +
+      (s.dataset.title || ('Slide ' + (i + 1))) + '</span>';
+    a.addEventListener('click', (e) => { e.preventDefault(); show(i); });
+    sideNav.appendChild(a);
+  });
+}
+
+function renderBars(el, rows) {
+  el.innerHTML = rows.map(r => `
+    <div class="bar-row">
+      <span class="mono">${r.name}</span>
+      <div class="bar-track"><div class="bar-fill" style="width:${r.pct}%"></div></div>
+      <span class="muted mono">${r.pct}% <small>(${r.n})</small></span>
+    </div>`).join('');
+}
+
+const TRAJ_NOTES = [
+  {
+    title: 'ScaleSWE 成功 · auth0…pr122',
+    bullets: [
+      'Read PROBLEM → find/Read Connections → RestClient',
+      'Edit API + 单测 → pytest 绿 → 新箱 grading',
+      '工具模式：探索短、编辑集中 —— 适合 turn residual',
+    ],
+    takeaway: '短成功轨迹：结局信号清晰，turn paint 主要区分探索 turn 与有效 Edit。',
+  },
+  {
+    title: 'ScaleSWE 失败 · 空 patch',
+    bullets: [
+      '大量 Read/Bash，未形成可 apply diff',
+      '空 patch → solved=0；help-seeking 才可能有 α',
+      '长探索无落盘：纯结局 GRPO 时组内接近全 0',
+    ],
+    takeaway: '空 patch 失败是 ScaleSWE 的典型压力点 —— 需要 α / 跨 traj 相对补信号。',
+  },
+  {
+    title: 'Tmax 成功 · task_000001…',
+    bullets: [
+      '读题 → 分析 data.csv → Write answer.txt',
+      '同箱延期跑 test_sh',
+      '终态任务：git diff 对 credit 帮助有限',
+    ],
+    takeaway: 'Tmax 成功短轨迹：credit 对象是操作序列而非 patch；GiGPO-diff 适配性较弱。',
+  },
+  {
+    title: 'Tmax 失败 · 长轨迹',
+    bullets: [
+      '局部看起来「很努力」，终态仍错',
+      '若只广播 0：努力 turn 与无效 turn 无区分',
+      '装依赖 / 写服务等中间步可能有假阳性「进展感」',
+    ],
+    takeaway: '失败长轨迹占多数时，纯结局 GRPO 稀疏；help-seeking / turn paint / GiGPO 之一补细粒度。',
+  },
+];
+
+function renderTraj(i) {
+  const t = TRAJ_DATA[i];
+  if (!t) return;
+  document.querySelectorAll('#trajBtns button').forEach((b, j) => b.classList.toggle('active', j === i));
+  document.getElementById('trajMeta').innerHTML = `
+    <span class="tag">${t.protocol}</span>
+    <span class="tag ${Number(t.reward)===1?'good':'bad'}">reward=${t.reward}</span>
+    <span>${t.instance_id}</span>
+    <span>${t.turns} turns · ${Number(t.elapsed_sec||0).toFixed(0)}s</span>
+    <span class="mono">${t.run}</span>`;
+  const note = TRAJ_NOTES[i] || { title: t.label, bullets: [], takeaway: '' };
+  const ok = Number(t.reward) === 1;
+  document.getElementById('trajNote').innerHTML = `
+    <h3>${escapeHtml(note.title)}</h3>
+    <p><span class="tag ${ok?'good':'bad'}">reward=${t.reward}</span>
+      ${t.turns} turns · ~${Number(t.elapsed_sec||0).toFixed(0)}s
+      ${t.patch_chars ? ' · patch≈' + t.patch_chars : ''}</p>
+    <ul class="dense">${note.bullets.map(b => `<li>${escapeHtml(b)}</li>`).join('')}</ul>
+    <div class="note-takeaway"><div class="callout-title">解读</div>${escapeHtml(note.takeaway)}</div>`;
+  document.getElementById('trajTimeline').innerHTML = (t.turn_timeline || []).map(turn => {
+    const tools = (turn.tools || []).map(x =>
+      `<span class="tool-chip">${escapeHtml(x.name)}${x.args_preview ? ': ' + escapeHtml(x.args_preview) : ''}</span>`
+    ).join('') || '<span class="muted">（无 tool）</span>';
+    return `<div class="turn"><div class="turn-idx">#${turn.turn_index}</div><div>
+      <div>${tools}</div>
+      <div class="muted" style="margin-top:0.25rem;font-size:0.9rem">${escapeHtml(turn.reasoning || '')}</div>
+    </div></div>`;
+  }).join('');
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function initTraj() {
+  const btns = document.getElementById('trajBtns');
+  TRAJ_DATA.forEach((t, i) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = t.label;
+    b.addEventListener('click', () => renderTraj(i));
+    btns.appendChild(b);
+  });
+  renderTraj(0);
+}
+
+function openMenu() {
+  document.getElementById('sidebar').classList.add('open');
+  document.getElementById('backdrop').classList.add('show');
+}
+function closeMenu() {
+  document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('backdrop').classList.remove('show');
+}
+
+document.getElementById('prevBtn').onclick = () => show(idx - 1);
+document.getElementById('nextBtn').onclick = () => show(idx + 1);
+document.getElementById('menuBtn').onclick = openMenu;
+document.getElementById('backdrop').onclick = closeMenu;
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowRight' || e.key === 'PageDown') { e.preventDefault(); show(idx + 1); }
+  if (e.key === 'ArrowLeft' || e.key === 'PageUp') { e.preventDefault(); show(idx - 1); }
+  if (e.key === 'Home') show(0);
+  if (e.key === 'End') show(slides.length - 1);
+});
+
+buildSideNav();
+renderBars(document.getElementById('barsScaleswe'), AGENT_RATES.scaleswe);
+renderBars(document.getElementById('barsTmax'), AGENT_RATES.tmax);
+initTraj();
+const hash = parseInt((location.hash || '#1').slice(1), 10);
+show(Number.isFinite(hash) && hash > 0 ? hash - 1 : 0);
+
+</script>
+</body>
+</html>

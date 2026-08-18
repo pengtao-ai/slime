@@ -1,0 +1,169 @@
+{
+  "label": "ScaleSWE 成功（短）",
+  "run": "infer_cc_glm_20260728_141118",
+  "dir": "i041_auth0_auth0-python_pr122",
+  "protocol": "scaleswe",
+  "instance_id": "auth0_auth0-python_pr122",
+  "agent": null,
+  "reward": 1.0,
+  "turns": 11,
+  "tool_use_turns": 10,
+  "elapsed_sec": 210.083,
+  "patch_chars": 1781,
+  "eval_applied": true,
+  "dashscope_model": "glm-5.2-fp8",
+  "mode": "glm_only",
+  "prompt": "Read PROBLEM_STATEMENT.md and fix the issue. Use tools as needed.",
+  "patch_preview": "diff --git a/auth0/v3/management/connections.py b/auth0/v3/management/connections.py\nindex 95cc4c4..5cad10c 100644\n--- a/auth0/v3/management/connections.py\n+++ b/auth0/v3/management/connections.py\n@@ -92,6 +92,17 @@ class Connections(object):\n \n         return self.client.delete(self._url(id))\n \n+    def delete_user_by_email(self, id, email):\n+        \"\"\"Deletes a specified connection user by its email.\n+\n+        Args:\n+           id (str): The id of the connection (must be a database connection).\n+\n+           email (str): The email of the user to delete.\n+        \"\"\"\n+        url = self._url('%s/users' % id)\n+        return self.client.delete(url, params={'email': email})\n+\n     def update(self, id, body):\n         \"\"\"Modifies a connection.\n \ndiff --git a/auth0/v3/test/management/test_connections.py b/auth0/v3/test/management/test_connections.py\nindex 2b9a829..0647133 100644\n--- a/auth0/v3/test/management/test_connections.py\n+++ b/auth0/v3/test/management/test_connections.py\n@@ -113,6 +113,19 @@ class TestConnection(unittest.TestCase):\n             'https://domain/api/v2/connections/this-id'\n         )\n \n+    @mock.patch('auth0.v3.management.connections.RestClient')\n+    def test_delete_user_by_email(self, mock_rc):\n+        mock_instance = mock_rc.return_value\n+        mock_instance.delete.return_value = {}\n+\n+        c = Connections(domain='domain', token='jwttoken')\n+        c.delete_user_by_email('this-id', 'user@domain.com')\n+\n+        mock_instance.delete.assert_called_with(\n+            'https://domain/api/v2/connections/this-id/users',\n…",
+  "turn_timeline": [
+    {
+      "turn_index": 0,
+      "stop_reason": "tool_use",
+      "tools": [
+        {
+          "name": "Read",
+          "args_preview": "{\"file_path\": \"/workspace/auth0-python/PROBLEM_STATEMENT.md\"}"
+        }
+      ],
+      "reasoning": "Let me start by reading the PROBLEM_STATEMENT.md file to understand what issue I need to fix.",
+      "elapsed_sec": 1.015,
+      "prompt_tokens": 18620,
+      "completion_tokens": 42
+    },
+    {
+      "turn_index": 1,
+      "stop_reason": "tool_use",
+      "tools": [
+        {
+          "name": "Bash",
+          "args_preview": "{\"command\": \"find /workspace/auth0-python -type f -name \\\"*.py\\\" | grep -i connection | head -20\", \"description\": \"Find "
+        }
+      ],
+      "reasoning": "Let me explore the repository structure to understand the codebase and find the Connections class.",
+      "elapsed_sec": 2.679,
+      "prompt_tokens": 18904,
+      "completion_tokens": 61
+    },
+    {
+      "turn_index": 2,
+      "stop_reason": "tool_use",
+      "tools": [
+        {
+          "name": "Read",
+          "args_preview": "{\"file_path\": \"/workspace/auth0-python/auth0/v3/management/connections.py\"}"
+        }
+      ],
+      "reasoning": "",
+      "elapsed_sec": 0.564,
+      "prompt_tokens": 18997,
+      "completion_tokens": 24
+    },
+    {
+      "turn_index": 3,
+      "stop_reason": "tool_use",
+      "tools": [
+        {
+          "name": "Read",
+          "args_preview": "{\"file_path\": \"/workspace/auth0-python/auth0/v3/test/management/test_connections.py\"}"
+        }
+      ],
+      "reasoning": "Now let me look at the existing test file to understand the testing conventions.",
+      "elapsed_sec": 1.831,
+      "prompt_tokens": 19941,
+      "completion_tokens": 40
+    },
+    {
+      "turn_index": 4,
+      "stop_reason": "tool_use",
+      "tools": [
+        {
+          "name": "Read",
+          "args_preview": "{\"file_path\": \"/workspace/auth0-python/auth0/v3/management/rest.py\"}"
+        }
+      ],
+      "reasoning": "Now let me look at the RestClient to understand the `delete` method signature and how params can be passed.",
+      "elapsed_sec": 1.253,
+      "prompt_tokens": 21254,
+      "completion_tokens": 45
+    },
+    {
+      "turn_index": 5,
+      "stop_reason": "tool_use",
+      "tools": [
+        {
+          "name": "Bash",
+          "args_preview": "{\"command\": \"ls /workspace/auth0-python/auth0/v3/management/\", \"description\": \"List management modules\"}"
+        }
+      ],
+      "reasoning": "Now I understand the structure. The `delete` method of RestClient accepts a `params` argument. So I need to:\n\n1. Add a `delete_user_by_email(self, id, email)` method to the `Connections` class.\n2. The endpoint is `DELETE…",
+      "elapsed_sec": 6.571,
+      "prompt_tokens": 22635,
+      "completion_tokens": 253
+    },
+    {
+      "turn_index": 6,
+      "stop_reason": "tool_use",
+      "tools": [
+        {
+          "name": "Read",
+          "args_preview": "{\"file_path\": \"/workspace/auth0-python/auth0/v3/management/users.py\"}"
+        }
+      ],
+      "reasoning": "",
+      "elapsed_sec": 0.594,
+      "prompt_tokens": 22968,
+      "completion_tokens": 23
+    },
+    {
+      "turn_index": 7,
+      "stop_reason": "tool_use",
+      "tools": [
+        {
+          "name": "Edit",
+          "args_preview": "{\"replace_all\": false, \"file_path\": \"/workspace/auth0-python/auth0/v3/management/connections.py\", \"old_string\": \"       "
+        }
+      ],
+      "reasoning": "Now I understand the patterns. Let me implement the `delete_user_by_email` method in the `Connections` class. I'll add it after the `delete` method.\n\nThe URL should be `https://{domain}/api/v2/connections/{id}/users` and…",
+      "elapsed_sec": 7.489,
+      "prompt_tokens": 24813,
+      "completion_tokens": 303
+    },
+    {
+      "turn_index": 8,
+      "stop_reason": "tool_use",
+      "tools": [
+        {
+          "name": "Edit",
+          "args_preview": "{\"replace_all\": false, \"file_path\": \"/workspace/auth0-python/auth0/v3/test/management/test_connections.py\", \"old_string\""
+        }
+      ],
+      "reasoning": "Now let me add a test for the new method, following the conventions of the existing tests.",
+      "elapsed_sec": 7.851,
+      "prompt_tokens": 25157,
+      "completion_tokens": 267
+    },
+    {
+      "turn_index": 9,
+      "stop_reason": "tool_use",
+      "tools": [
+        {
+          "name": "Bash",
+          "args_preview": "{\"command\": \"python -m pytest auth0/v3/test/management/test_connections.py -v 2>&1 | tail -30\", \"description\": \"Run conn"
+        }
+      ],
+      "reasoning": "The reminder is about task tools. This task is small and nearly done - I've made the edits. Let me run the tests to verify rather than create tasks. The task is straightforward (add a method + test), so task tracking isn…",
+      "elapsed_sec": 4.891,
+      "prompt_tokens": 25166,
+      "completion_tokens": 129
+    },
+    {
+      "turn_index": 10,
+      "stop_reason": "end_turn",
+      "tools": [],
+      "reasoning": "All 6 tests pass, including the new `test_delete_user_by_email`.\n\n## Summary\n\nI added the `delete_user_by_email` method to the `Connections` management client per the feature request in `PROBLEM_STATEMENT.md`.\n\n**`auth0/…",
+      "elapsed_sec": 9.892,
+      "prompt_tokens": 25527,
+      "completion_tokens": 276
+    }
+  ]
+}

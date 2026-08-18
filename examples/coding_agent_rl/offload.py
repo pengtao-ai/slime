@@ -28,6 +28,13 @@ without contributing to the policy loss (``SLIME_OFFLOAD_EMBED_IN_TRAJECTORY``).
 Train shaping (when ``SLIME_AGENT_OFFLOAD=1``):
   - Per-turn costs in ``offload_stats["turn_costs"]``; ``r_i`` via
     :func:`compute_turn_rewards` (baseline completion = ``metadata.completion_tokens / n``).
+  - Incomplete offload (orphan OPEN / missing digit) is
+    :func:`repair_incomplete_offload`'d then still calls GLM; turn is marked
+    ``repaired`` and gets flat ``−β`` (no help_seeking α).
+  - Orphan / malformed / repaired → flat ``−β``; hard compact removes
+    unrepaired spam (``OFFLOAD_COMPACT_ORPHAN_OPEN_K``, default 1).
+  - Post-decode :func:`truncate_offload_open_spam` cuts runaway OPEN spam before
+    GLM / agent flush (does not stop SGLang mid-generate).
   - Hard compact filter + group α:
     :func:`compact_and_shape_group_help_seeking_rewards`.
   - Turn-painted advantages:
@@ -103,17 +110,27 @@ DEFAULT_OFFLOAD_SWE_PROMPT = OFFLOAD_SYSTEM_PROMPT_APPEND
 
 # Train reward: subtract this once if any offload span appeared outside <think>.
 DEFAULT_OFFLOAD_THINK_FORMAT_PENALTY = 0.25
-# Extra per-turn penalty for malformed offload tags (orphan OPEN, bad N, etc.).
+# Extra per-turn penalty for malformed offload tags (orphan OPEN, bad N, repaired).
 DEFAULT_OFFLOAD_MALFORMED_PENALTY = 0.25
 # help_seeking_reward: partial credit when unsolved but the SLM asked for help in-think.
 DEFAULT_OFFLOAD_SEEK_ALPHA = 0.1
 DEFAULT_OFFLOAD_SEEK_EMPTY_SCALE = 0.5
 DEFAULT_OFFLOAD_UNIQUE_SOLVER_BONUS = 0.15
-# Compact filter defaults (hard remove_sample).
-DEFAULT_COMPACT_ORPHAN_OPEN_K = 8
-DEFAULT_COMPACT_OPEN_CLOSE_RATIO = 20.0
-DEFAULT_COMPACT_SPECIAL_TOKEN_RATIO = 0.5
-DEFAULT_COMPACT_SPECIAL_TOKEN_RUN = 32
+# Compact filter defaults (hard remove_sample). Tight so open-without-close
+# spam is zero-masked before GRPO rather than training on flat −β batches.
+DEFAULT_COMPACT_ORPHAN_OPEN_K = 1
+DEFAULT_COMPACT_OPEN_CLOSE_RATIO = 3.0
+DEFAULT_COMPACT_SPECIAL_TOKEN_RATIO = 0.2
+DEFAULT_COMPACT_SPECIAL_TOKEN_RUN = 8
+# Legacy cap (flat −β ignores count; kept for env / launch-script compat).
+DEFAULT_OFFLOAD_MALFORMED_PENALTY_CAP = 8
+# Treat consecutive OPEN runs at least this long as malformed (aligned with compact).
+DEFAULT_OFFLOAD_MALFORMED_OPEN_RUN = 8
+# Post-decode truncate: cut before the N-th consecutive OPEN / N-th orphan OPEN.
+DEFAULT_OFFLOAD_TRUNCATE_OPEN_RUN = 2
+DEFAULT_OFFLOAD_TRUNCATE_ORPHAN = 2
+DEFAULT_OFFLOAD_OPEN_TOKEN_ID = 248077
+DEFAULT_OFFLOAD_CLOSE_TOKEN_ID = 248078
 
 
 def offload_system_append_text() -> str:
@@ -187,6 +204,30 @@ def think_format_penalty() -> float:
 
 def malformed_penalty() -> float:
     return float(os.environ.get("OFFLOAD_MALFORMED_PENALTY", str(DEFAULT_OFFLOAD_MALFORMED_PENALTY)))
+
+
+def malformed_penalty_cap() -> int:
+    return int(os.environ.get("OFFLOAD_MALFORMED_PENALTY_CAP", str(DEFAULT_OFFLOAD_MALFORMED_PENALTY_CAP)))
+
+
+def malformed_open_run_threshold() -> int:
+    return int(os.environ.get("OFFLOAD_MALFORMED_OPEN_RUN", str(DEFAULT_OFFLOAD_MALFORMED_OPEN_RUN)))
+
+
+def offload_open_token_id() -> int:
+    return int(os.environ.get("OFFLOAD_OPEN_TOKEN_ID", str(DEFAULT_OFFLOAD_OPEN_TOKEN_ID)))
+
+
+def offload_close_token_id() -> int:
+    return int(os.environ.get("OFFLOAD_CLOSE_TOKEN_ID", str(DEFAULT_OFFLOAD_CLOSE_TOKEN_ID)))
+
+
+def truncate_open_run_limit() -> int:
+    return int(os.environ.get("OFFLOAD_TRUNCATE_OPEN_RUN", str(DEFAULT_OFFLOAD_TRUNCATE_OPEN_RUN)))
+
+
+def truncate_orphan_limit() -> int:
+    return int(os.environ.get("OFFLOAD_TRUNCATE_ORPHAN", str(DEFAULT_OFFLOAD_TRUNCATE_ORPHAN)))
 
 
 def reward_mode() -> str:
@@ -288,6 +329,62 @@ def parse_valid_offload_directive(raw: str) -> tuple[int, str] | None:
     if parsed is None or not offload_span_inside_think(raw):
         return None
     return parsed
+
+
+def repair_incomplete_offload(raw: str) -> dict[str, Any] | None:
+    """Synthesize ``OPEN+N+CLOSE`` from an incomplete first offload attempt.
+
+    Only repairs when the payload between the first ``OPEN`` and the boundary
+    (next ``OPEN``, ``CLOSE``, or EOS) is empty or a single digit:
+      - empty → ``N=0``
+      - digit → that ``N``
+      - anything else → ``None`` (no repair)
+
+    A second ``OPEN`` before any ``CLOSE`` is treated as the close boundary
+    (that second open is consumed, not kept in the repaired string).
+    Already-valid spans return ``None``.
+
+    Returns ``{n, repaired_raw, prefix, defaulted_digit}`` or ``None``.
+    """
+    text = raw or ""
+    if OFFLOAD_OPEN not in text:
+        return None
+    if parse_offload_directive(text) is not None:
+        return None
+
+    oi = text.find(OFFLOAD_OPEN)
+    after = oi + len(OFFLOAD_OPEN)
+    next_open = text.find(OFFLOAD_OPEN, after)
+    next_close = text.find(OFFLOAD_CLOSE, after)
+
+    def _payload_n(payload: str) -> tuple[int, bool] | None:
+        ps = (payload or "").strip()
+        if ps == "":
+            return 0, True
+        if len(ps) == 1 and ps.isdigit():
+            return int(ps), False
+        return None
+
+    if next_close >= 0 and (next_open < 0 or next_close < next_open):
+        parsed_n = _payload_n(text[after:next_close])
+        rest = text[next_close + len(OFFLOAD_CLOSE) :]
+    elif next_open >= 0:
+        parsed_n = _payload_n(text[after:next_open])
+        rest = text[next_open + len(OFFLOAD_OPEN) :]
+    else:
+        parsed_n = _payload_n(text[after:])
+        rest = ""
+
+    if parsed_n is None:
+        return None
+    n, defaulted = parsed_n
+    repaired_raw = text[:oi] + OFFLOAD_OPEN + str(n) + OFFLOAD_CLOSE + rest
+    return {
+        "n": int(n),
+        "repaired_raw": repaired_raw,
+        "prefix": text[:oi],
+        "defaulted_digit": bool(defaulted),
+    }
 
 
 def reasoning_from_n(n: int) -> tuple[bool, str | None]:
@@ -394,6 +491,155 @@ def analyze_offload_tags(raw: str) -> dict[str, Any]:
     }
 
 
+def truncate_offload_open_spam(
+    text: str,
+    *,
+    max_run: int | None = None,
+    max_orphan: int | None = None,
+) -> tuple[str, bool]:
+    """Cut text before runaway OPEN spam; keep at most one orphan OPEN.
+
+    - Consecutive OPEN run of length ``max_run`` → cut before that OPEN.
+    - ``max_orphan``-th unmatched OPEN → cut before it.
+
+    Does not stop SGLang mid-decode; call after generate to shrink agent-facing
+    text / recorded stats. Returns ``(text, truncated)``.
+    """
+    if not text:
+        return text, False
+    run_lim = int(max_run if max_run is not None else truncate_open_run_limit())
+    orphan_lim = int(max_orphan if max_orphan is not None else truncate_orphan_limit())
+    if run_lim < 1 and orphan_lim < 1:
+        return text, False
+
+    if run_lim >= 1:
+        run = 0
+        scan = 0
+        while scan < len(text):
+            if text.startswith(OFFLOAD_OPEN, scan):
+                run += 1
+                if run >= run_lim:
+                    return text[:scan], True
+                scan += len(OFFLOAD_OPEN)
+                continue
+            if text.startswith(OFFLOAD_CLOSE, scan):
+                run = 0
+                scan += len(OFFLOAD_CLOSE)
+                continue
+            run = 0
+            scan += 1
+
+    if orphan_lim >= 1:
+        valid = list(_OFFLOAD_SPAN_RE.finditer(text))
+        consumed = [(m.start(), m.end()) for m in valid]
+        orphan_i = 0
+        pos = 0
+        while True:
+            oi = text.find(OFFLOAD_OPEN, pos)
+            if oi < 0:
+                break
+            if any(s <= oi < e for s, e in consumed):
+                pos = oi + len(OFFLOAD_OPEN)
+                continue
+            orphan_i += 1
+            if orphan_i >= orphan_lim:
+                return text[:oi], True
+            pos = oi + len(OFFLOAD_OPEN)
+
+    return text, False
+
+
+def truncate_offload_open_spam_ids(
+    output_ids: list[int],
+    *,
+    open_id: int | None = None,
+    close_id: int | None = None,
+    max_run: int | None = None,
+    max_orphan: int | None = None,
+) -> tuple[int, bool]:
+    """Return keep-length for ``output_ids`` using the same spam rules as text.
+
+    Mutator should ``del output_ids[keep:]`` (and align logprobs / loss_mask).
+    """
+    if not output_ids:
+        return 0, False
+    oid = int(open_id if open_id is not None else offload_open_token_id())
+    cid = int(close_id if close_id is not None else offload_close_token_id())
+    run_lim = int(max_run if max_run is not None else truncate_open_run_limit())
+    orphan_lim = int(max_orphan if max_orphan is not None else truncate_orphan_limit())
+
+    if run_lim >= 1:
+        run = 0
+        for i, tok in enumerate(output_ids):
+            if tok == oid:
+                run += 1
+                if run >= run_lim:
+                    return i, True
+            elif tok == cid:
+                run = 0
+            else:
+                run = 0
+
+    if orphan_lim >= 1:
+        # Approximate orphans: OPEN not followed by (digit-ish is unknown in id
+        # space) CLOSE before next OPEN. Count OPEN with no CLOSE before next OPEN.
+        orphan_i = 0
+        i = 0
+        n = len(output_ids)
+        while i < n:
+            if output_ids[i] != oid:
+                i += 1
+                continue
+            start = i
+            i += 1
+            saw_close = False
+            while i < n and output_ids[i] != oid:
+                if output_ids[i] == cid:
+                    saw_close = True
+                    i += 1
+                    break
+                i += 1
+            if not saw_close:
+                orphan_i += 1
+                if orphan_i >= orphan_lim:
+                    return start, True
+        return n, False
+
+    return len(output_ids), False
+
+
+def _clip_turn_outputs(turn: Any, keep: int) -> None:
+    """In-place trim SLM ``output_ids`` / logprobs / loss_mask to ``keep`` tokens."""
+    ids = getattr(turn, "output_ids", None)
+    if not isinstance(ids, list):
+        return
+    keep = max(0, min(int(keep), len(ids)))
+    if keep >= len(ids):
+        return
+    del ids[keep:]
+    for attr in ("output_log_probs", "output_loss_mask"):
+        seq = getattr(turn, attr, None)
+        if isinstance(seq, list) and len(seq) > keep:
+            del seq[keep:]
+
+
+def turn_malformed_penalty_value(
+    tc: dict[str, Any],
+    *,
+    mal_pen: float | None = None,
+) -> float | None:
+    """Flat −β for repaired / orphan / malformed / long OPEN runs; ``None`` if clean."""
+    pen = float(mal_pen if mal_pen is not None else malformed_penalty())
+    if tc.get("repaired"):
+        return -pen
+    orphan = int(tc.get("orphan_open_count", 0) or 0)
+    mal = int(tc.get("malformed_count", 0) or 0)
+    run = int(tc.get("max_open_run", 0) or 0)
+    if orphan > 0 or mal > 0 or run >= malformed_open_run_threshold():
+        return -pen
+    return None
+
+
 def record_local_turn_tokens(session: Session, turn: TurnRecord, *, raw_output: str = "") -> dict[str, Any]:
     """Accumulate per-round SLM tokens and append a ``turn_costs`` ledger entry."""
     stats = _ensure_stats(session)
@@ -416,6 +662,7 @@ def record_local_turn_tokens(session: Session, turn: TurnRecord, *, raw_output: 
         "response_token_len": out_n,
         "valid_offload": valid_offload,
         "outside_think": outside,
+        "repaired": False,
         "orphan_open_count": int(tag["orphan_open_count"]),
         "malformed_count": int(tag["malformed_count"]),
         "open_count": int(tag["open_count"]),
@@ -1041,11 +1288,82 @@ async def apply_offload_if_needed(
     if not offload_enabled():
         return reply
 
+    # Post-decode OPEN-spam truncate (SGLang already finished; shrink traj + agent view).
+    keep, ids_cut = truncate_offload_open_spam_ids(list(turn.output_ids or []))
+    if ids_cut:
+        _clip_turn_outputs(turn, keep)
+        if tokenizer is not None and turn.output_ids:
+            raw_output = tokenizer.decode(turn.output_ids, skip_special_tokens=False)
+        else:
+            raw_output, _ = truncate_offload_open_spam(raw_output)
+        reply = amend_reply_with_offload(
+            reply, raw_output=raw_output, glm_content="", glm_think="", glm_tool_calls=None
+        )
+        logger.warning(
+            "[coding_agent_offload] sid=%s truncated open-tag spam keep_tokens=%d",
+            sid,
+            keep,
+        )
+    else:
+        raw_output, text_cut = truncate_offload_open_spam(raw_output)
+        if text_cut:
+            reply = amend_reply_with_offload(
+                reply, raw_output=raw_output, glm_content="", glm_think="", glm_tool_calls=None
+            )
+            logger.warning(
+                "[coding_agent_offload] sid=%s truncated open-tag spam (text-only) len=%d",
+                sid,
+                len(raw_output),
+            )
+
     turn_entry = record_local_turn_tokens(session, turn, raw_output=raw_output)
     parsed = parse_valid_offload_directive(raw_output)
+    repaired = False
     if parsed is None:
-        # Complete span exists but not in <think> → format violation, no GLM.
-        if parse_offload_directive(raw_output) is not None:
+        repair = repair_incomplete_offload(raw_output)
+        if repair is not None:
+            repaired_raw = str(repair["repaired_raw"])
+            turn_entry["repaired"] = True
+            turn_entry["incomplete_close"] = True
+            turn_entry["defaulted_digit"] = bool(repair.get("defaulted_digit"))
+            # Re-tag from the synthesized span so compact does not hard-drop
+            # trajectories that we are about to offload after repair.
+            tag = analyze_offload_tags(repaired_raw)
+            for key in (
+                "orphan_open_count",
+                "malformed_count",
+                "open_count",
+                "close_count",
+                "max_open_run",
+                "special_mark_count",
+            ):
+                turn_entry[key] = int(tag[key])
+            if parse_valid_offload_directive(repaired_raw) is not None:
+                raw_output = repaired_raw
+                parsed = (int(repair["n"]), str(repair["prefix"]))
+                repaired = True
+                logger.info(
+                    "[coding_agent_offload] sid=%s repaired incomplete offload N=%d "
+                    "defaulted_digit=%s",
+                    sid,
+                    int(repair["n"]),
+                    bool(repair.get("defaulted_digit")),
+                )
+            else:
+                # Synthesized span still outside <think> → format violation, no GLM.
+                stats = _ensure_stats(session)
+                stats["offload_outside_think_count"] = int(stats.get("offload_outside_think_count", 0)) + 1
+                turn_entry["outside_think"] = True
+                turn_entry["response_token_len"] = len(turn.output_ids or [])
+                logger.info(
+                    "[coding_agent_offload] sid=%s skip GLM: repaired offload outside <think> "
+                    "(outside_think#%d)",
+                    sid,
+                    stats["offload_outside_think_count"],
+                )
+                return reply
+        elif parse_offload_directive(raw_output) is not None:
+            # Complete span exists but not in <think> → format violation, no GLM.
             stats = _ensure_stats(session)
             stats["offload_outside_think_count"] = int(stats.get("offload_outside_think_count", 0)) + 1
             turn_entry["outside_think"] = True
@@ -1055,8 +1373,11 @@ async def apply_offload_if_needed(
                 sid,
                 stats["offload_outside_think_count"],
             )
-        turn_entry["response_token_len"] = len(turn.output_ids or [])
-        return reply
+            turn_entry["response_token_len"] = len(turn.output_ids or [])
+            return reply
+        else:
+            turn_entry["response_token_len"] = len(turn.output_ids or [])
+            return reply
 
     n, _prefix = parsed
     enable_thinking, reasoning_effort = reasoning_from_n(n)
@@ -1099,13 +1420,14 @@ async def apply_offload_if_needed(
 
     logger.info(
         "[coding_agent_offload] sid=%s offload#%d N=%d thinking=%s effort=%s "
-        "glm_budget=%d content_len=%d think_len=%d tool_calls=%d "
+        "repaired=%s glm_budget=%d content_len=%d think_len=%d tool_calls=%d "
         "cum_slm=(%d,%d) cum_glm=(%d,%d)",
         sid,
         stats["offload_count"],
         n,
         enable_thinking,
         reasoning_effort,
+        repaired,
         glm_budget,
         len(content),
         len(think),
@@ -1339,9 +1661,14 @@ def compute_turn_rewards(
 ) -> dict[str, Any]:
     """Per-turn rewards ``r_i`` and scalar ``mean(r_i)``.
 
-    Solved: ``r_i = max(0, 1 - λ * c_i/b_i - format - malformed)``.
-    Unsolved help_seeking: α' on valid in-think turns (unless deferred),
-    ``-β`` on malformed/orphan spam turns, else 0.
+    Solved:
+      - no offload / not repaired → ``1``
+      - valid offload → ``max(0, 1 - λ·c_i/b_i - format)``
+      - repaired → ``max(0, 1 - λ·c_i/b_i - format - β)``
+    Unsolved help_seeking:
+      - clean valid in-think offload → α' (unless deferred)
+      - repaired / orphan / malformed → flat ``-β`` (never α)
+      - else 0
     """
     st = dict(stats or {})
     turns: list[dict[str, Any]] = list(st.get("turn_costs") or [])
@@ -1379,35 +1706,39 @@ def compute_turn_rewards(
 
     if float(solved) > 0.0:
         for tc in turns:
+            mal_r = turn_malformed_penalty_value(tc, mal_pen=mal_pen)
+            used_offload = bool(tc.get("valid_offload") or tc.get("repaired"))
+            if not used_offload and mal_r is None and not tc.get("outside_think"):
+                # Independent completion: full credit, no cost shaping.
+                turn_rewards.append(1.0)
+                continue
             c_i = turn_actual_cost(tc)
             ratio = (c_i / b_i) if b_i > 0 else 0.0
             r_i = 1.0 - lam_v * ratio
             if tc.get("outside_think"):
                 r_i -= fmt_pen
-            mal = int(tc.get("malformed_count", 0) or 0) + int(tc.get("orphan_open_count", 0) or 0)
-            if mal > 0:
-                r_i -= mal_pen
+            if mal_r is not None:
+                r_i += mal_r  # already negative (repaired / orphan / malformed)
             turn_rewards.append(max(0.0, float(r_i)))
     elif reward_mode() != "help_seeking":
-        # cost_aware: unsolved → all zeros (still record malformed as -β for advantage).
+        # cost_aware: unsolved → zeros, or flat −β on orphan/malformed/repaired.
         for tc in turns:
-            mal = int(tc.get("malformed_count", 0) or 0) + int(tc.get("orphan_open_count", 0) or 0)
-            if mal > 0 or int(tc.get("max_open_run", 0) or 0) >= 8:
-                turn_rewards.append(-mal_pen)
-            else:
-                turn_rewards.append(0.0)
+            mal_r = turn_malformed_penalty_value(tc, mal_pen=mal_pen)
+            turn_rewards.append(0.0 if mal_r is None else float(mal_r))
     else:
         credit = _apply_empty_scale(
             alpha_v, empty_patch=empty_patch, empty_scale=emp_scale, protocol=proto, metadata=metadata
         )
         for tc in turns:
-            mal = int(tc.get("malformed_count", 0) or 0) + int(tc.get("orphan_open_count", 0) or 0)
-            if mal > 0 or int(tc.get("max_open_run", 0) or 0) >= 8:
-                turn_rewards.append(-mal_pen)
+            mal_r = turn_malformed_penalty_value(tc, mal_pen=mal_pen)
+            if mal_r is not None:
+                # repaired / orphan / malformed: flat −β, never α.
+                turn_rewards.append(float(mal_r))
                 continue
             if (
                 encourage_seek
                 and tc.get("valid_offload")
+                and not tc.get("repaired")
                 and not tc.get("outside_think")
             ):
                 turn_rewards.append(max(0.0, float(credit)))
@@ -1630,12 +1961,16 @@ def shape_group_help_seeking_rewards(args: Any, groups: list) -> None:
 
             if turn_costs and turn_rewards:
                 for i, tc in enumerate(turn_costs):
-                    mal = int(tc.get("malformed_count", 0) or 0) + int(tc.get("orphan_open_count", 0) or 0)
-                    if mal > 0:
-                        if turn_rewards[i] > -mal_pen:
-                            turn_rewards[i] = -mal_pen
+                    mal_r = turn_malformed_penalty_value(tc, mal_pen=mal_pen)
+                    if mal_r is not None:
+                        if turn_rewards[i] > mal_r:
+                            turn_rewards[i] = float(mal_r)
                         continue
-                    if tc.get("valid_offload") and not tc.get("outside_think"):
+                    if (
+                        tc.get("valid_offload")
+                        and not tc.get("repaired")
+                        and not tc.get("outside_think")
+                    ):
                         if float(turn_rewards[i]) <= 0.0:
                             turn_rewards[i] = credit
                 if turn_rewards:
