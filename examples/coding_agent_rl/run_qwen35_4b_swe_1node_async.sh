@@ -201,6 +201,9 @@ fi
 ALGO_ARGS=(
    --advantage-estimator grpo
    --custom-advantage-function-path examples.coding_agent_rl.offload_turn_advantage.compute_turn_advantages
+   --custom-reward-post-process-path examples.coding_agent_rl.offload_sft.post_process_rewards_grpo_only
+   --loss-type custom_loss
+   --custom-loss-function-path examples.coding_agent_rl.grpo_sft_loss.grpo_sft_loss_function
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
    --kl-coef 0.00
@@ -360,6 +363,7 @@ keys = (
     "OFFLOAD_STOP_TOKEN_ID", "ROLLOUT_STOP_TOKEN_IDS",
     "SLIME_AGENT_OFFLOAD_SYSTEM_APPEND",
     "SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS",
+    "OFFLOAD_SFT_LAMBDA",
 )
 env = {k: os.environ[k] for k in keys if k in os.environ}
 env["MASTER_ADDR"] = os.environ["MASTER_ADDR"]

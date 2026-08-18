@@ -291,6 +291,7 @@ def log_rollout_data(
                 "num_microbatches",
                 "micro_batch_indices",
                 "source_names",
+                "metadata",
             ]:
                 continue
             # Emit (sum, count) so gather_log_data can do a weighted average across

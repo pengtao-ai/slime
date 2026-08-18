@@ -47,6 +47,7 @@ Enable with ``SLIME_AGENT_OFFLOAD=1`` (see ``generate.py`` Offload* adapters).
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -1440,6 +1441,7 @@ async def apply_offload_if_needed(
     # N=0: no remote think channel; drop any accidental reasoning payload.
     if not enable_thinking:
         think = ""
+    slm_n = len(turn.output_ids or [])
     append_glm_tokens_to_turn(
         turn,
         tokenizer=tokenizer,
@@ -1447,6 +1449,19 @@ async def apply_offload_if_needed(
         glm_content=content,
         glm_think=think,
     )
+    # Persist teacher payload for online SFT (x, y) export; analysis / dumps.
+    turn_entry["action"] = "offload"
+    turn_entry["n"] = int(n)
+    turn_entry["slm_n"] = int(slm_n)
+    turn_entry["glm_token_span"] = [int(slm_n), int(len(turn.output_ids or []))]
+    turn_entry["qwen_think_prefix"] = _offload_prefix(raw_output)
+    turn_entry["teacher_think"] = think
+    turn_entry["teacher_content"] = content
+    turn_entry["teacher_tool_calls"] = list(glm_tool_calls or [])
+    turn_entry["teacher_response"] = content
+    # Snapshot history at the offload turn so SFT can rebuild chat-template (x, y).
+    turn_entry["sft_history_messages"] = copy.deepcopy(translated)
+    turn_entry["sft_tools_schema"] = copy.deepcopy(tools_schema) if tools_schema else None
     turn_entry["response_token_len"] = len(turn.output_ids or [])
     return amend_reply_with_offload(
         reply,
@@ -1815,6 +1830,7 @@ def attach_turn_advantage_metadata(
             md.pop("turn_token_spans", None)
         sample.metadata = md
         train_md = dict(getattr(sample, "train_metadata", None) or {})
+        train_md.setdefault("objective", "grpo")
         train_md["turn_rewards"] = list(turn_rewards)
         if spans is not None:
             train_md["turn_token_spans"] = spans
@@ -1849,6 +1865,11 @@ def _aggregate_tag_counts(stats: dict[str, Any]) -> dict[str, int]:
 def compact_should_remove_sample(sample: Any) -> tuple[bool, str | None]:
     """Return (remove, reason) for hard compact/overlong filters."""
     from slime.utils.types import Sample as _Sample
+
+    # Online SFT rows are reconstructed; never compact-drop them via tag spam.
+    tmd = getattr(sample, "train_metadata", None) or {}
+    if isinstance(tmd, dict) and tmd.get("objective") == "sft":
+        return False, None
 
     md = getattr(sample, "metadata", None) or {}
     status = getattr(sample, "status", None)
@@ -1913,11 +1934,22 @@ def _session_solved(metadata: dict[str, Any] | None) -> bool:
     return float(md.get("solved", 0) or 0) > 0.0
 
 
+def _is_sft_sample(sample: Any) -> bool:
+    tmd = getattr(sample, "train_metadata", None) or {}
+    return isinstance(tmd, dict) and tmd.get("objective") == "sft"
+
+
 def _session_segments(group_item: Any) -> list[Any]:
-    """One GRPO sibling may be a Sample or a fan-out ``list[Sample]``."""
+    """One GRPO sibling may be a Sample or a fan-out ``list[Sample]``.
+
+    SFT rows appended by generate() share the fan-out list but must not enter
+    help_seeking α / compact group logic.
+    """
     if isinstance(group_item, list):
-        return [s for s in group_item if s is not None]
-    return [group_item] if group_item is not None else []
+        return [s for s in group_item if s is not None and not _is_sft_sample(s)]
+    if group_item is None or _is_sft_sample(group_item):
+        return []
+    return [group_item]
 
 
 def shape_group_help_seeking_rewards(args: Any, groups: list) -> None:

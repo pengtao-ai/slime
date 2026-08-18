@@ -198,6 +198,18 @@ async def _run() -> None:
                 assert stats["small_output_tokens"] == len(TURN1_IDS) + len(TURN2_IDS)
                 assert stats["glm_input_tokens"] == 111
                 assert stats["glm_output_tokens"] == 22
+                turns = list(stats.get("turn_costs") or [])
+                assert turns, "expected turn_costs ledger"
+                off_turns = [t for t in turns if t.get("valid_offload")]
+                assert off_turns, "expected a valid offload turn"
+                ot = off_turns[0]
+                assert ot.get("action") == "offload"
+                assert ot.get("teacher_think") == "remote-why"
+                assert "GLM next step" in str(ot.get("teacher_content") or "")
+                assert "qwen_think_prefix" in ot
+                assert offload.OFFLOAD_OPEN not in str(ot.get("qwen_think_prefix") or "")
+                assert isinstance(ot.get("sft_history_messages"), list) and ot["sft_history_messages"]
+                assert isinstance(ot.get("glm_token_span"), list) and len(ot["glm_token_span"]) == 2
 
                 reward = offload.cost_aware_reward(1.0, stats, usage=None)
                 assert reward < 1.0, reward

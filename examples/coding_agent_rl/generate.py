@@ -48,6 +48,7 @@ from slime.utils.types import Sample
 
 from . import offload, swe
 from .agents_registry import AdapterProtocol, resolve_agent
+from .offload_sft import build_sft_samples
 
 logger = logging.getLogger(__name__)
 logging.getLogger("e2b").setLevel(logging.WARNING)
@@ -666,6 +667,17 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         "turn_rewards": s.metadata.get("turn_rewards"),
                         "turn_token_spans": s.metadata.get("turn_token_spans"),
                     }
+
+            # Online SFT: PASS + valid offload turns → separate Sample rows (not in GRPO group).
+            if offload.offload_enabled() and solved == 1.0:
+                sft_samples = build_sft_samples(
+                    grpo_samples=samples,
+                    tokenizer=state.tokenizer,
+                    grading_solved=True,
+                )
+                if sft_samples:
+                    samples = list(samples) + sft_samples
+
             if agent_exit_code != 0:
                 reason = "time budget exceeded" if agent_exit_code < 0 else f"CLI error (exit {agent_exit_code})"
                 logger.warning(

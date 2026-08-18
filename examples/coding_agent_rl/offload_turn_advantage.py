@@ -63,6 +63,10 @@ def compute_turn_advantages(args: Namespace, rollout_data: dict[str, Any]) -> No
     for i, (k, a_s) in enumerate(zip(kl, rewards, strict=False)):
         md = metadata_list[i] if i < len(metadata_list) else None
         md = md if isinstance(md, dict) else {}
+        if md.get("objective") == "sft":
+            # SFT rows: no policy-gradient; CE is applied in custom_loss.
+            advantages.append(torch.zeros_like(k, dtype=torch.float32))
+            continue
         turn_rewards = list(md.get("turn_rewards") or [])
         spans = md.get("turn_token_spans")
         if spans is not None and not isinstance(spans, list):
