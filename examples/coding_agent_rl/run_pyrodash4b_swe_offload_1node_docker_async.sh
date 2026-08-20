@@ -7,9 +7,8 @@
 # 4-6=high, 7-9=max via chat_template_kwargs.thinking) and returns the
 # continuation so the agent can keep editing. Default train reward is
 # help_seeking (OFFLOAD_REWARD_MODE) with OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG:
-# α only when every sibling in the GRPO group failed and this traj did
-# in-think offload; otherwise unsolved→0 / solved→(1-λ*cost_ratio).
-# Empty patches never count as solved.
+# α for failed in-think offload unless a sibling solved without offload;
+# otherwise unsolved→0 / solved→(1-λ*cost_ratio). Empty patches never count as solved.
 #
 # Prerequisites:
 #   bash examples/coding_agent_rl/convert_pyrodash4b_to_torch_dist.sh
@@ -46,8 +45,8 @@ export SAVE_INTERVAL="${SAVE_INTERVAL:-20}"
 # ---- mid-turn offload ----
 export SLIME_AGENT_OFFLOAD=1
 export OFFLOAD_EFFICIENCY_LAMBDA=0.3
-# help_seeking + only-all-wrong: α only if the whole GRPO group failed
-# (see offload.shape_group_help_seeking_rewards). Else do not encourage offload.
+# help_seeking + SEEK_ONLY_WHEN_ALL_WRONG: withhold α only if a sibling
+# solved without offload (see offload.shape_group_help_seeking_rewards).
 # Set OFFLOAD_REWARD_MODE=cost_aware to restore the old "fail → 0" shaping.
 export OFFLOAD_REWARD_MODE=help_seeking
 export OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG=1
@@ -55,6 +54,7 @@ export OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG=1
 export OFFLOAD_SEEK_ALPHA=0.1
 export OFFLOAD_SEEK_EMPTY_SCALE=0.5
 export OFFLOAD_UNIQUE_SOLVER_BONUS=0.15
+export OFFLOAD_NO_SEEK_PENALTY="${OFFLOAD_NO_SEEK_PENALTY:-0.1}"
 export ADAPTER_MAX_TURNS_PER_SID="${ADAPTER_MAX_TURNS_PER_SID:-64}"
 export DASHSCOPE_BASE_URL=http://208.64.254.187:8001/v1
 export DASHSCOPE_API_KEY=sk-6137d26281697017ef07ef4da0823dc16d32acaad253ecac
@@ -71,6 +71,10 @@ export SLIME_OFFLOAD_EMBED_IN_TRAJECTORY="${SLIME_OFFLOAD_EMBED_IN_TRAJECTORY:-1
 # export SLIME_OFFLOAD_EMBED_MAX_TOKENS="${SLIME_OFFLOAD_EMBED_MAX_TOKENS:-8192}"
 # Mixed L = L_GRPO + λ L_SFT. Default 0 = Exp 1 (GRPO only). Set e.g. 0.1 for Exp 2.
 export OFFLOAD_SFT_LAMBDA="${OFFLOAD_SFT_LAMBDA:-0}"
+export OFFLOAD_SFT_MAX_SAMPLES="${OFFLOAD_SFT_MAX_SAMPLES:-1}"
+export OFFLOAD_SFT_MAX_SEQ_LEN="${OFFLOAD_SFT_MAX_SEQ_LEN:-0}"
+# Match GRPO-only: do not override MAX_TOKENS_PER_GPU (async uses MAX_CONTEXT_LEN/CP).
+# export MAX_TOKENS_PER_GPU=8192
 
 if [[ -z "${DASHSCOPE_API_KEY:-}" && -z "${OPENAI_API_KEY:-}" ]]; then
   echo "WARNING: DASHSCOPE_API_KEY (or OPENAI_API_KEY) is unset; offload calls will fail at runtime." >&2
@@ -135,7 +139,18 @@ echo "  OFFLOAD_EFFICIENCY_LAMBDA=${OFFLOAD_EFFICIENCY_LAMBDA}"
 echo "  OFFLOAD_REWARD_MODE=${OFFLOAD_REWARD_MODE}"
 echo "  OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG=${OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG}"
 echo "  OFFLOAD_SEEK_ALPHA=${OFFLOAD_SEEK_ALPHA}"
+echo "  OFFLOAD_SEEK_EMPTY_SCALE=${OFFLOAD_SEEK_EMPTY_SCALE}"
+echo "  OFFLOAD_UNIQUE_SOLVER_BONUS=${OFFLOAD_UNIQUE_SOLVER_BONUS}"
+echo "  OFFLOAD_NO_SEEK_PENALTY=${OFFLOAD_NO_SEEK_PENALTY:-0.1}"
+echo "  OFFLOAD_THINK_FORMAT_PENALTY=${OFFLOAD_THINK_FORMAT_PENALTY:-0.25}"
+echo "  OFFLOAD_MALFORMED_PENALTY=${OFFLOAD_MALFORMED_PENALTY:-0.25}"
 echo "  OFFLOAD_SFT_LAMBDA=${OFFLOAD_SFT_LAMBDA}"
+echo "  OFFLOAD_SFT_MAX_SAMPLES=${OFFLOAD_SFT_MAX_SAMPLES:-1}"
+echo "  OFFLOAD_SFT_MAX_SEQ_LEN=${OFFLOAD_SFT_MAX_SEQ_LEN:-0}"
+echo "  OFFLOAD_COMPACT_ORPHAN_OPEN_K=${OFFLOAD_COMPACT_ORPHAN_OPEN_K:-1}"
+echo "  OFFLOAD_COMPACT_SPECIAL_TOKEN_RUN=${OFFLOAD_COMPACT_SPECIAL_TOKEN_RUN:-8}"
+echo "  OFFLOAD_TRUNCATE_OPEN_RUN=${OFFLOAD_TRUNCATE_OPEN_RUN:-2} ORPHAN=${OFFLOAD_TRUNCATE_ORPHAN:-2}"
+echo "  SLIME_OFFLOAD_EMBED_IN_TRAJECTORY=${SLIME_OFFLOAD_EMBED_IN_TRAJECTORY:-1}"
 echo "  SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS=${SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS}"
 echo "  TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=${TORCH_ALLOW_TF32_CUBLAS_OVERRIDE}"
 echo "  DEBUG_TRAIN_MEM=${DEBUG_TRAIN_MEM}"

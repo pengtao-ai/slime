@@ -60,8 +60,34 @@ def _pack_step_into_mbs(
     max_per_bin: int | None,
     micro_batch_size: int | None,
     balance_by_flops: bool = False,
+    force_singleton: list[bool] | None = None,
 ) -> list[list[int]]:
     """Group a step's samples into mbs. Returns ``mbs[k]`` = local indices into ``step_lengths``."""
+    n = len(step_lengths)
+    singleton_idx = (
+        [i for i, flag in enumerate(force_singleton) if flag]
+        if force_singleton is not None and len(force_singleton) == n
+        else []
+    )
+    # Dynamic packing only: keep marked samples out of leftover bins so a
+    # medium-length extra row cannot fill ``max_tokens_per_gpu`` next to a
+    # long GRPO trajectory (that [T, V] dlogits spike OOMs after a full fwd).
+    if use_dynamic_batch_size and singleton_idx:
+        packable_idx = [i for i in range(n) if not force_singleton[i]]
+        bins: list[list[int]] = []
+        if packable_idx:
+            packed_bins = _pack_step_into_mbs(
+                [step_lengths[i] for i in packable_idx],
+                args=args,
+                use_dynamic_batch_size=True,
+                max_per_bin=max_per_bin,
+                micro_batch_size=micro_batch_size,
+                balance_by_flops=balance_by_flops,
+                force_singleton=None,
+            )
+            bins = [[packable_idx[j] for j in bin_] for bin_ in packed_bins]
+        bins.extend([[i] for i in singleton_idx])
+        return bins
     if use_dynamic_batch_size:
         assert max_per_bin is not None
         if balance_by_flops:
@@ -75,7 +101,6 @@ def _pack_step_into_mbs(
             return get_seqlen_balanced_partitions(workloads, num_mbs, equal_size=False)
         return first_fit_pack(step_lengths, max_per_bin)
     assert micro_batch_size is not None
-    n = len(step_lengths)
     return [list(range(i, min(i + micro_batch_size, n))) for i in range(0, n, micro_batch_size)]
 
 
@@ -86,6 +111,7 @@ def build_dp_schedule(
     *,
     global_batch_size: int,
     rollout_indices: list[int],
+    force_singleton: list[bool] | None = None,
 ) -> tuple[list[list[int]], list[list[list[int]]], list[int], list[int]]:
     """Compute the per-rank DP partition and micro-batch schedule.
 
@@ -103,6 +129,9 @@ def build_dp_schedule(
             samples don't fit are dropped.
         rollout_indices: rollout id for each sample (``samples[i].index``).
             Samples sharing the same id are kept together in one step.
+        force_singleton: optional per-sample flags (same length as
+            ``total_lengths``). Dynamic packing puts a True sample in its own
+            micro-batch so it cannot fill leftover tokens beside other rows.
 
     Returns:
         ``(partitions, micro_batch_indices, num_microbatches, global_batch_sizes)``.
@@ -147,6 +176,11 @@ def build_dp_schedule(
         step_rollouts = rollout_ids[step_i * global_batch_size : (step_i + 1) * global_batch_size]
         sample_indices = [pos for rid in step_rollouts for pos in rollout_id_to_samples[rid]]
         step_lengths = [total_lengths[i] for i in sample_indices]
+        step_singleton = (
+            [force_singleton[i] for i in sample_indices]
+            if force_singleton is not None and len(force_singleton) == len(total_lengths)
+            else None
+        )
         global_batch_sizes.append(global_batch_size)
         assert len(sample_indices) >= dp_size, (
             f"step {step_i}: {len(sample_indices)} samples < dp_size {dp_size}; "
@@ -162,6 +196,7 @@ def build_dp_schedule(
             max_per_bin=max_per_bin,
             micro_batch_size=getattr(args, "micro_batch_size", None),
             balance_by_flops=args.balance_by_flops,
+            force_singleton=step_singleton,
         )
 
         # 2. Align mbs count to a multiple of ``align_to``.

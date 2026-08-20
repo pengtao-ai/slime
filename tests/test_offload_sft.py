@@ -37,7 +37,11 @@ class _FakeTok:
             parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
             for tc in m.get("tool_calls") or []:
                 fn = tc.get("function") or {}
-                parts.append(f"<tool_call>{fn.get('name')}:{fn.get('arguments')}</tool_call>")
+                args = fn.get("arguments")
+                # Qwen chat template: ``arguments|items`` requires a mapping.
+                if args is not None and not isinstance(args, dict):
+                    raise TypeError("Can only get item pairs from a mapping.")
+                parts.append(f"<tool_call>{fn.get('name')}:{args}</tool_call>")
         if add_generation_prompt:
             parts.append("<|im_start|>assistant\n")
         text = "".join(parts)
@@ -91,6 +95,33 @@ def test_sft_mask_zeros_x_ones_glm() -> None:
     assert offload.OFFLOAD_OPEN not in decoded
 
 
+def test_sft_tool_calls_accept_openai_json_arguments() -> None:
+    """GLM wire ``function.arguments`` is a JSON string; Qwen template needs a dict."""
+    tok = _FakeTok()
+    history = [{"role": "user", "content": "fix B.py"}]
+    built = build_sft_token_sequence(
+        tok,
+        history=history,
+        tools=None,
+        qwen_think="need to read B.py",
+        glm_think="stack points at B.py:80",
+        glm_content="",
+        glm_tool_calls=[
+            {
+                "id": "chatcmpl-tool-glm-0",
+                "type": "function",
+                "function": {"name": "Read", "arguments": '{"path": "B.py"}'},
+            }
+        ],
+    )
+    assert built is not None
+    tokens, loss_mask, response_length = built
+    decoded = tok.decode(tokens[-response_length:])
+    assert "Read" in decoded
+    assert "B.py" in decoded
+    assert 1 in loss_mask
+
+
 def test_build_sft_samples_only_when_lambda_and_pass() -> None:
     tok = _FakeTok()
     os.environ["OFFLOAD_SFT_LAMBDA"] = "0"
@@ -123,11 +154,93 @@ def test_build_sft_samples_only_when_lambda_and_pass() -> None:
     out = build_sft_samples(grpo_samples=[grpo], tokenizer=tok, grading_solved=True)
     assert len(out) == 1
     assert out[0].train_metadata["objective"] == "sft"
-    assert out[0].rollout_id is not None and out[0].rollout_id < 0
+    assert out[0].train_metadata["pack_singleton"] is True
+    assert out[0].rollout_id == 7
     assert sum(out[0].loss_mask) > 0
     assert out[0].loss_mask.count(0) > 0
 
     assert build_sft_samples(grpo_samples=[grpo], tokenizer=tok, grading_solved=False) == []
+
+
+def test_sft_max_samples_keeps_last_turns() -> None:
+    tok = _FakeTok()
+    os.environ["OFFLOAD_SFT_LAMBDA"] = "0.1"
+    os.environ["OFFLOAD_SFT_MAX_SAMPLES"] = "2"
+    os.environ["OFFLOAD_SFT_MAX_SEQ_LEN"] = "0"
+    turns = []
+    for i in range(5):
+        turns.append(
+            {
+                "valid_offload": True,
+                "qwen_think_prefix": f"local{i}",
+                "teacher_think": f"why{i}",
+                "teacher_content": f"do{i}",
+                "teacher_tool_calls": [],
+                "sft_history_messages": [{"role": "user", "content": f"q{i}"}],
+            }
+        )
+    grpo = Sample(
+        index=3,
+        group_index=1,
+        tokens=[1, 2, 3],
+        response_length=2,
+        loss_mask=[1, 1],
+        reward=1.0,
+        metadata={"grading_solved": True, "turn_costs": turns},
+    )
+    out = build_sft_samples(grpo_samples=[grpo], tokenizer=tok, grading_solved=True)
+    assert len(out) == 2
+    assert [s.train_metadata["sft_turn_index"] for s in out] == [3, 4]
+    os.environ.pop("OFFLOAD_SFT_MAX_SAMPLES", None)
+    os.environ.pop("OFFLOAD_SFT_MAX_SEQ_LEN", None)
+
+
+def test_sft_left_trims_old_history_keeps_y() -> None:
+    tok = _FakeTok()
+    old = "OLDCTX" * 40
+    history = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": old},
+        {"role": "assistant", "content": "old-reply"},
+        {"role": "user", "content": "latest-q"},
+    ]
+    kwargs = dict(
+        tokenizer=tok,
+        history=history,
+        tools=None,
+        qwen_think="local plan",
+        glm_think="remote why",
+        glm_content="edit foo.py",
+        glm_tool_calls=None,
+    )
+    full = build_sft_token_sequence(**kwargs, max_seq=0)
+    assert full is not None
+    last_only = build_sft_token_sequence(
+        tok,
+        history=[{"role": "system", "content": "sys"}, {"role": "user", "content": "latest-q"}],
+        tools=None,
+        qwen_think="local plan",
+        glm_think="remote why",
+        glm_content="edit foo.py",
+        glm_tool_calls=None,
+        max_seq=0,
+    )
+    assert last_only is not None
+    cap = (len(last_only[0]) + len(full[0])) // 2
+    assert len(last_only[0]) < cap < len(full[0])
+
+    trimmed = build_sft_token_sequence(**kwargs, max_seq=cap)
+    assert trimmed is not None
+    tokens, loss_mask, response_length = trimmed
+    assert len(tokens) <= cap
+    decoded = tok.decode(tokens)
+    assert "latest-q" in decoded
+    assert "remote why" in decoded
+    assert "edit foo.py" in decoded
+    assert old not in decoded
+    assert 0 in loss_mask and 1 in loss_mask
+    assert len(loss_mask) == response_length
+    assert build_sft_token_sequence(**kwargs, max_seq=8) is None
 
 
 def test_post_process_skips_sft_in_group() -> None:
@@ -149,6 +262,9 @@ if __name__ == "__main__":
     test_strip_offload_not_in_x()
     test_turn_eligible_requires_glm_payload()
     test_sft_mask_zeros_x_ones_glm()
+    test_sft_tool_calls_accept_openai_json_arguments()
     test_build_sft_samples_only_when_lambda_and_pass()
+    test_sft_max_samples_keeps_last_turns()
+    test_sft_left_trims_old_history_keeps_y()
     test_post_process_skips_sft_in_group()
     print("ok")

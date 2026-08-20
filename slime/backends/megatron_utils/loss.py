@@ -975,6 +975,10 @@ def policy_loss_function(
         log_probs = torch.cat(log_probs, dim=0)
         ppo_kl = old_log_probs - log_probs
 
+    # Expose concatenated log-probs for custom mixed losses (e.g. GRPO+SFT)
+    # so they can reuse this tensor instead of a second softmax over V.
+    batch["_cat_log_probs"] = log_probs
+
     if args.advantage_estimator == "cispo":
         pg_loss, pg_clipfrac = compute_cispo_loss(ppo_kl, log_probs, advantages, args.eps_clip, args.eps_clip_high)
     else:

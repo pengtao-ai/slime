@@ -7,18 +7,19 @@ Target pair (per PASS offload turn)::
 
 ``loss_mask`` is 0 on ``x`` and 1 on the GLM continuation. Offload tags never
 enter the SFT sequence. These samples are emitted alongside the GRPO trajectory
-from the same ``generate()`` call but use a distinct ``rollout_id`` and
-``train_metadata.objective == "sft"`` so they never enter GRPO grouping.
+from the same ``generate()`` call, share that trajectory's ``rollout_id``
+(slime compact contract), and use ``train_metadata.objective == "sft"`` so they
+never enter GRPO grouping.
 """
 
 from __future__ import annotations
 
 import copy
-import json
 import logging
 import os
 from typing import Any
 
+from slime.agent.adapters.openai import _arguments_as_dict
 from slime.utils.types import Sample
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,31 @@ def sft_lambda() -> float:
         return float(raw)
     except ValueError:
         return 0.0
+
+
+def sft_max_samples() -> int:
+    """Max SFT rows per episode. Default 1 (last eligible turn). 0 = no cap."""
+    raw = (os.environ.get("OFFLOAD_SFT_MAX_SAMPLES") or "1").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 1
+    return max(0, n)
+
+
+def sft_max_seq_len() -> int:
+    """Optional SFT length budget. Default 0 = no cap (same as GRPO trajectories).
+
+    When set, long episodes keep the target ``y`` and left-trim older history.
+    Do not set a small cap: medium-length SFT rows pack denser than one long
+    GRPO sample and are more likely to fill ``max_tokens_per_gpu``.
+    """
+    raw = (os.environ.get("OFFLOAD_SFT_MAX_SEQ_LEN") or "0").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 0
+    return max(0, n)
 
 
 def is_sft_sample(sample: Any) -> bool:
@@ -60,6 +86,10 @@ def _assistant_content_with_think(*, reasoning: str, content: str) -> str:
 
 
 def _normalize_tool_calls(tool_calls: list[Any] | None) -> list[dict[str, Any]]:
+    """Chat-template shape: ``function.arguments`` must be a mapping (not JSON str).
+
+    Qwen templates do ``arguments|items``; OpenAI-wire GLM payloads store a string.
+    """
     out: list[dict[str, Any]] = []
     for i, call in enumerate(tool_calls or []):
         if not isinstance(call, dict):
@@ -69,19 +99,13 @@ def _normalize_tool_calls(tool_calls: list[Any] | None) -> list[dict[str, Any]]:
         arguments = function.get("arguments")
         if arguments is None:
             arguments = call.get("arguments", {})
-        if not isinstance(arguments, str):
-            try:
-                arguments = json.dumps(arguments if arguments is not None else {}, ensure_ascii=False)
-            except TypeError:
-                arguments = json.dumps({"_raw": str(arguments)}, ensure_ascii=False)
-        call_id = call.get("id") or f"sft-call-{i}"
-        out.append(
-            {
-                "id": str(call_id),
-                "type": "function",
-                "function": {"name": str(name), "arguments": arguments},
-            }
-        )
+        entry: dict[str, Any] = {
+            "type": "function",
+            "function": {"name": str(name), "arguments": _arguments_as_dict(arguments)},
+        }
+        call_id = call.get("id")
+        entry["id"] = str(call_id) if call_id else f"sft-call-{i}"
+        out.append(entry)
     return out
 
 
@@ -102,6 +126,53 @@ def _render_ids(
     return list(ids)
 
 
+def _split_system_prefix(history: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    i = 0
+    while i < len(history) and history[i].get("role") == "system":
+        i += 1
+    return history[:i], history[i:]
+
+
+def _history_fits(
+    tokenizer: Any,
+    history: list[dict[str, Any]],
+    *,
+    tools: list[dict] | None,
+    assistant_y: dict[str, Any],
+    max_seq: int,
+) -> bool:
+    try:
+        ids_y = _render_ids(tokenizer, history + [assistant_y], tools=tools, add_generation_prompt=False)
+    except Exception:
+        return False
+    return len(ids_y) <= max_seq
+
+
+def left_trim_history_to_fit(
+    tokenizer: Any,
+    history: list[dict[str, Any]],
+    *,
+    tools: list[dict] | None,
+    assistant_y: dict[str, Any],
+    max_seq: int,
+) -> list[dict[str, Any]] | None:
+    """Keep system + the newest turns so ``history + y`` is ≤ ``max_seq`` tokens.
+
+    Returns None if even system + the last non-system turn + y cannot fit.
+    """
+    if max_seq <= 0 or _history_fits(tokenizer, history, tools=tools, assistant_y=assistant_y, max_seq=max_seq):
+        return history
+    sys_msgs, rest = _split_system_prefix(history)
+    if not rest:
+        return sys_msgs if _history_fits(tokenizer, sys_msgs, tools=tools, assistant_y=assistant_y, max_seq=max_seq) else None
+    # Drop oldest non-system messages first; keep the turn that triggered offload.
+    for start in range(len(rest)):
+        trimmed = sys_msgs + rest[start:]
+        if _history_fits(tokenizer, trimmed, tools=tools, assistant_y=assistant_y, max_seq=max_seq):
+            return trimmed
+    return None
+
+
 def _common_prefix_len(a: list[int], b: list[int]) -> int:
     n = min(len(a), len(b))
     i = 0
@@ -119,6 +190,7 @@ def build_sft_token_sequence(
     glm_think: str,
     glm_content: str,
     glm_tool_calls: list[Any] | None,
+    max_seq: int | None = None,
 ) -> tuple[list[int], list[int], int] | None:
     """Return ``(tokens, loss_mask, response_length)`` or None if unusable.
 
@@ -142,6 +214,30 @@ def build_sft_token_sequence(
     if g_tools:
         assistant_y["tool_calls"] = g_tools
 
+    cap = sft_max_seq_len() if max_seq is None else max_seq
+    if cap > 0:
+        trimmed = left_trim_history_to_fit(
+            tokenizer,
+            history,
+            tools=tools,
+            assistant_y=assistant_y,
+            max_seq=cap,
+        )
+        if trimmed is None:
+            logger.warning(
+                "[offload_sft] skip: even system + last turn + y exceeds OFFLOAD_SFT_MAX_SEQ_LEN=%d",
+                cap,
+            )
+            return None
+        if len(trimmed) < len(history):
+            logger.info(
+                "[offload_sft] left-trim history %d -> %d messages to fit max_seq=%d",
+                len(history),
+                len(trimmed),
+                cap,
+            )
+        history = trimmed
+
     assistant_x: dict[str, Any] = {
         "role": "assistant",
         "content": _assistant_content_with_think(reasoning=x, content=""),
@@ -151,8 +247,8 @@ def build_sft_token_sequence(
         prompt_ids = _render_ids(tokenizer, history, tools=tools, add_generation_prompt=True)
         ids_y = _render_ids(tokenizer, history + [assistant_y], tools=tools, add_generation_prompt=False)
         ids_x = _render_ids(tokenizer, history + [assistant_x], tools=tools, add_generation_prompt=False)
-    except Exception:
-        logger.exception("[offload_sft] apply_chat_template failed; skip SFT sample")
+    except Exception as exc:
+        logger.warning("[offload_sft] apply_chat_template failed; skip SFT sample: %s", exc)
         return None
 
     prefix = _common_prefix_len(prompt_ids, ids_y)
@@ -230,7 +326,9 @@ def build_sft_samples(
     out: list[Sample] = []
     base_index = int(getattr(base, "index", 0) or 0)
     group_index = getattr(base, "group_index", None)
+    max_n = sft_max_samples()
 
+    eligible: list[tuple[int, dict[str, Any]]] = []
     for turn_idx, tc in enumerate(turn_costs):
         if not isinstance(tc, dict) or not turn_eligible_for_sft(tc):
             continue
@@ -238,13 +336,18 @@ def build_sft_samples(
         if not isinstance(history, list) or not history:
             logger.debug("[offload_sft] turn %d missing sft_history_messages; skip", turn_idx)
             continue
+        eligible.append((turn_idx, tc))
+    if max_n > 0:
+        eligible = eligible[-max_n:]
+
+    for turn_idx, tc in eligible:
         tools = tc.get("sft_tools_schema")
         if tools is not None and not isinstance(tools, list):
             tools = None
 
         built = build_sft_token_sequence(
             tokenizer,
-            history=history,
+            history=tc.get("sft_history_messages"),
             tools=tools,
             qwen_think=str(tc.get("qwen_think_prefix") or ""),
             glm_think=str(tc.get("teacher_think") or ""),
@@ -258,11 +361,17 @@ def build_sft_samples(
         if prompt_len < 0:
             continue
 
+        base_rid = getattr(base, "rollout_id", None)
+        if base_rid is None:
+            base_rid = base_index
+
         sft = Sample(
             index=base_index,
             group_index=group_index,
-            # Distinct rollout_id so SFT tokens do not inflate GRPO rollout_mask_sums.
-            rollout_id=-((base_index + 1) * 10_000 + turn_idx + 1),
+            # Same rollout_id as the GRPO siblings: slime compact validation
+            # requires one generate() fan-out list to share a single id. SFT
+            # rows are still excluded from GRPO grouping / mask-sum denom.
+            rollout_id=base_rid,
             prompt=copy.deepcopy(getattr(base, "prompt", "")),
             label=getattr(base, "label", None),
             tokens=tokens,
@@ -280,6 +389,8 @@ def build_sft_samples(
             train_metadata={
                 "objective": "sft",
                 "sft_turn_index": turn_idx,
+                # Own micro-batch: do not fill leftover tokens beside GRPO rows.
+                "pack_singleton": True,
             },
         )
         out.append(sft)

@@ -82,11 +82,39 @@ def ensure_assets(
             print(f"[bake] prepared {dst}", flush=True)
 
 
+def _registry_auth_payload(*, username: str, password: str) -> dict[str, Any]:
+    auth = base64.b64encode(f"{username}:{password}".encode()).decode()
+    return {
+        "auths": {
+            host: {"auth": auth}
+            for host in ("https://index.docker.io/v1/", "registry-1.docker.io", "docker.io")
+        }
+    }
+
+
+def write_registry_auth_file(dest: Path, *, username: str, password: str) -> None:
+    """Write a Kaniko-readable Docker config to ``dest`` (does not call ``docker login``)."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(_registry_auth_payload(username=username, password=password), indent=2) + "\n", encoding="utf-8")
+
+
+def hub_credentials_from_env() -> tuple[str | None, str | None]:
+    username = (
+        os.environ.get("DOCKERHUB_USERNAME") or os.environ.get("DOCKER_USERNAME") or ""
+    ).strip() or None
+    password = (
+        os.environ.get("DOCKERHUB_TOKEN")
+        or os.environ.get("DOCKERHUB_PASSWORD")
+        or os.environ.get("DOCKER_PASSWORD")
+        or ""
+    ).strip() or None
+    return username, password
+
+
 def ensure_registry_auth_from_env(*, username: str | None, password: str | None) -> None:
     """Write ~/.docker/config.json for Kaniko. Does not call ``docker login``."""
     if not username or not password:
         return
-    auth = base64.b64encode(f"{username}:{password}".encode()).decode()
     cfg_path = Path.home() / ".docker" / "config.json"
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     cfg: dict[str, Any] = {}
@@ -96,8 +124,7 @@ def ensure_registry_auth_from_env(*, username: str | None, password: str | None)
         except json.JSONDecodeError:
             cfg = {}
     auths = cfg.setdefault("auths", {})
-    for host in ("https://index.docker.io/v1/", "registry-1.docker.io", "docker.io"):
-        auths[host] = {"auth": auth}
+    auths.update(_registry_auth_payload(username=username, password=password)["auths"])
     cfg_path.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
     print(f"[bake] wrote registry auth for {username!r} → {cfg_path} (no docker login)", flush=True)
 
@@ -683,9 +710,16 @@ def kaniko_build(
     fake_proc = root / "fake_proc"
     prepare_filtered_proc(fake_proc)
 
-    docker_cfg = Path.home() / ".docker" / "config.json"
-    if docker_cfg.is_file():
-        shutil.copy2(docker_cfg, root / "root" / ".docker" / "config.json")
+    # Write Hub auth into the proot guest. Do not copy ~/.docker/config.json:
+    # that host file has vanished mid-bake (TOCTOU with parallel workers).
+    hub_user, hub_pass = hub_credentials_from_env()
+    guest_cfg = root / "root" / ".docker" / "config.json"
+    if hub_user and hub_pass:
+        write_registry_auth_file(guest_cfg, username=hub_user, password=hub_pass)
+    else:
+        docker_cfg = Path.home() / ".docker" / "config.json"
+        if docker_cfg.is_file():
+            guest_cfg.write_bytes(docker_cfg.read_bytes())
 
     etc = root / "etc"
     etc.mkdir(parents=True, exist_ok=True)
@@ -696,7 +730,7 @@ def kaniko_build(
         certs_dst = etc / "ssl" / "certs"
         if certs_dst.exists():
             shutil.rmtree(certs_dst)
-        shutil.copytree(certs_src, certs_dst, symlinks=True)
+        shutil.copytree(certs_src, certs_dst, symlinks=True, ignore_dangling_symlinks=True)
 
     out_host: Path | None = None
     if not push:

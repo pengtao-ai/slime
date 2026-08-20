@@ -338,6 +338,7 @@ class _AdapterService(metaclass=SingletonMeta):
             self.tool_parser,
             self.reasoning_parser,
         )
+        offload.log_train_config_once(args)
 
     def adapter_for(self, protocol: AdapterProtocol):
         return self.openai if protocol == "openai" else self.anthropic
@@ -540,7 +541,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 completion_tokens = md.get("completion_tokens")
                 if offload.reward_mode() == "help_seeking":
                     # When OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG=1, defer α to
-                    # compact_and_shape_group_help_seeking_rewards (group all-failed only).
+                    # compact_and_shape_group_help_seeking_rewards (withhold only
+                    # if a sibling solved without offload).
                     shaped = offload.compute_turn_rewards(
                         solved,
                         offload_stats,

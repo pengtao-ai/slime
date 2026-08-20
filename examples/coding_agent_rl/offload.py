@@ -117,6 +117,8 @@ DEFAULT_OFFLOAD_MALFORMED_PENALTY = 0.25
 DEFAULT_OFFLOAD_SEEK_ALPHA = 0.1
 DEFAULT_OFFLOAD_SEEK_EMPTY_SCALE = 0.5
 DEFAULT_OFFLOAD_UNIQUE_SOLVER_BONUS = 0.15
+# Group all-wrong + no valid seek → flat negative (help_seeking shaping).
+DEFAULT_OFFLOAD_NO_SEEK_PENALTY = 0.1
 # Compact filter defaults (hard remove_sample). Tight so open-without-close
 # spam is zero-masked before GRPO rather than training on flat −β batches.
 DEFAULT_COMPACT_ORPHAN_OPEN_K = 1
@@ -251,11 +253,27 @@ def unique_solver_bonus() -> float:
     return float(os.environ.get("OFFLOAD_UNIQUE_SOLVER_BONUS", str(DEFAULT_OFFLOAD_UNIQUE_SOLVER_BONUS)))
 
 
-def seek_only_when_all_wrong() -> bool:
-    """If true, help-seeking α is granted only when every sibling in the group failed.
+def no_seek_penalty() -> float:
+    """Magnitude of the all-wrong / no-seek penalty (stored as a positive number).
 
-    Per-sample finish then uses ``encourage_seek=False``; group shaping is applied
-    later by :func:`shape_group_help_seeking_rewards` (``--rollout-sample-filter-path``).
+    When ``OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG`` group shaping runs and **every**
+    sibling failed, trajs with no valid in-think offload get ``−this`` instead
+    of ``0``. Set env to ``0`` to disable.
+    """
+    raw = (os.environ.get("OFFLOAD_NO_SEEK_PENALTY") or str(DEFAULT_OFFLOAD_NO_SEEK_PENALTY)).strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return float(DEFAULT_OFFLOAD_NO_SEEK_PENALTY)
+
+
+def seek_only_when_all_wrong() -> bool:
+    """If true, defer help-seeking α to group shaping (see :func:`shape_group_help_seeking_rewards`).
+
+    Group shaping withholds α when any sibling **solved without offload**; a
+    solve that itself used offload does not block α for failed help-seekers.
+    Per-sample finish uses ``encourage_seek=False``; α is applied later via
+    ``--rollout-sample-filter-path``.
     """
     return os.environ.get("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "").strip().lower() in (
         "1",
@@ -263,6 +281,119 @@ def seek_only_when_all_wrong() -> bool:
         "yes",
         "on",
     )
+
+
+def resolved_train_config() -> dict[str, Any]:
+    """Effective offload / help_seeking / SFT / compact knobs (resolved defaults).
+
+    Intended for startup logs and run-dir dumps so later A/B compares do not
+    depend on reconstructing env from launch scripts.
+    """
+    from examples.coding_agent_rl import offload_sft
+
+    return {
+        "SLIME_AGENT_OFFLOAD": offload_enabled(),
+        "OFFLOAD_REWARD_MODE": reward_mode(),
+        "OFFLOAD_EFFICIENCY_LAMBDA": efficiency_lambda(),
+        "OFFLOAD_SEEK_ALPHA": seek_alpha(),
+        "OFFLOAD_SEEK_EMPTY_SCALE": seek_empty_scale(),
+        "OFFLOAD_UNIQUE_SOLVER_BONUS": unique_solver_bonus(),
+        "OFFLOAD_NO_SEEK_PENALTY": no_seek_penalty(),
+        # Withhold α only when a sibling solved with offload_count==0.
+        "OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG": seek_only_when_all_wrong(),
+        "OFFLOAD_THINK_FORMAT_PENALTY": think_format_penalty(),
+        "OFFLOAD_MALFORMED_PENALTY": malformed_penalty(),
+        "OFFLOAD_MALFORMED_PENALTY_CAP": malformed_penalty_cap(),
+        "OFFLOAD_MALFORMED_OPEN_RUN": malformed_open_run_threshold(),
+        "OFFLOAD_MAX_TOKENS": _max_tokens(),
+        "OFFLOAD_SFT_LAMBDA": offload_sft.sft_lambda(),
+        "OFFLOAD_SFT_MAX_SAMPLES": offload_sft.sft_max_samples(),
+        "OFFLOAD_SFT_MAX_SEQ_LEN": offload_sft.sft_max_seq_len(),
+        "OFFLOAD_COMPACT_ORPHAN_OPEN_K": int(
+            os.environ.get("OFFLOAD_COMPACT_ORPHAN_OPEN_K", str(DEFAULT_COMPACT_ORPHAN_OPEN_K))
+        ),
+        "OFFLOAD_COMPACT_OPEN_CLOSE_RATIO": float(
+            os.environ.get("OFFLOAD_COMPACT_OPEN_CLOSE_RATIO", str(DEFAULT_COMPACT_OPEN_CLOSE_RATIO))
+        ),
+        "OFFLOAD_COMPACT_SPECIAL_TOKEN_RATIO": float(
+            os.environ.get("OFFLOAD_COMPACT_SPECIAL_TOKEN_RATIO", str(DEFAULT_COMPACT_SPECIAL_TOKEN_RATIO))
+        ),
+        "OFFLOAD_COMPACT_SPECIAL_TOKEN_RUN": int(
+            os.environ.get("OFFLOAD_COMPACT_SPECIAL_TOKEN_RUN", str(DEFAULT_COMPACT_SPECIAL_TOKEN_RUN))
+        ),
+        "OFFLOAD_TRUNCATE_OPEN_RUN": truncate_open_run_limit(),
+        "OFFLOAD_TRUNCATE_ORPHAN": truncate_orphan_limit(),
+        "OFFLOAD_OPEN_TOKEN_ID": offload_open_token_id(),
+        "OFFLOAD_CLOSE_TOKEN_ID": offload_close_token_id(),
+        "OFFLOAD_STOP_TOKEN_ID": (os.environ.get("OFFLOAD_STOP_TOKEN_ID") or "").strip() or None,
+        "ROLLOUT_STOP_TOKEN_IDS": (os.environ.get("ROLLOUT_STOP_TOKEN_IDS") or "").strip() or None,
+        "SLIME_OFFLOAD_EMBED_IN_TRAJECTORY": embed_offload_in_trajectory_enabled(),
+        "DASHSCOPE_BASE_URL": _base_url(),
+        "DASHSCOPE_MODEL": _model(),
+        "COST_SMALL_PROMPT": COST_SMALL_PROMPT,
+        "COST_SMALL_OUTPUT": COST_SMALL_OUTPUT,
+        "COST_GLM_INPUT": COST_GLM_INPUT,
+        "COST_GLM_OUTPUT": COST_GLM_OUTPUT,
+        "OFFLOAD_BASELINE_PROMPT_TOKENS": _DEFAULT_BASELINE_PROMPT_TOKENS,
+        "OFFLOAD_BASELINE_COMPLETION_TOKENS": _DEFAULT_BASELINE_COMPLETION_TOKENS,
+    }
+
+
+_TRAIN_CONFIG_LOGGED = False
+
+
+def log_train_config_once(args: Any | None = None) -> dict[str, Any]:
+    """Log resolved config once per process; optionally dump ``offload_config.json``."""
+    global _TRAIN_CONFIG_LOGGED
+    cfg = resolved_train_config()
+    if _TRAIN_CONFIG_LOGGED:
+        return cfg
+    _TRAIN_CONFIG_LOGGED = True
+    logger.info("[coding_agent_offload] train_config=%s", cfg)
+
+    dump_path = _resolve_config_dump_path(args)
+    if dump_path is not None:
+        try:
+            import json
+            from pathlib import Path
+
+            path = Path(dump_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
+            logger.info("[coding_agent_offload] wrote train_config → %s", path)
+        except Exception:
+            logger.exception("[coding_agent_offload] failed to write train_config json")
+    return cfg
+
+
+def _resolve_config_dump_path(args: Any | None) -> str | None:
+    """Prefer ``<run_root>/offload_config.json`` beside rollout dumps / checkpoints."""
+    import os
+    from pathlib import Path
+
+    for key in ("OFFLOAD_CONFIG_JSON", "RUN_ROOT"):
+        raw = (os.environ.get(key) or "").strip()
+        if not raw:
+            continue
+        p = Path(raw)
+        if key == "RUN_ROOT":
+            return str(p / "offload_config.json")
+        return str(p)
+
+    if args is None:
+        return None
+    dbg = getattr(args, "save_debug_rollout_data", None)
+    if dbg:
+        # e.g. .../run/rollout_dumps/rollout_{rollout_id}.pt → .../run/offload_config.json
+        stem = str(dbg).split("{", 1)[0]
+        parent = Path(stem).parent
+        if parent.name in ("rollout_dumps", "timelines"):
+            return str(parent.parent / "offload_config.json")
+        return str(parent / "offload_config.json")
+    save = getattr(args, "save", None)
+    if save:
+        return str(Path(str(save)).parent / "offload_config.json")
+    return None
 
 
 def _api_key() -> str:
@@ -1934,6 +2065,35 @@ def _session_solved(metadata: dict[str, Any] | None) -> bool:
     return float(md.get("solved", 0) or 0) > 0.0
 
 
+def _session_offload_count(metadata: dict[str, Any] | None) -> int:
+    stats = (metadata or {}).get("offload_stats") or {}
+    return int(stats.get("offload_count", 0) or 0)
+
+
+def _session_outside_think_count(metadata: dict[str, Any] | None) -> int:
+    stats = (metadata or {}).get("offload_stats") or {}
+    return int(stats.get("offload_outside_think_count", 0) or 0)
+
+
+def _session_has_valid_seek(metadata: dict[str, Any] | None) -> bool:
+    """True if the session did at least one clean in-think offload (eligible for α)."""
+    md = metadata or {}
+    stats = md.get("offload_stats") or {}
+    turn_costs = list(md.get("turn_costs") or stats.get("turn_costs") or [])
+    if turn_costs:
+        return any(
+            bool(tc.get("valid_offload")) and not tc.get("repaired") and not tc.get("outside_think")
+            for tc in turn_costs
+            if isinstance(tc, dict)
+        )
+    return _session_offload_count(md) >= 1 and _session_outside_think_count(md) < 1
+
+
+def _session_solo_solved(metadata: dict[str, Any] | None) -> bool:
+    """True if the session graded solved and never offloaded (no help-seeking)."""
+    return _session_solved(metadata) and _session_offload_count(metadata) < 1
+
+
 def _is_sft_sample(sample: Any) -> bool:
     tmd = getattr(sample, "train_metadata", None) or {}
     return isinstance(tmd, dict) and tmd.get("objective") == "sft"
@@ -1952,8 +2112,35 @@ def _session_segments(group_item: Any) -> list[Any]:
     return [group_item]
 
 
+def _write_session_turn_rewards(
+    segs: list[Any],
+    *,
+    turn_rewards: list[float],
+    turn_costs: list[Any],
+    reward: float,
+) -> None:
+    for sample in segs:
+        smd = dict(getattr(sample, "metadata", None) or {})
+        smd["turn_rewards"] = list(turn_rewards)
+        smd["turn_costs"] = list(turn_costs)
+        sample.metadata = smd
+        tmd = dict(getattr(sample, "train_metadata", None) or {})
+        tmd["turn_rewards"] = list(turn_rewards)
+        if "turn_token_spans" in smd:
+            tmd["turn_token_spans"] = smd["turn_token_spans"]
+        sample.train_metadata = tmd
+        cur = float(getattr(sample, "reward", 0.0) or 0.0)
+        if cur <= 0.0:
+            sample.reward = float(reward)
+
+
 def shape_group_help_seeking_rewards(args: Any, groups: list) -> None:
-    """Grant help-seeking α on valid offload turns when the whole group failed.
+    """Group help-seeking shaping under ``OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG``.
+
+    - Skip α when a sibling **solo-solved** (solved, ``offload_count==0``).
+    - Else grant α on clean in-think offload turns.
+    - When **every** sibling failed and a traj never validly sought help, set
+      reward to ``−OFFLOAD_NO_SEEK_PENALTY`` (default 0.1) instead of 0.
 
     Mutates ``turn_rewards`` / ``sample.reward`` in place. tmax does not apply
     ``empty_scale`` on empty_patch.
@@ -1965,14 +2152,19 @@ def shape_group_help_seeking_rewards(args: Any, groups: list) -> None:
     alpha_v = seek_alpha()
     emp_scale = seek_empty_scale()
     mal_pen = malformed_penalty()
+    no_seek_pen = no_seek_penalty()
 
     for group in groups:
         sessions = [_session_segments(item) for item in group]
         sessions = [segs for segs in sessions if segs]
         if not sessions:
             continue
-        if any(_session_solved(getattr(segs[0], "metadata", None)) for segs in sessions):
+        if any(_session_solo_solved(getattr(segs[0], "metadata", None)) for segs in sessions):
             continue
+
+        all_wrong = not any(
+            _session_solved(getattr(segs[0], "metadata", None)) for segs in sessions
+        )
 
         for segs in sessions:
             md = dict(getattr(segs[0], "metadata", None) or {})
@@ -1987,6 +2179,7 @@ def shape_group_help_seeking_rewards(args: Any, groups: list) -> None:
                 metadata=md,
             )
             credit = max(0.0, float(credit))
+            sought = _session_has_valid_seek(md)
 
             if turn_costs and (not turn_rewards or len(turn_rewards) != len(turn_costs)):
                 turn_rewards = [0.0] * len(turn_costs)
@@ -2005,33 +2198,32 @@ def shape_group_help_seeking_rewards(args: Any, groups: list) -> None:
                     ):
                         if float(turn_rewards[i]) <= 0.0:
                             turn_rewards[i] = credit
-                if turn_rewards:
-                    mean_r = float(sum(turn_rewards) / max(len(turn_rewards), 1))
-                    for sample in segs:
-                        smd = dict(getattr(sample, "metadata", None) or {})
-                        smd["turn_rewards"] = list(turn_rewards)
-                        smd["turn_costs"] = list(turn_costs)
-                        sample.metadata = smd
-                        tmd = dict(getattr(sample, "train_metadata", None) or {})
-                        tmd["turn_rewards"] = list(turn_rewards)
-                        if "turn_token_spans" in smd:
-                            tmd["turn_token_spans"] = smd["turn_token_spans"]
-                        sample.train_metadata = tmd
-                        if float(getattr(sample, "reward", 0.0) or 0.0) <= 0.0:
-                            sample.reward = mean_r
+                mean_r = float(sum(turn_rewards) / max(len(turn_rewards), 1))
+                if all_wrong and not sought and no_seek_pen > 0.0:
+                    # Prefer keeping a worse malformed −β if already present.
+                    if mean_r > -no_seek_pen:
+                        turn_rewards = [-no_seek_pen] * len(turn_rewards)
+                        mean_r = -no_seek_pen
+                _write_session_turn_rewards(
+                    segs, turn_rewards=turn_rewards, turn_costs=turn_costs, reward=mean_r
+                )
                 continue
 
             # Legacy scalar path (no turn ledger).
-            oc = int(stats.get("offload_count", 0) or 0)
-            outside = int(stats.get("offload_outside_think_count", 0) or 0)
-            if oc < 1 or outside > 0:
+            if sought:
+                for sample in segs:
+                    if float(getattr(sample, "reward", 0.0) or 0.0) <= 0.0:
+                        sample.reward = credit
                 continue
-            for sample in segs:
-                if float(getattr(sample, "reward", 0.0) or 0.0) <= 0.0:
-                    sample.reward = credit
+            if all_wrong and no_seek_pen > 0.0:
+                for sample in segs:
+                    cur = float(getattr(sample, "reward", 0.0) or 0.0)
+                    if cur > -no_seek_pen:
+                        sample.reward = -no_seek_pen
 
 
 def compact_and_shape_group_help_seeking_rewards(args: Any, groups: list) -> None:
     """Compact hard-filter then help-seeking group α shaping."""
+    log_train_config_once(args)
     compact_filter_offload_samples(args, groups)
     shape_group_help_seeking_rewards(args, groups)

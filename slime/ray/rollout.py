@@ -769,9 +769,20 @@ class RolloutManager:
         rollout_id_list = train_data["rollout_ids"]
         mask_sums_per_sample = [sum(m) for m in loss_masks]
         rollout_total_mask: dict[int, int] = {}
-        for rid, ms in zip(rollout_id_list, mask_sums_per_sample, strict=True):
+        sft_flags = []
+        for rid, ms, sample in zip(rollout_id_list, mask_sums_per_sample, samples, strict=True):
+            tmd = getattr(sample, "train_metadata", None) or {}
+            is_sft = isinstance(tmd, dict) and tmd.get("objective") == "sft"
+            sft_flags.append(is_sft)
+            # Online SFT rows share compact rollout_id with GRPO siblings but
+            # must not inflate the GRPO per-rollout denominator.
+            if is_sft:
+                continue
             rollout_total_mask[rid] = rollout_total_mask.get(rid, 0) + ms
-        train_data["rollout_mask_sums"] = [rollout_total_mask[rid] for rid in rollout_id_list]
+        train_data["rollout_mask_sums"] = [
+            ms if is_sft else rollout_total_mask.get(rid, ms)
+            for rid, ms, is_sft in zip(rollout_id_list, mask_sums_per_sample, sft_flags, strict=True)
+        ]
 
         # Overwrite raw_reward when available. Mixed-source batches may only
         # populate this field for a subset of samples (e.g. SWE but not code).
@@ -808,8 +819,8 @@ class RolloutManager:
         if samples[0].rollout_routed_experts is not None:
             train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]
 
-        if samples[0].train_metadata is not None:
-            train_data["metadata"] = [sample.train_metadata for sample in samples]
+        if any(getattr(sample, "train_metadata", None) is not None for sample in samples):
+            train_data["metadata"] = [getattr(sample, "train_metadata", None) for sample in samples]
 
         if any(sample.multimodal_train_inputs is not None for sample in samples):
             train_data["multimodal_train_inputs"] = [sample.multimodal_train_inputs for sample in samples]
@@ -841,12 +852,20 @@ class RolloutManager:
         total_lengths = [len(t) for t in data["tokens"]]
         data["total_lengths"] = total_lengths
 
+        metas = data.get("metadata")
+        force_singleton = None
+        if metas:
+            flags = [isinstance(m, dict) and bool(m.get("pack_singleton")) for m in metas]
+            if any(flags):
+                force_singleton = flags
+
         partitions, micro_batch_indices, num_microbatches, global_batch_sizes = build_dp_schedule(
             self.args,
             self.train_parallel_config,
             total_lengths,
             global_batch_size=self.args.global_batch_size,
             rollout_indices=data["rollout_ids"],
+            force_singleton=force_singleton,
         )
 
         # Package per-rank rollout_data
@@ -872,6 +891,7 @@ class RolloutManager:
                 "source_names",
                 "prompt",
                 "teacher_log_probs",
+                "metadata",
             ]:
                 if key not in data:
                     continue

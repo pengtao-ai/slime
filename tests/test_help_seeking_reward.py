@@ -87,22 +87,60 @@ def test_shape_group_all_wrong_grants_alpha(monkeypatch):
     monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
     monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
     monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
+    monkeypatch.setenv("OFFLOAD_NO_SEEK_PENALTY", "0.1")
     a = _sample(reward=0.0, solved=0.0, oc=1)
     b = _sample(reward=0.0, solved=0.0, oc=0)
     offload.shape_group_help_seeking_rewards(None, [[a, b]])
     assert a.reward == pytest.approx(0.1)
-    assert b.reward == 0.0
+    assert b.reward == pytest.approx(-0.1)
 
 
-def test_shape_group_any_solved_does_not_encourage(monkeypatch):
+def test_shape_group_all_wrong_no_seek_penalty(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
+    monkeypatch.setenv("OFFLOAD_NO_SEEK_PENALTY", "0.15")
+    a = _sample(reward=0.0, solved=0.0, oc=0)
+    b = _sample(reward=0.0, solved=0.0, oc=0)
+    offload.shape_group_help_seeking_rewards(None, [[a, b]])
+    assert a.reward == pytest.approx(-0.15)
+    assert b.reward == pytest.approx(-0.15)
+
+
+def test_shape_group_not_all_wrong_skips_no_seek_penalty(monkeypatch):
+    """If someone solved via offload, failed non-seekers stay at 0 (not 全做错)."""
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
+    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
+    monkeypatch.setenv("OFFLOAD_NO_SEEK_PENALTY", "0.1")
+    failed = _sample(reward=0.0, solved=0.0, oc=0)
+    offload_solved = _sample(reward=0.85, solved=1.0, oc=2)
+    offload.shape_group_help_seeking_rewards(None, [[failed, offload_solved]])
+    assert failed.reward == 0.0
+    assert offload_solved.reward == pytest.approx(0.85)
+
+
+def test_shape_group_solo_solved_does_not_encourage(monkeypatch):
+    """Solo solve (no offload) blocks α for failed help-seekers."""
     monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
     monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
     monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
     failed_offload = _sample(reward=0.0, solved=0.0, oc=2)
-    solved = _sample(reward=0.9, solved=1.0, oc=0)
-    offload.shape_group_help_seeking_rewards(None, [[failed_offload, solved]])
+    solo_solved = _sample(reward=0.9, solved=1.0, oc=0)
+    offload.shape_group_help_seeking_rewards(None, [[failed_offload, solo_solved]])
     assert failed_offload.reward == 0.0
-    assert solved.reward == pytest.approx(0.9)
+    assert solo_solved.reward == pytest.approx(0.9)
+
+
+def test_shape_group_offload_solved_still_grants_alpha(monkeypatch):
+    """A sibling that solved *with* offload must not block α."""
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
+    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
+    failed_offload = _sample(reward=0.0, solved=0.0, oc=2)
+    offload_solved = _sample(reward=0.85, solved=1.0, oc=3)
+    offload.shape_group_help_seeking_rewards(None, [[failed_offload, offload_solved]])
+    assert failed_offload.reward == pytest.approx(0.1)
+    assert offload_solved.reward == pytest.approx(0.85)
 
 
 def test_shape_group_noop_without_flag(monkeypatch):
@@ -117,13 +155,14 @@ def test_shape_group_fanout_segments(monkeypatch):
     monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
     monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
     monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
+    monkeypatch.setenv("OFFLOAD_NO_SEEK_PENALTY", "0.1")
     seg0 = _sample(reward=0.0, solved=0.0, oc=1)
     seg1 = _sample(reward=0.0, solved=0.0, oc=1)
     other = _sample(reward=0.0, solved=0.0, oc=0)
     offload.shape_group_help_seeking_rewards(None, [[[seg0, seg1], other]])
     assert seg0.reward == pytest.approx(0.1)
     assert seg1.reward == pytest.approx(0.1)
-    assert other.reward == 0.0
+    assert other.reward == pytest.approx(-0.1)
 
 
 def test_tmax_empty_patch_does_not_scale_alpha():
@@ -269,6 +308,7 @@ def test_shape_group_skips_alpha_on_repaired(monkeypatch):
     monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
     monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
     monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
+    monkeypatch.setenv("OFFLOAD_NO_SEEK_PENALTY", "0.1")
     a = _sample(reward=0.0, solved=0.0, oc=1)
     a.metadata["turn_costs"] = [{"valid_offload": True, "repaired": True, "outside_think": False,
                                   "orphan_open_count": 0, "malformed_count": 0, "max_open_run": 0}]
@@ -277,7 +317,7 @@ def test_shape_group_skips_alpha_on_repaired(monkeypatch):
     b = _sample(reward=0.0, solved=0.0, oc=0)
     offload.shape_group_help_seeking_rewards(None, [[a, b]])
     assert a.reward == pytest.approx(-0.25)
-    assert b.reward == 0.0
+    assert b.reward == pytest.approx(-0.1)
 
 
 def test_truncate_offload_open_spam_consecutive():
@@ -428,11 +468,41 @@ def test_shape_group_tmax_empty_no_scale(monkeypatch):
     monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
     monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
     monkeypatch.setenv("OFFLOAD_SEEK_EMPTY_SCALE", "0.5")
+    monkeypatch.setenv("OFFLOAD_NO_SEEK_PENALTY", "0.1")
     a = _sample(reward=0.0, solved=0.0, oc=1, empty_patch=True)
     a.metadata["protocol"] = "tmax"
     b = _sample(reward=0.0, solved=0.0, oc=0)
     offload.shape_group_help_seeking_rewards(None, [[a, b]])
     assert a.reward == pytest.approx(0.1)
+    assert b.reward == pytest.approx(-0.1)
+
+
+def test_resolved_train_config_and_dump(tmp_path, monkeypatch):
+    monkeypatch.setenv("SLIME_AGENT_OFFLOAD", "1")
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
+    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.25")
+    monkeypatch.setenv("OFFLOAD_EFFICIENCY_LAMBDA", "0.3")
+    monkeypatch.setenv("OFFLOAD_SFT_LAMBDA", "1")
+    monkeypatch.setenv("RUN_ROOT", str(tmp_path))
+    offload._TRAIN_CONFIG_LOGGED = False
+    cfg = offload.resolved_train_config()
+    assert cfg["OFFLOAD_REWARD_MODE"] == "help_seeking"
+    assert cfg["OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG"] is True
+    assert cfg["OFFLOAD_SEEK_ALPHA"] == pytest.approx(0.25)
+    assert cfg["OFFLOAD_EFFICIENCY_LAMBDA"] == pytest.approx(0.3)
+    assert cfg["OFFLOAD_SFT_LAMBDA"] == pytest.approx(1.0)
+    logged = offload.log_train_config_once(None)
+    assert logged["OFFLOAD_SEEK_ALPHA"] == pytest.approx(0.25)
+    path = tmp_path / "offload_config.json"
+    assert path.is_file()
+    import json
+
+    disk = json.loads(path.read_text())
+    assert disk["OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG"] is True
+    # second call is a no-op for logging / overwrite is fine; flag stays set
+    offload.log_train_config_once(None)
+    assert offload._TRAIN_CONFIG_LOGGED is True
 
 
 def test_turn_advantage_paints_residuals():

@@ -322,5 +322,41 @@ def test_rejects_when_fewer_rollouts_than_gbs():
         build_dp_schedule(args, tp, [3] * 6, global_batch_size=4, rollout_indices=[0, 0, 1, 1, 2, 2])
 
 
+@pytest.mark.unit
+def test_force_singleton_does_not_fill_leftover():
+    """Flagged samples stay alone even when they would fit a leftover bin."""
+    # 12 + 4 == 16 == max_per_bin, so first-fit would otherwise pack them.
+    total_lengths = [12, 4, 4, 4]
+    rollout_indices = list(range(4))
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=16)
+    tp = make_tp(dp_size=1)
+    force_singleton = [False, True, True, True]
+
+    partitions, mbi, nmb, _gbs = build_dp_schedule(
+        args,
+        tp,
+        total_lengths,
+        global_batch_size=4,
+        rollout_indices=rollout_indices,
+        force_singleton=force_singleton,
+    )
+    assert_invariants(
+        partitions,
+        mbi,
+        nmb,
+        dp_size=1,
+        expected_global_sample_indices=range(4),
+        total_lengths=total_lengths,
+        max_per_bin=16,
+    )
+    partition = partitions[0]
+    for global_i, flagged in enumerate(force_singleton):
+        if not flagged:
+            continue
+        local = partition.index(global_i)
+        owners = [mbs for mbs in mbi[0] if local in mbs]
+        assert len(owners) == 1 and owners[0] == [local], f"singleton sample {global_i} packed into {owners}"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
