@@ -11,6 +11,17 @@ from examples.coding_agent_rl import offload
 NUM_GPUS = 0
 
 
+@pytest.fixture(autouse=True)
+def _clear_seek_budget_env(monkeypatch):
+    for key in (
+        "OFFLOAD_SEEK_BUDGET",
+        "OFFLOAD_SEEK_BUDGET_TURN_K",
+        "OFFLOAD_SEEK_BUDGET_DECAY",
+        "OFFLOAD_SEEK_OVERAGE_PENALTY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
 def _stats(*, oc: int = 0, outside: int = 0, small_o: int = 100, glm_o: int = 0) -> dict:
     return {
         "offload_count": oc,
@@ -94,15 +105,32 @@ def test_shape_group_all_wrong_grants_alpha(monkeypatch):
     assert b.reward == 0.0
 
 
-def test_shape_group_any_solved_does_not_encourage(monkeypatch):
+def test_shape_group_solo_solved_does_not_encourage(monkeypatch):
+    """Withhold α when a sibling solved without offload."""
     monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
     monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
     monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
     failed_offload = _sample(reward=0.0, solved=0.0, oc=2)
-    solved = _sample(reward=0.9, solved=1.0, oc=0)
-    offload.shape_group_help_seeking_rewards(None, [[failed_offload, solved]])
+    solved_solo = _sample(reward=0.9, solved=1.0, oc=0)
+    offload.shape_group_help_seeking_rewards(None, [[failed_offload, solved_solo]])
     assert failed_offload.reward == 0.0
-    assert solved.reward == pytest.approx(0.9)
+    assert solved_solo.reward == pytest.approx(0.9)
+
+
+def test_shape_group_solved_with_offload_still_grants_alpha(monkeypatch):
+    """A sibling that solved *with* offload does not block α for failed seekers."""
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
+    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
+    failed_offload = _sample(reward=0.0, solved=0.0, oc=2)
+    solved_with_help = _sample(reward=0.8, solved=1.0, oc=3)
+    # Pretend solved path already painted turn rewards; must not be overwritten with α.
+    solved_with_help.metadata["turn_costs"] = [_turn(valid=True), _turn(valid=False)]
+    solved_with_help.metadata["turn_rewards"] = [0.7, 1.0]
+    offload.shape_group_help_seeking_rewards(None, [[failed_offload, solved_with_help]])
+    assert failed_offload.reward == pytest.approx(0.1)
+    assert solved_with_help.reward == pytest.approx(0.8)
+    assert solved_with_help.metadata["turn_rewards"] == [0.7, 1.0]
 
 
 def test_shape_group_noop_without_flag(monkeypatch):
@@ -283,6 +311,64 @@ def test_shape_group_tmax_empty_no_scale(monkeypatch):
     b = _sample(reward=0.0, solved=0.0, oc=0)
     offload.shape_group_help_seeking_rewards(None, [[a, b]])
     assert a.reward == pytest.approx(0.1)
+
+
+def test_resolve_seek_budget_modes(monkeypatch):
+    monkeypatch.delenv("OFFLOAD_SEEK_BUDGET", raising=False)
+    monkeypatch.delenv("OFFLOAD_SEEK_BUDGET_TURN_K", raising=False)
+    assert offload.resolve_seek_budget(12) is None
+
+    monkeypatch.setenv("OFFLOAD_SEEK_BUDGET", "4")
+    assert offload.resolve_seek_budget(12) == 4
+
+    monkeypatch.delenv("OFFLOAD_SEEK_BUDGET", raising=False)
+    monkeypatch.setenv("OFFLOAD_SEEK_BUDGET_TURN_K", "4")
+    assert offload.resolve_seek_budget(12) == 3  # 12//4
+    assert offload.resolve_seek_budget(3) == 1  # max(1, 0)
+
+    monkeypatch.setenv("OFFLOAD_SEEK_BUDGET", "2")
+    assert offload.resolve_seek_budget(12) == 2  # min(3, 2)
+
+
+def test_seek_budget_alpha_decay():
+    assert offload.seek_budget_alpha_scale(1, 2, decay=0.5) == 1.0
+    assert offload.seek_budget_alpha_scale(2, 2, decay=0.5) == 1.0
+    assert offload.seek_budget_alpha_scale(3, 2, decay=0.5) == pytest.approx(0.5)
+    assert offload.seek_budget_alpha_scale(4, 2, decay=0.5) == pytest.approx(0.25)
+    assert offload.seek_budget_alpha_scale(3, None) == 1.0
+
+
+def test_compute_turn_rewards_soft_budget_decays_alpha(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    monkeypatch.setenv("OFFLOAD_SEEK_BUDGET", "1")
+    monkeypatch.setenv("OFFLOAD_SEEK_BUDGET_DECAY", "0.5")
+    monkeypatch.delenv("OFFLOAD_SEEK_BUDGET_TURN_K", raising=False)
+    turns = [_turn(valid=True), _turn(valid=True), _turn(valid=False)]
+    stats = {"turn_costs": turns, "offload_count": 2, "offload_outside_think_count": 0}
+    out = offload.compute_turn_rewards(0.0, stats, alpha=0.1, encourage_seek=True)
+    assert out["seek_budget"] == 1
+    assert out["turn_rewards"][0] == pytest.approx(0.1)
+    assert out["turn_rewards"][1] == pytest.approx(0.05)
+    assert out["turn_rewards"][2] == 0.0
+
+
+def test_compute_turn_rewards_soft_budget_solved_overage(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_SEEK_BUDGET", "1")
+    monkeypatch.setenv("OFFLOAD_SEEK_OVERAGE_PENALTY", "0.1")
+    monkeypatch.delenv("OFFLOAD_SEEK_BUDGET_TURN_K", raising=False)
+    turns = [_turn(valid=True, small_o=0, glm_o=0), _turn(valid=True, small_o=0, glm_o=0)]
+    stats = {"turn_costs": turns, "offload_count": 2, "offload_outside_think_count": 0}
+    out = offload.compute_turn_rewards(1.0, stats, lam=0.0)
+    assert out["turn_rewards"][0] == pytest.approx(1.0)
+    assert out["turn_rewards"][1] == pytest.approx(0.9)
+
+
+def test_help_seeking_scalar_soft_budget(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_SEEK_BUDGET", "1")
+    monkeypatch.setenv("OFFLOAD_SEEK_BUDGET_DECAY", "0.5")
+    monkeypatch.delenv("OFFLOAD_SEEK_BUDGET_TURN_K", raising=False)
+    r = offload.help_seeking_reward(0.0, _stats(oc=3), alpha=0.1, n_turns=8)
+    assert r == pytest.approx(0.1 * (0.5**2))
 
 
 def test_turn_advantage_paints_residuals():

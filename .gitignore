@@ -17,6 +17,7 @@ examples/coding_agent_rl/docker_build/verify_failures_reward1_glm_20260728.jsonl
 examples/coding_agent_rl/docker_build/dockerfiles/
 examples/coding_agent_rl/docker_build/.env
 examples/coding_agent_rl/data/
+examples/coding_agent_rl/docker_build/dockerfiles_tmax
 # C extensions
 *.so
 a_csv/

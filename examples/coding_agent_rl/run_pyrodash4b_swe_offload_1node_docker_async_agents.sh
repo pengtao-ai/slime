@@ -7,9 +7,8 @@
 # 4-6=high, 7-9=max via chat_template_kwargs.thinking) and returns the
 # continuation so the agent can keep editing. Default train reward is
 # help_seeking (OFFLOAD_REWARD_MODE) with OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG:
-# α only when every sibling in the GRPO group failed and this traj did
-# in-think offload; otherwise unsolved→0 / solved→(1-λ*cost_ratio).
-# Empty patches never count as solved.
+# group α on valid in-think offload unless a sibling solved without offload;
+# otherwise unsolved→0 / solved→(1-λ*cost_ratio). Empty patches never count as solved.
 #
 # Prerequisites:
 #   bash examples/coding_agent_rl/convert_pyrodash4b_to_torch_dist.sh
@@ -48,9 +47,9 @@ SLIME_DIR="${SLIME_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 export SAVE_INTERVAL="${SAVE_INTERVAL:-20}"
 # ---- mid-turn offload ----
 export SLIME_AGENT_OFFLOAD=1
-export OFFLOAD_EFFICIENCY_LAMBDA=0.5
-# help_seeking + only-all-wrong: α only if the whole GRPO group failed
-# (see offload.shape_group_help_seeking_rewards). Else do not encourage offload.
+export OFFLOAD_EFFICIENCY_LAMBDA=0.1
+# help_seeking + SEEK_ONLY_WHEN_ALL_WRONG: withhold α only if a sibling
+# solved without offload (see offload.shape_group_help_seeking_rewards).
 # Set OFFLOAD_REWARD_MODE=cost_aware to restore the old "fail → 0" shaping.
 export OFFLOAD_REWARD_MODE=help_seeking
 export OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG=1
@@ -58,6 +57,11 @@ export OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG=1
 export OFFLOAD_SEEK_ALPHA=0.1
 export OFFLOAD_SEEK_EMPTY_SCALE=0.5
 export OFFLOAD_UNIQUE_SOLVER_BONUS=0.15
+# Soft seek budget: budget=max(1, n_turns//K); over-budget α*=decay^excess, solved -= pen*excess.
+export OFFLOAD_SEEK_BUDGET_TURN_K="${OFFLOAD_SEEK_BUDGET_TURN_K:-2}"
+export OFFLOAD_SEEK_BUDGET_DECAY="${OFFLOAD_SEEK_BUDGET_DECAY:-0.5}"
+export OFFLOAD_SEEK_OVERAGE_PENALTY="${OFFLOAD_SEEK_OVERAGE_PENALTY:-0.05}"
+# Optional fixed cap (min with turn budget when both set): OFFLOAD_SEEK_BUDGET=4
 export ADAPTER_MAX_TURNS_PER_SID="${ADAPTER_MAX_TURNS_PER_SID:-50}"
 export DASHSCOPE_BASE_URL=http://208.64.254.187:8001/v1
 export DASHSCOPE_API_KEY=sk-6137d26281697017ef07ef4da0823dc16d32acaad253ecac
@@ -79,9 +83,9 @@ fi
 
 # ---- PyroDash checkpoints (BF16 train + BF16 rollout) ----
 # SGLang loads padded HF vocab rows; Megatron torch_dist is padded to 248320.
-export HF_CHECKPOINT="${HF_CHECKPOINT:-/workspace/models/pyromind/PyroDash-4B-SFT-0803}"
-export REF_MODEL_PATH="${REF_MODEL_PATH:-/workspace/models/pyromind/PyroDash-4B-SFT-0803_torch_dist}"
-export EXP_TAG="${EXP_TAG:-agent_offload_pyrodash4b_docker_async}"
+export HF_CHECKPOINT=/workspace/models/pyromind/PyroDash-4B-SFT-0803
+export REF_MODEL_PATH=/workspace/models/pyromind/PyroDash-4B-SFT-0803_torch_dist
+export EXP_TAG=agent_offload_pyrodash4b_docker_async_turn
 # FP8 KV cache for longer agent decode contexts (rollout only; weights stay BF16).
 export SGLANG_KV_CACHE_DTYPE="${SGLANG_KV_CACHE_DTYPE:-fp8_e4m3}"
 
@@ -163,6 +167,10 @@ echo "  OFFLOAD_EFFICIENCY_LAMBDA=${OFFLOAD_EFFICIENCY_LAMBDA}"
 echo "  OFFLOAD_REWARD_MODE=${OFFLOAD_REWARD_MODE}"
 echo "  OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG=${OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG}"
 echo "  OFFLOAD_SEEK_ALPHA=${OFFLOAD_SEEK_ALPHA}"
+echo "  OFFLOAD_SEEK_BUDGET=${OFFLOAD_SEEK_BUDGET:-}"
+echo "  OFFLOAD_SEEK_BUDGET_TURN_K=${OFFLOAD_SEEK_BUDGET_TURN_K:-}"
+echo "  OFFLOAD_SEEK_BUDGET_DECAY=${OFFLOAD_SEEK_BUDGET_DECAY:-}"
+echo "  OFFLOAD_SEEK_OVERAGE_PENALTY=${OFFLOAD_SEEK_OVERAGE_PENALTY:-}"
 echo "  SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS=${SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS}"
 echo "  TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=${TORCH_ALLOW_TF32_CUBLAS_OVERRIDE}"
 echo "  DEBUG_TRAIN_MEM=${DEBUG_TRAIN_MEM}"

@@ -30,6 +30,8 @@ Train shaping (when ``SLIME_AGENT_OFFLOAD=1``):
     :func:`compute_turn_rewards` (baseline completion = ``metadata.completion_tokens / n``).
   - Hard compact filter + group α:
     :func:`compact_and_shape_group_help_seeking_rewards`.
+  - Soft seek budget (``OFFLOAD_SEEK_BUDGET`` / ``_TURN_K``): over-budget α decay
+    and solved overage penalty.
   - Turn-painted advantages:
     ``examples.coding_agent_rl.offload_turn_advantage.compute_turn_advantages``.
   - tmax ``empty_patch`` does **not** multiply ``empty_scale``.
@@ -109,6 +111,11 @@ DEFAULT_OFFLOAD_MALFORMED_PENALTY = 0.25
 DEFAULT_OFFLOAD_SEEK_ALPHA = 0.1
 DEFAULT_OFFLOAD_SEEK_EMPTY_SCALE = 0.5
 DEFAULT_OFFLOAD_UNIQUE_SOLVER_BONUS = 0.15
+# Soft seek budget: 0 disables. Prefer TURN_K (budget=max(1,n_turns//K)) and/or fixed BUDGET.
+DEFAULT_OFFLOAD_SEEK_BUDGET = 0
+DEFAULT_OFFLOAD_SEEK_BUDGET_TURN_K = 0
+DEFAULT_OFFLOAD_SEEK_BUDGET_DECAY = 0.5
+DEFAULT_OFFLOAD_SEEK_OVERAGE_PENALTY = 0.05
 # Compact filter defaults (hard remove_sample).
 DEFAULT_COMPACT_ORPHAN_OPEN_K = 8
 DEFAULT_COMPACT_OPEN_CLOSE_RATIO = 20.0
@@ -210,10 +217,12 @@ def unique_solver_bonus() -> float:
 
 
 def seek_only_when_all_wrong() -> bool:
-    """If true, help-seeking α is granted only when every sibling in the group failed.
+    """If true, defer help-seeking α to group shaping.
 
-    Per-sample finish then uses ``encourage_seek=False``; group shaping is applied
-    later by :func:`shape_group_help_seeking_rewards` (``--rollout-sample-filter-path``).
+    Per-sample finish uses ``encourage_seek=False``; :func:`shape_group_help_seeking_rewards`
+    then grants α on valid in-think offload **unless** a sibling solved without
+    offloading (solo success as counterfactual). A sibling that solved *with*
+    offload does not block α.
     """
     return os.environ.get("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "").strip().lower() in (
         "1",
@@ -221,6 +230,92 @@ def seek_only_when_all_wrong() -> bool:
         "yes",
         "on",
     )
+
+
+def seek_budget_fixed() -> int:
+    """Fixed max in-think offloads before soft overage (0 = unused)."""
+    try:
+        return max(0, int(os.environ.get("OFFLOAD_SEEK_BUDGET", str(DEFAULT_OFFLOAD_SEEK_BUDGET))))
+    except ValueError:
+        return DEFAULT_OFFLOAD_SEEK_BUDGET
+
+
+def seek_budget_turn_k() -> int:
+    """If >0, budget includes ``max(1, n_turns // K)``."""
+    try:
+        return max(0, int(os.environ.get("OFFLOAD_SEEK_BUDGET_TURN_K", str(DEFAULT_OFFLOAD_SEEK_BUDGET_TURN_K))))
+    except ValueError:
+        return DEFAULT_OFFLOAD_SEEK_BUDGET_TURN_K
+
+
+def seek_budget_decay() -> float:
+    """Per over-budget seek: α *= decay**excess."""
+    try:
+        return float(os.environ.get("OFFLOAD_SEEK_BUDGET_DECAY", str(DEFAULT_OFFLOAD_SEEK_BUDGET_DECAY)))
+    except ValueError:
+        return DEFAULT_OFFLOAD_SEEK_BUDGET_DECAY
+
+
+def seek_overage_penalty() -> float:
+    """Solved: subtract ``penalty * excess`` per over-budget seek turn."""
+    try:
+        return float(
+            os.environ.get("OFFLOAD_SEEK_OVERAGE_PENALTY", str(DEFAULT_OFFLOAD_SEEK_OVERAGE_PENALTY))
+        )
+    except ValueError:
+        return DEFAULT_OFFLOAD_SEEK_OVERAGE_PENALTY
+
+
+def resolve_seek_budget(n_turns: int) -> int | None:
+    """Soft in-think offload budget, or ``None`` when unlimited.
+
+    - ``OFFLOAD_SEEK_BUDGET_TURN_K=K>0`` → ``max(1, n_turns // K)``
+    - ``OFFLOAD_SEEK_BUDGET=M>0`` → fixed ``M`` (or ``min`` with turn budget when both set)
+    - both 0 → ``None`` (no soft limit)
+    """
+    fixed = seek_budget_fixed()
+    k = seek_budget_turn_k()
+    if fixed <= 0 and k <= 0:
+        return None
+    budget: int | None = None
+    if k > 0:
+        budget = max(1, int(n_turns) // k)
+    if fixed > 0:
+        budget = fixed if budget is None else min(budget, fixed)
+    return budget
+
+
+def seek_budget_alpha_scale(
+    offload_ordinal: int,
+    budget: int | None,
+    *,
+    decay: float | None = None,
+) -> float:
+    """1-based ordinal of valid in-think offloads → α multiplier (soft decay past budget)."""
+    if budget is None or int(offload_ordinal) <= int(budget):
+        return 1.0
+    excess = int(offload_ordinal) - int(budget)
+    d = float(decay if decay is not None else seek_budget_decay())
+    if d <= 0.0:
+        return 0.0
+    return float(d**excess)
+
+
+def seek_budget_overage_penalty_value(
+    offload_ordinal: int,
+    budget: int | None,
+    *,
+    pen: float | None = None,
+) -> float:
+    """Extra solved-path penalty for the ``offload_ordinal``-th seek (0 within budget)."""
+    if budget is None or int(offload_ordinal) <= int(budget):
+        return 0.0
+    p = float(pen if pen is not None else seek_overage_penalty())
+    return p * (int(offload_ordinal) - int(budget))
+
+
+def _is_valid_in_think_offload(tc: dict[str, Any]) -> bool:
+    return bool(tc.get("valid_offload")) and not bool(tc.get("outside_think"))
 
 
 def _api_key() -> str:
@@ -1278,6 +1373,7 @@ def help_seeking_reward(
     unique_bonus: float | None = None,
     encourage_seek: bool = True,
     protocol: str | None = None,
+    n_turns: int | None = None,
 ) -> float:
     """Train reward that keeps a gradient toward offloading when stuck.
 
@@ -1287,9 +1383,10 @@ def help_seeking_reward(
     - unsolved, ``encourage_seek=False``: ``0`` (defer α to group shaping)
     - unsolved, no in-think offload: ``0``
     - unsolved, ``offload_count>0`` and no outside-think spans: ``α``
-      (scaled by ``empty_scale`` when ``empty_patch``, **except tmax**)
+      (scaled by ``empty_scale`` when ``empty_patch``, **except tmax**; soft
+      budget decays α when ``offload_count`` exceeds :func:`resolve_seek_budget`)
     - unsolved with only outside-think offload: ``0`` (format still discouraged)
-    - solved: ``1 - λ * cost_ratio`` (− format penalty if outside-think), then
+    - solved: ``1 - λ * cost_ratio`` (− format / soft overage), then
       optional ``unique_bonus`` when this traj is the sole solver in its group
 
     Prefer :func:`compute_turn_rewards` for per-turn shaping used in training.
@@ -1299,6 +1396,9 @@ def help_seeking_reward(
     outside = int(st.get("offload_outside_think_count", 0) or 0)
     alpha_v = float(alpha if alpha is not None else seek_alpha())
     emp_scale = float(empty_scale if empty_scale is not None else seek_empty_scale())
+    turns = list(st.get("turn_costs") or [])
+    n = int(n_turns) if n_turns is not None else (len(turns) if turns else max(oc, 1))
+    budget = resolve_seek_budget(n)
 
     if float(solved) <= 0.0:
         if not encourage_seek or oc < 1 or outside > 0:
@@ -1306,6 +1406,7 @@ def help_seeking_reward(
         credit = _apply_empty_scale(
             alpha_v, empty_patch=empty_patch, empty_scale=emp_scale, protocol=protocol
         )
+        credit *= seek_budget_alpha_scale(oc, budget)
         return max(0.0, credit)
 
     reward = cost_aware_reward(
@@ -1315,6 +1416,7 @@ def help_seeking_reward(
         lam=lam,
         format_penalty=format_penalty,
     )
+    reward -= seek_budget_overage_penalty_value(oc, budget)
     if unique_solver:
         bonus = float(unique_bonus if unique_bonus is not None else unique_solver_bonus())
         reward += bonus
@@ -1339,9 +1441,9 @@ def compute_turn_rewards(
 ) -> dict[str, Any]:
     """Per-turn rewards ``r_i`` and scalar ``mean(r_i)``.
 
-    Solved: ``r_i = max(0, 1 - λ * c_i/b_i - format - malformed)``.
-    Unsolved help_seeking: α' on valid in-think turns (unless deferred),
-    ``-β`` on malformed/orphan spam turns, else 0.
+    Solved: ``r_i = max(0, 1 - λ * c_i/b_i - format - malformed - overage)``.
+    Unsolved help_seeking: α' on valid in-think turns (unless deferred; soft
+    budget decays α past the seek budget), ``-β`` on malformed/orphan spam, else 0.
     """
     st = dict(stats or {})
     turns: list[dict[str, Any]] = list(st.get("turn_costs") or [])
@@ -1352,6 +1454,7 @@ def compute_turn_rewards(
     alpha_v = float(alpha if alpha is not None else seek_alpha())
     emp_scale = float(empty_scale if empty_scale is not None else seek_empty_scale())
     proto = protocol if protocol is not None else (metadata or {}).get("protocol")
+    budget = resolve_seek_budget(n if n > 0 else max(int(st.get("offload_count", 0) or 0), 1))
 
     if n == 0:
         # Fallback to legacy scalar when no turn ledger (compat).
@@ -1376,9 +1479,12 @@ def compute_turn_rewards(
         n_turns=n, usage=usage, completion_tokens=completion_tokens, metadata=metadata
     )
     turn_rewards: list[float] = []
+    seek_ordinal = 0
 
     if float(solved) > 0.0:
         for tc in turns:
+            if _is_valid_in_think_offload(tc):
+                seek_ordinal += 1
             c_i = turn_actual_cost(tc)
             ratio = (c_i / b_i) if b_i > 0 else 0.0
             r_i = 1.0 - lam_v * ratio
@@ -1387,6 +1493,8 @@ def compute_turn_rewards(
             mal = int(tc.get("malformed_count", 0) or 0) + int(tc.get("orphan_open_count", 0) or 0)
             if mal > 0:
                 r_i -= mal_pen
+            if _is_valid_in_think_offload(tc):
+                r_i -= seek_budget_overage_penalty_value(seek_ordinal, budget)
             turn_rewards.append(max(0.0, float(r_i)))
     elif reward_mode() != "help_seeking":
         # cost_aware: unsolved → all zeros (still record malformed as -β for advantage).
@@ -1405,17 +1513,20 @@ def compute_turn_rewards(
             if mal > 0 or int(tc.get("max_open_run", 0) or 0) >= 8:
                 turn_rewards.append(-mal_pen)
                 continue
-            if (
-                encourage_seek
-                and tc.get("valid_offload")
-                and not tc.get("outside_think")
-            ):
-                turn_rewards.append(max(0.0, float(credit)))
+            if encourage_seek and _is_valid_in_think_offload(tc):
+                seek_ordinal += 1
+                scale = seek_budget_alpha_scale(seek_ordinal, budget)
+                turn_rewards.append(max(0.0, float(credit) * scale))
             else:
                 turn_rewards.append(0.0)
 
     reward = float(sum(turn_rewards) / max(len(turn_rewards), 1))
-    return {"reward": reward, "turn_rewards": turn_rewards, "turn_costs": turns}
+    return {
+        "reward": reward,
+        "turn_rewards": turn_rewards,
+        "turn_costs": turns,
+        "seek_budget": budget,
+    }
 
 
 def build_turn_token_spans(
@@ -1582,6 +1693,16 @@ def _session_solved(metadata: dict[str, Any] | None) -> bool:
     return float(md.get("solved", 0) or 0) > 0.0
 
 
+def _session_offload_count(metadata: dict[str, Any] | None) -> int:
+    stats = (metadata or {}).get("offload_stats") or {}
+    return int(stats.get("offload_count", 0) or 0)
+
+
+def _session_solved_without_offload(metadata: dict[str, Any] | None) -> bool:
+    """True if grading passed and the traj never offloaded (solo solve)."""
+    return _session_solved(metadata) and _session_offload_count(metadata) < 1
+
+
 def _session_segments(group_item: Any) -> list[Any]:
     """One GRPO sibling may be a Sample or a fan-out ``list[Sample]``."""
     if isinstance(group_item, list):
@@ -1590,7 +1711,10 @@ def _session_segments(group_item: Any) -> list[Any]:
 
 
 def shape_group_help_seeking_rewards(args: Any, groups: list) -> None:
-    """Grant help-seeking α on valid offload turns when the whole group failed.
+    """Grant help-seeking α on valid offload turns unless a solo (no-offload) solve exists.
+
+    Skips the group when any sibling solved with ``offload_count == 0``. A sibling
+    that solved *with* offload does not block α for failed help-seekers.
 
     Mutates ``turn_rewards`` / ``sample.reward`` in place. tmax does not apply
     ``empty_scale`` on empty_patch.
@@ -1608,14 +1732,23 @@ def shape_group_help_seeking_rewards(args: Any, groups: list) -> None:
         sessions = [segs for segs in sessions if segs]
         if not sessions:
             continue
-        if any(_session_solved(getattr(segs[0], "metadata", None)) for segs in sessions):
+        if any(
+            _session_solved_without_offload(getattr(segs[0], "metadata", None))
+            for segs in sessions
+        ):
             continue
 
         for segs in sessions:
             md = dict(getattr(segs[0], "metadata", None) or {})
+            # Only reshape failed seekers. Solved siblings already have cost-aware
+            # turn_rewards; do not overwrite zeros with α (possible after clamp).
+            if _session_solved(md):
+                continue
             stats = md.get("offload_stats") or {}
             turn_rewards = list(md.get("turn_rewards") or [])
             turn_costs = list(md.get("turn_costs") or stats.get("turn_costs") or [])
+            n_turns = len(turn_costs) if turn_costs else max(int(stats.get("offload_count", 0) or 0), 1)
+            budget = resolve_seek_budget(n_turns)
             credit = _apply_empty_scale(
                 alpha_v,
                 empty_patch=bool(md.get("empty_patch")),
@@ -1629,21 +1762,26 @@ def shape_group_help_seeking_rewards(args: Any, groups: list) -> None:
                 turn_rewards = [0.0] * len(turn_costs)
 
             if turn_costs and turn_rewards:
+                seek_ordinal = 0
                 for i, tc in enumerate(turn_costs):
                     mal = int(tc.get("malformed_count", 0) or 0) + int(tc.get("orphan_open_count", 0) or 0)
                     if mal > 0:
                         if turn_rewards[i] > -mal_pen:
                             turn_rewards[i] = -mal_pen
                         continue
-                    if tc.get("valid_offload") and not tc.get("outside_think"):
+                    if _is_valid_in_think_offload(tc):
+                        seek_ordinal += 1
                         if float(turn_rewards[i]) <= 0.0:
-                            turn_rewards[i] = credit
+                            scale = seek_budget_alpha_scale(seek_ordinal, budget)
+                            turn_rewards[i] = credit * scale
                 if turn_rewards:
                     mean_r = float(sum(turn_rewards) / max(len(turn_rewards), 1))
                     for sample in segs:
                         smd = dict(getattr(sample, "metadata", None) or {})
                         smd["turn_rewards"] = list(turn_rewards)
                         smd["turn_costs"] = list(turn_costs)
+                        if budget is not None:
+                            smd["seek_budget"] = budget
                         sample.metadata = smd
                         tmd = dict(getattr(sample, "train_metadata", None) or {})
                         tmd["turn_rewards"] = list(turn_rewards)
@@ -1659,9 +1797,14 @@ def shape_group_help_seeking_rewards(args: Any, groups: list) -> None:
             outside = int(stats.get("offload_outside_think_count", 0) or 0)
             if oc < 1 or outside > 0:
                 continue
+            scaled = credit * seek_budget_alpha_scale(oc, budget)
             for sample in segs:
                 if float(getattr(sample, "reward", 0.0) or 0.0) <= 0.0:
-                    sample.reward = credit
+                    sample.reward = scaled
+                if budget is not None:
+                    smd = dict(getattr(sample, "metadata", None) or {})
+                    smd["seek_budget"] = budget
+                    sample.metadata = smd
 
 
 def compact_and_shape_group_help_seeking_rewards(args: Any, groups: list) -> None:
