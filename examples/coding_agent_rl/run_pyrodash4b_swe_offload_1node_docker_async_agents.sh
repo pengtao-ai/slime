@@ -47,7 +47,7 @@ SLIME_DIR="${SLIME_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 export SAVE_INTERVAL="${SAVE_INTERVAL:-20}"
 # ---- mid-turn offload ----
 export SLIME_AGENT_OFFLOAD=1
-export OFFLOAD_EFFICIENCY_LAMBDA=0.1
+export OFFLOAD_EFFICIENCY_LAMBDA=0.2
 # help_seeking + SEEK_ONLY_WHEN_ALL_WRONG: withhold α only if a sibling
 # solved without offload (see offload.shape_group_help_seeking_rewards).
 # Set OFFLOAD_REWARD_MODE=cost_aware to restore the old "fail → 0" shaping.
@@ -58,12 +58,12 @@ export OFFLOAD_SEEK_ALPHA=0.1
 export OFFLOAD_SEEK_EMPTY_SCALE=0.5
 export OFFLOAD_UNIQUE_SOLVER_BONUS=0.15
 # Soft seek budget: budget=max(1, n_turns//K); over-budget α*=decay^excess, solved -= pen*excess.
-export OFFLOAD_SEEK_BUDGET_TURN_K="${OFFLOAD_SEEK_BUDGET_TURN_K:-2}"
+export OFFLOAD_SEEK_BUDGET_TURN_K="${OFFLOAD_SEEK_BUDGET_TURN_K:-4}"
 export OFFLOAD_SEEK_BUDGET_DECAY="${OFFLOAD_SEEK_BUDGET_DECAY:-0.5}"
 export OFFLOAD_SEEK_OVERAGE_PENALTY="${OFFLOAD_SEEK_OVERAGE_PENALTY:-0.05}"
 # Optional fixed cap (min with turn budget when both set): OFFLOAD_SEEK_BUDGET=4
 export ADAPTER_MAX_TURNS_PER_SID="${ADAPTER_MAX_TURNS_PER_SID:-50}"
-export DASHSCOPE_BASE_URL=http://208.64.254.187:8001/v1
+export DASHSCOPE_BASE_URL=http://208.64.254.189:8001/v1
 export DASHSCOPE_API_KEY=sk-6137d26281697017ef07ef4da0823dc16d32acaad253ecac
 export DASHSCOPE_MODEL=deepseek-v4-flash-0731
 export OFFLOAD_MAX_TOKENS="${OFFLOAD_MAX_TOKENS:-32768}"
