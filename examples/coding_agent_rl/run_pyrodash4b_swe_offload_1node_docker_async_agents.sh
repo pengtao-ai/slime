@@ -47,18 +47,18 @@ SLIME_DIR="${SLIME_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 export SAVE_INTERVAL="${SAVE_INTERVAL:-20}"
 # ---- mid-turn offload ----
 export SLIME_AGENT_OFFLOAD=1
-export OFFLOAD_EFFICIENCY_LAMBDA=0.5
+export OFFLOAD_EFFICIENCY_LAMBDA=0.1
 # help_seeking + SEEK_ONLY_WHEN_ALL_WRONG: withhold α only if a sibling
 # solved without offload (see offload.shape_group_help_seeking_rewards).
 # Set OFFLOAD_REWARD_MODE=cost_aware to restore the old "fail → 0" shaping.
 export OFFLOAD_REWARD_MODE=help_seeking
 export OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG=1
 # export OFFLOAD_REWARD_MODE="${OFFLOAD_REWARD_MODE:-cost_aware}"
-export OFFLOAD_SEEK_ALPHA=0.1
+export OFFLOAD_SEEK_ALPHA=0.2
 export OFFLOAD_SEEK_EMPTY_SCALE=0.5
 export OFFLOAD_UNIQUE_SOLVER_BONUS=0.15
-export OFFLOAD_NO_SEEK_PENALTY="${OFFLOAD_NO_SEEK_PENALTY:-0.1}"
-export EXP_TAG=agent_offload_pyrodash4b_lambda05_grpo_sft1
+export OFFLOAD_NO_SEEK_PENALTY="${OFFLOAD_NO_SEEK_PENALTY:-0.2}"
+export EXP_TAG=agent_offload_pyrodash4b_phase2_sft03
 # Compact: any open-without-close → remove_sample (loss_mask=0). Aligned with
 # malformed open-run threshold (see offload.DEFAULT_COMPACT_*).
 export OFFLOAD_COMPACT_ORPHAN_OPEN_K="${OFFLOAD_COMPACT_ORPHAN_OPEN_K:-1}"
@@ -71,7 +71,7 @@ export OFFLOAD_TRUNCATE_ORPHAN="${OFFLOAD_TRUNCATE_ORPHAN:-2}"
 export OFFLOAD_OPEN_TOKEN_ID="${OFFLOAD_OPEN_TOKEN_ID:-248077}"
 export OFFLOAD_CLOSE_TOKEN_ID="${OFFLOAD_CLOSE_TOKEN_ID:-248078}"
 export ADAPTER_MAX_TURNS_PER_SID="${ADAPTER_MAX_TURNS_PER_SID:-50}"
-export DASHSCOPE_BASE_URL=http://208.64.254.187:8001/v1
+export DASHSCOPE_BASE_URL=http://208.64.254.189:8001/v1
 export DASHSCOPE_API_KEY=sk-6137d26281697017ef07ef4da0823dc16d32acaad253ecac
 export DASHSCOPE_MODEL=deepseek-v4-flash-0731
 export OFFLOAD_MAX_TOKENS="${OFFLOAD_MAX_TOKENS:-32768}"
