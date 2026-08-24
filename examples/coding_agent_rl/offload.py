@@ -309,6 +309,7 @@ def resolved_train_config() -> dict[str, Any]:
         "OFFLOAD_SFT_LAMBDA": offload_sft.sft_lambda(),
         "OFFLOAD_SFT_MAX_SAMPLES": offload_sft.sft_max_samples(),
         "OFFLOAD_SFT_MAX_SEQ_LEN": offload_sft.sft_max_seq_len(),
+        "OFFLOAD_SFT_TAG_PROB": offload_sft.sft_tag_prob(),
         "OFFLOAD_COMPACT_ORPHAN_OPEN_K": int(
             os.environ.get("OFFLOAD_COMPACT_ORPHAN_OPEN_K", str(DEFAULT_COMPACT_ORPHAN_OPEN_K))
         ),
@@ -1397,6 +1398,21 @@ def amend_reply_with_offload(
     return Reply(manager_message=mm, finish_reason=reply.finish_reason, wire=wire)
 
 
+def _record_sft_turn_snapshot(
+    turn_entry: dict[str, Any],
+    *,
+    translated: list[dict],
+    tools_schema: list[dict] | None,
+    raw_output: str,
+    reply: Reply,
+) -> None:
+    """Persist chat history + SLM output on every agent round for multiturn SFT."""
+    turn_entry["sft_history_messages"] = copy.deepcopy(translated)
+    turn_entry["sft_tools_schema"] = copy.deepcopy(tools_schema) if tools_schema else None
+    turn_entry["slm_raw_output"] = raw_output
+    turn_entry["sft_assistant_message"] = copy.deepcopy(reply.manager_message)
+
+
 async def apply_offload_if_needed(
     reply: Reply,
     *,
@@ -1493,6 +1509,13 @@ async def apply_offload_if_needed(
                     sid,
                     stats["offload_outside_think_count"],
                 )
+                _record_sft_turn_snapshot(
+                    turn_entry,
+                    translated=translated,
+                    tools_schema=tools_schema,
+                    raw_output=raw_output,
+                    reply=reply,
+                )
                 return reply
         elif parse_offload_directive(raw_output) is not None:
             # Complete span exists but not in <think> → format violation, no GLM.
@@ -1506,9 +1529,23 @@ async def apply_offload_if_needed(
                 stats["offload_outside_think_count"],
             )
             turn_entry["response_token_len"] = len(turn.output_ids or [])
+            _record_sft_turn_snapshot(
+                turn_entry,
+                translated=translated,
+                tools_schema=tools_schema,
+                raw_output=raw_output,
+                reply=reply,
+            )
             return reply
         else:
             turn_entry["response_token_len"] = len(turn.output_ids or [])
+            _record_sft_turn_snapshot(
+                turn_entry,
+                translated=translated,
+                tools_schema=tools_schema,
+                raw_output=raw_output,
+                reply=reply,
+            )
             return reply
 
     n, _prefix = parsed
@@ -1590,17 +1627,22 @@ async def apply_offload_if_needed(
     turn_entry["teacher_content"] = content
     turn_entry["teacher_tool_calls"] = list(glm_tool_calls or [])
     turn_entry["teacher_response"] = content
-    # Snapshot history at the offload turn so SFT can rebuild chat-template (x, y).
-    turn_entry["sft_history_messages"] = copy.deepcopy(translated)
-    turn_entry["sft_tools_schema"] = copy.deepcopy(tools_schema) if tools_schema else None
     turn_entry["response_token_len"] = len(turn.output_ids or [])
-    return amend_reply_with_offload(
+    reply = amend_reply_with_offload(
         reply,
         raw_output=raw_output,
         glm_content=content,
         glm_think=think,
         glm_tool_calls=glm_tool_calls,
     )
+    _record_sft_turn_snapshot(
+        turn_entry,
+        translated=translated,
+        tools_schema=tools_schema,
+        raw_output=raw_output,
+        reply=reply,
+    )
+    return reply
 
 
 def actual_cost(stats: dict[str, Any]) -> float:
@@ -1807,10 +1849,10 @@ def compute_turn_rewards(
 ) -> dict[str, Any]:
     """Per-turn rewards ``r_i`` and scalar ``mean(r_i)``.
 
-    Solved:
-      - no offload / not repaired → ``1``
-      - valid offload → ``max(0, 1 - λ·c_i/b_i - format)``
-      - repaired → ``max(0, 1 - λ·c_i/b_i - format - β)``
+    Solved (solo and offload share the same cost term):
+      - every turn → ``max(0, 1 - λ·c_i/b_i - format - β?)``
+      - ``c_i`` is SLM-only on solo turns; adds GLM tokens when offloaded
+      - outside-think → subtract format penalty; repaired / orphan / malformed → ``-β``
     Unsolved help_seeking:
       - clean valid in-think offload → α' (unless deferred)
       - repaired / orphan / malformed → flat ``-β`` (never α)
@@ -1853,11 +1895,6 @@ def compute_turn_rewards(
     if float(solved) > 0.0:
         for tc in turns:
             mal_r = turn_malformed_penalty_value(tc, mal_pen=mal_pen)
-            used_offload = bool(tc.get("valid_offload") or tc.get("repaired"))
-            if not used_offload and mal_r is None and not tc.get("outside_think"):
-                # Independent completion: full credit, no cost shaping.
-                turn_rewards.append(1.0)
-                continue
             c_i = turn_actual_cost(tc)
             ratio = (c_i / b_i) if b_i > 0 else 0.0
             r_i = 1.0 - lam_v * ratio

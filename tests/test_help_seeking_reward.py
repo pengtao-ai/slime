@@ -266,14 +266,22 @@ def test_repair_skips_already_valid():
     assert offload.repair_incomplete_offload(raw) is None
 
 
-def test_compute_turn_rewards_solved_independent_is_one():
+def test_compute_turn_rewards_solved_solo_uses_cost_formula():
     turns = [_turn(valid=False, small_o=50), _turn(valid=True, small_o=50, glm_o=20)]
     stats = {"turn_costs": turns}
+    lam = 0.5
     out = offload.compute_turn_rewards(
-        1.0, stats, completion_tokens=100, metadata={"completion_tokens": 100}, lam=0.5
+        1.0, stats, completion_tokens=100, metadata={"completion_tokens": 100}, lam=lam
     )
-    assert out["turn_rewards"][0] == pytest.approx(1.0)
-    assert out["turn_rewards"][1] < 1.0
+    b_i = offload.per_turn_baseline_cost(
+        n_turns=2, completion_tokens=100, metadata={"completion_tokens": 100}
+    )
+    for tc, r in zip(turns, out["turn_rewards"], strict=True):
+        c_i = offload.turn_actual_cost(tc)
+        expected = max(0.0, 1.0 - lam * (c_i / b_i))
+        assert r == pytest.approx(expected)
+    # Offload turn pays GLM cost → lower reward than solo on the same SLM budget.
+    assert out["turn_rewards"][1] < out["turn_rewards"][0]
 
 
 def test_compute_turn_rewards_repaired_no_alpha_unsolved(monkeypatch):

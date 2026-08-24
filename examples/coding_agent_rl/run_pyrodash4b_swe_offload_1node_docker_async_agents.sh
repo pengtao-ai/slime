@@ -45,20 +45,24 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 SLIME_DIR="${SLIME_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 
 export SAVE_INTERVAL="${SAVE_INTERVAL:-20}"
+# ---- Phase3 (2026-08): multiturn SFT + solo cost shaping + moderate help_seeking ----
+# Lessons from sft03: λ=0.1 + α=0.2 + NO_SEEK=0.2 → spam offload then cliff at ~step10.
+# sft02 decayed slower (λ=0.5) but still high offload; phase3 balances cost + seek + SFT.
+export EXP_TAG="${EXP_TAG:-agent_offload_pyrodash4b_phase3}"
+# Warm-start from sft02 iter_59 (last ckpt before long decay). Override or copy ckpt as needed.
+# export SAVE_DIR="${SAVE_DIR:-/workspace/work/spt/slime/runs/agent_offload_pyrodash4b_phase2_sft02_20260820_031605/checkpoints}"
+export NUM_ROLLOUT="${NUM_ROLLOUT:-200}"
 # ---- mid-turn offload ----
 export SLIME_AGENT_OFFLOAD=1
 export OFFLOAD_EFFICIENCY_LAMBDA=0.1
 # help_seeking + SEEK_ONLY_WHEN_ALL_WRONG: withhold α only if a sibling
 # solved without offload (see offload.shape_group_help_seeking_rewards).
-# Set OFFLOAD_REWARD_MODE=cost_aware to restore the old "fail → 0" shaping.
 export OFFLOAD_REWARD_MODE=help_seeking
 export OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG=1
-# export OFFLOAD_REWARD_MODE="${OFFLOAD_REWARD_MODE:-cost_aware}"
-export OFFLOAD_SEEK_ALPHA=0.2
+export OFFLOAD_SEEK_ALPHA="${OFFLOAD_SEEK_ALPHA:-0.15}"
 export OFFLOAD_SEEK_EMPTY_SCALE=0.5
-export OFFLOAD_UNIQUE_SOLVER_BONUS=0.15
-export OFFLOAD_NO_SEEK_PENALTY="${OFFLOAD_NO_SEEK_PENALTY:-0.2}"
-export EXP_TAG=agent_offload_pyrodash4b_phase2_sft03
+export OFFLOAD_UNIQUE_SOLVER_BONUS="${OFFLOAD_UNIQUE_SOLVER_BONUS:-0.1}"
+export OFFLOAD_NO_SEEK_PENALTY="${OFFLOAD_NO_SEEK_PENALTY:-0.1}"
 # Compact: any open-without-close → remove_sample (loss_mask=0). Aligned with
 # malformed open-run threshold (see offload.DEFAULT_COMPACT_*).
 export OFFLOAD_COMPACT_ORPHAN_OPEN_K="${OFFLOAD_COMPACT_ORPHAN_OPEN_K:-1}"
@@ -83,12 +87,12 @@ export ROLLOUT_STOP_TOKEN_IDS="${ROLLOUT_STOP_TOKEN_IDS:-248046 248044 ${OFFLOAD
 export SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS="${SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS:-160000}"
 # Embed GLM continuation into Sample.tokens with loss_mask=0 (default on).
 export SLIME_OFFLOAD_EMBED_IN_TRAJECTORY="${SLIME_OFFLOAD_EMBED_IN_TRAJECTORY:-1}"
-# Mixed L = L_GRPO + λ L_SFT. Default 0 = Exp 1 (GRPO only). Set e.g. 0.1 for Exp 2.
-export OFFLOAD_SFT_LAMBDA="${OFFLOAD_SFT_LAMBDA:-1}"
-# Cap SFT rows. Default 1 = last eligible offload. Do not short-cap seq len:
-# GRPO already trains 50-turn trajectories; a small SFT cap makes medium-length
-# rows that packing concatenates to fill max_tokens_per_gpu (worse than one long sample).
-export OFFLOAD_SFT_MAX_SAMPLES="${OFFLOAD_SFT_MAX_SAMPLES:-1}"
+# Mixed L = L_GRPO + λ_sft L_SFT. Multiturn: one long seq / episode, all assistant turns.
+export OFFLOAD_SFT_LAMBDA="${OFFLOAD_SFT_LAMBDA:-0.3}"
+# Cap SFT assistant turns from the end. Default 0 = include every round in one multiturn row.
+export OFFLOAD_SFT_MAX_SAMPLES="${OFFLOAD_SFT_MAX_SAMPLES:-0}"
+# Per offload turn: probability of supervising <|llm_offload|>N<|/llm_offload|> in SFT CE.
+export OFFLOAD_SFT_TAG_PROB="${OFFLOAD_SFT_TAG_PROB:-0.3}"
 # 0 = no cap (same context as GRPO). Positive → left-trim history, keep GLM y.
 export OFFLOAD_SFT_MAX_SEQ_LEN="${OFFLOAD_SFT_MAX_SEQ_LEN:-0}"
 # Leave MAX_TOKENS_PER_GPU unset so async launcher uses MAX_CONTEXT_LEN/CP
@@ -170,7 +174,9 @@ fi
 
 echo "======================================================================"
 echo "PyroDash coding-agent OFFLOAD (async docker, BF16 train + BF16 rollout)"
-echo "  SLIME_AGENT_OFFLOAD=${SLIME_AGENT_OFFLOAD}"
+echo "  EXP_TAG=${EXP_TAG}"
+echo "  NUM_ROLLOUT=${NUM_ROLLOUT:-50}"
+echo "  SAVE_DIR=${SAVE_DIR:-<RUN_ROOT>/checkpoints}"
 echo "  HF_CHECKPOINT=${HF_CHECKPOINT}"
 echo "  REF_MODEL_PATH=${REF_MODEL_PATH}"
 echo "  SGLANG_KV_CACHE_DTYPE=${SGLANG_KV_CACHE_DTYPE:-<unset>}"
@@ -191,8 +197,9 @@ echo "  OFFLOAD_UNIQUE_SOLVER_BONUS=${OFFLOAD_UNIQUE_SOLVER_BONUS}"
 echo "  OFFLOAD_NO_SEEK_PENALTY=${OFFLOAD_NO_SEEK_PENALTY:-0.1}"
 echo "  OFFLOAD_THINK_FORMAT_PENALTY=${OFFLOAD_THINK_FORMAT_PENALTY:-0.25}"
 echo "  OFFLOAD_MALFORMED_PENALTY=${OFFLOAD_MALFORMED_PENALTY:-0.25}"
-echo "  OFFLOAD_SFT_LAMBDA=${OFFLOAD_SFT_LAMBDA:-1}"
-echo "  OFFLOAD_SFT_MAX_SAMPLES=${OFFLOAD_SFT_MAX_SAMPLES:-1}"
+echo "  OFFLOAD_SFT_LAMBDA=${OFFLOAD_SFT_LAMBDA:-0.15}"
+echo "  OFFLOAD_SFT_MAX_SAMPLES=${OFFLOAD_SFT_MAX_SAMPLES:-0}"
+echo "  OFFLOAD_SFT_TAG_PROB=${OFFLOAD_SFT_TAG_PROB:-0.3}"
 echo "  OFFLOAD_SFT_MAX_SEQ_LEN=${OFFLOAD_SFT_MAX_SEQ_LEN:-0}"
 echo "  MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-<async default MAX_CONTEXT_LEN/CP>}"
 echo "  OFFLOAD_COMPACT_ORPHAN_OPEN_K=${OFFLOAD_COMPACT_ORPHAN_OPEN_K}"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for offline SFT (x, y) construction from offload turn fields."""
+"""Unit tests for multiturn SFT construction from offload turn fields."""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ sys.path.insert(0, str(_REPO))
 
 from examples.coding_agent_rl import offload  # noqa: E402
 from examples.coding_agent_rl.offload_sft import (  # noqa: E402
+    build_assistant_target,
+    build_multiturn_sft_token_sequence,
     build_sft_samples,
     build_sft_token_sequence,
     post_process_rewards_grpo_only,
@@ -33,12 +35,17 @@ class _FakeTok:
         parts = []
         for m in messages:
             role = m["role"]
+            reasoning = m.get("reasoning_content") or ""
             content = m.get("content") or ""
-            parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
+            if reasoning:
+                parts.append(
+                    f"<|im_start|>{role}\n<think>\n{reasoning}\n</think>\n\n{content}<|im_end|>\n"
+                )
+            else:
+                parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
             for tc in m.get("tool_calls") or []:
                 fn = tc.get("function") or {}
                 args = fn.get("arguments")
-                # Qwen chat template: ``arguments|items`` requires a mapping.
                 if args is not None and not isinstance(args, dict):
                     raise TypeError("Can only get item pairs from a mapping.")
                 parts.append(f"<tool_call>{fn.get('name')}:{args}</tool_call>")
@@ -58,15 +65,25 @@ def test_strip_offload_not_in_x() -> None:
     assert "need help" in prefix
 
 
-def test_turn_eligible_requires_glm_payload() -> None:
+def test_turn_eligible_requires_history_and_payload() -> None:
     assert not turn_eligible_for_sft({"valid_offload": True})
     assert turn_eligible_for_sft(
-        {"valid_offload": True, "teacher_think": "why", "teacher_content": "", "teacher_tool_calls": []}
+        {
+            "valid_offload": True,
+            "teacher_think": "why",
+            "qwen_think_prefix": "local",
+            "sft_history_messages": [{"role": "user", "content": "q"}],
+        }
     )
-    assert not turn_eligible_for_sft({"valid_offload": True, "repaired": True, "teacher_think": "why"})
+    assert turn_eligible_for_sft(
+        {
+            "slm_raw_output": "solo think",
+            "sft_history_messages": [{"role": "user", "content": "q"}],
+        }
+    )
 
 
-def test_sft_mask_zeros_x_ones_glm() -> None:
+def test_sft_mask_supervises_all_assistant_spans() -> None:
     tok = _FakeTok()
     history = [
         {"role": "system", "content": "sys"},
@@ -84,19 +101,182 @@ def test_sft_mask_zeros_x_ones_glm() -> None:
     assert built is not None
     tokens, loss_mask, response_length = built
     assert len(loss_mask) == response_length
-    assert 0 in loss_mask and 1 in loss_mask
-    first_one = loss_mask.index(1)
-    assert all(m == 0 for m in loss_mask[:first_one])
-    assert all(m == 1 for m in loss_mask[first_one:])
+    assert all(m == 1 for m in loss_mask)
     decoded = tok.decode(tokens[-response_length:])
     assert "local plan" in decoded
     assert "remote why" in decoded
     assert "edit foo.py" in decoded
-    assert offload.OFFLOAD_OPEN not in decoded
+
+
+def test_sft_random_offload_tag() -> None:
+    tok = _FakeTok()
+    history = [{"role": "user", "content": "fix bug"}]
+    with_tag = build_sft_token_sequence(
+        tok,
+        history=history,
+        tools=None,
+        qwen_think="local plan",
+        glm_think="remote why",
+        glm_content="edit foo.py",
+        glm_tool_calls=None,
+        include_offload_tag=True,
+        offload_n=3,
+    )
+    without_tag = build_sft_token_sequence(
+        tok,
+        history=history,
+        tools=None,
+        qwen_think="local plan",
+        glm_think="remote why",
+        glm_content="edit foo.py",
+        glm_tool_calls=None,
+        include_offload_tag=False,
+    )
+    assert with_tag is not None and without_tag is not None
+    _, _, resp_w = with_tag
+    _, _, resp_wo = without_tag
+    dec_w = tok.decode(with_tag[0][-resp_w:])
+    dec_wo = tok.decode(without_tag[0][-resp_wo:])
+    assert offload.OFFLOAD_OPEN in dec_w and offload.OFFLOAD_CLOSE in dec_w
+    assert offload.OFFLOAD_OPEN not in dec_wo
+
+
+def test_multiturn_two_assistants_both_supervised() -> None:
+    tok = _FakeTok()
+    turn_costs = [
+        {
+            "valid_offload": True,
+            "n": 4,
+            "qwen_think_prefix": "local1",
+            "teacher_think": "glm1",
+            "teacher_content": "step1",
+            "teacher_tool_calls": [],
+            "sft_history_messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "q1"},
+            ],
+        },
+        {
+            "slm_raw_output": "solo2",
+            "sft_assistant_message": {
+                "role": "assistant",
+                "reasoning_content": "solo2",
+                "content": "step2",
+            },
+            "sft_history_messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "q1"},
+                {
+                    "role": "assistant",
+                    "reasoning_content": f"{offload.OFFLOAD_OPEN}4{offload.OFFLOAD_CLOSE}",
+                    "content": "step1",
+                },
+                {"role": "user", "content": "q2"},
+            ],
+        },
+    ]
+    built = build_multiturn_sft_token_sequence(tok, turn_costs, rng=__import__("random").Random(0))
+    assert built is not None
+    tokens, loss_mask, response_length = built
+    assert len(loss_mask) == response_length
+    assert loss_mask.count(1) > 0
+    decoded = tok.decode(tokens)
+    assert "local1" in decoded and "glm1" in decoded and "solo2" in decoded
+    # Two assistant blocks → two supervised regions (mask may include template chars between)
+    assert sum(loss_mask) > len("local1glm1step1solo2")
+
+
+def test_multiturn_history_reset_keeps_longest_segment() -> None:
+    tok = _FakeTok()
+    turn_costs = [
+        {
+            "valid_offload": True,
+            "n": 1,
+            "slm_raw_output": "local0",
+            "teacher_think": "glm0",
+            "teacher_content": "do0",
+            "teacher_tool_calls": [],
+            "sft_history_messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "q0"},
+                {"role": "user", "content": "q0b"},
+            ],
+        },
+        {
+            "slm_raw_output": "solo-reset",
+            "sft_assistant_message": {
+                "role": "assistant",
+                "reasoning_content": "solo-reset",
+                "content": "after-reset",
+            },
+            "sft_history_messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "q1"},
+            ],
+        },
+        {
+            "slm_raw_output": "solo-tail",
+            "sft_assistant_message": {
+                "role": "assistant",
+                "reasoning_content": "solo-tail",
+                "content": "tail",
+            },
+            "sft_history_messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "q1"},
+                {"role": "assistant", "reasoning_content": "solo-reset", "content": "after-reset"},
+                {"role": "user", "content": "q2"},
+            ],
+        },
+    ]
+    built = build_multiturn_sft_token_sequence(tok, turn_costs)
+    assert built is not None
+    decoded = tok.decode(built[0])
+    assert "solo-reset" in decoded and "solo-tail" in decoded
+    assert "local0" not in decoded
+
+
+def test_build_assistant_target_merges_slm_and_glm_think() -> None:
+    tc = {
+        "valid_offload": True,
+        "n": 1,
+        "slm_raw_output": f"{offload.OFFLOAD_OPEN}1{offload.OFFLOAD_CLOSE}",
+        "teacher_think": "remote reasoning",
+        "teacher_content": "visible answer",
+        "teacher_tool_calls": [],
+        "sft_assistant_message": {
+            "role": "assistant",
+            "reasoning_content": f"{offload.OFFLOAD_OPEN}1{offload.OFFLOAD_CLOSE}remote reasoning",
+            "content": "visible answer",
+        },
+    }
+    built = build_assistant_target(tc, include_offload_tag=True)
+    assert built is not None
+    reasoning = built.get("reasoning_content") or ""
+    assert reasoning == f"{offload.OFFLOAD_OPEN}1{offload.OFFLOAD_CLOSE}remote reasoning"
+    assert reasoning.count("remote reasoning") == 1
+
+
+def test_build_assistant_target_offload_tag_toggle() -> None:
+    tc = {
+        "valid_offload": True,
+        "n": 5,
+        "slm_raw_output": "local plan",
+        "qwen_think_prefix": "local plan",
+        "teacher_think": "why",
+        "teacher_content": "do",
+        "teacher_tool_calls": [],
+    }
+    with_tag = build_assistant_target(tc, include_offload_tag=True)
+    without_tag = build_assistant_target(tc, include_offload_tag=False)
+    assert f"{offload.OFFLOAD_OPEN}5{offload.OFFLOAD_CLOSE}" in (with_tag.get("reasoning_content") or "")
+    assert "local plan" in (with_tag.get("reasoning_content") or "")
+    assert "why" in (with_tag.get("reasoning_content") or "")
+    assert offload.OFFLOAD_OPEN not in (without_tag.get("reasoning_content") or "")
+    assert "local planwhy" in (without_tag.get("reasoning_content") or "")
 
 
 def test_sft_tool_calls_accept_openai_json_arguments() -> None:
-    """GLM wire ``function.arguments`` is a JSON string; Qwen template needs a dict."""
     tok = _FakeTok()
     history = [{"role": "user", "content": "fix B.py"}]
     built = build_sft_token_sequence(
@@ -122,9 +302,32 @@ def test_sft_tool_calls_accept_openai_json_arguments() -> None:
     assert 1 in loss_mask
 
 
-def test_build_sft_samples_only_when_lambda_and_pass() -> None:
+def test_build_sft_samples_emits_one_multiturn_row() -> None:
     tok = _FakeTok()
     os.environ["OFFLOAD_SFT_LAMBDA"] = "0"
+    os.environ["OFFLOAD_SFT_TAG_PROB"] = "0"
+    messages: list[dict[str, str]] = [{"role": "user", "content": "q"}]
+    turn0 = {
+        "valid_offload": True,
+        "n": 2,
+        "qwen_think_prefix": "local",
+        "teacher_think": "why",
+        "teacher_content": "do it",
+        "teacher_tool_calls": [],
+        "sft_history_messages": list(messages),
+    }
+    messages = list(messages) + [
+        {
+            "role": "assistant",
+            "reasoning_content": "localwhy",
+            "content": "do it",
+        },
+        {"role": "user", "content": "next"},
+    ]
+    turn1 = {
+        "slm_raw_output": "follow up",
+        "sft_history_messages": list(messages),
+    }
     grpo = Sample(
         index=7,
         group_index=1,
@@ -132,21 +335,7 @@ def test_build_sft_samples_only_when_lambda_and_pass() -> None:
         response_length=2,
         loss_mask=[1, 1],
         reward=1.0,
-        metadata={
-            "grading_solved": True,
-            "turn_costs": [
-                {
-                    "valid_offload": True,
-                    "qwen_think_prefix": "local",
-                    "teacher_think": "why",
-                    "teacher_content": "do it",
-                    "teacher_tool_calls": [],
-                    "sft_history_messages": [
-                        {"role": "user", "content": "q"},
-                    ],
-                }
-            ],
-        },
+        metadata={"grading_solved": True, "turn_costs": [turn0, turn1]},
     )
     assert build_sft_samples(grpo_samples=[grpo], tokenizer=tok, grading_solved=True) == []
 
@@ -154,31 +343,41 @@ def test_build_sft_samples_only_when_lambda_and_pass() -> None:
     out = build_sft_samples(grpo_samples=[grpo], tokenizer=tok, grading_solved=True)
     assert len(out) == 1
     assert out[0].train_metadata["objective"] == "sft"
-    assert out[0].train_metadata["pack_singleton"] is True
+    assert out[0].train_metadata["sft_multiturn"] is True
     assert out[0].rollout_id == 7
     assert sum(out[0].loss_mask) > 0
-    assert out[0].loss_mask.count(0) > 0
 
     assert build_sft_samples(grpo_samples=[grpo], tokenizer=tok, grading_solved=False) == []
+    os.environ.pop("OFFLOAD_SFT_TAG_PROB", None)
 
 
 def test_sft_max_samples_keeps_last_turns() -> None:
     tok = _FakeTok()
     os.environ["OFFLOAD_SFT_LAMBDA"] = "0.1"
-    os.environ["OFFLOAD_SFT_MAX_SAMPLES"] = "2"
+    os.environ["OFFLOAD_SFT_MAX_SAMPLES"] = "1"
     os.environ["OFFLOAD_SFT_MAX_SEQ_LEN"] = "0"
+    messages: list[dict[str, str]] = [{"role": "user", "content": "q0"}]
     turns = []
-    for i in range(5):
+    for i in range(2):
         turns.append(
             {
                 "valid_offload": True,
+                "n": 1,
                 "qwen_think_prefix": f"local{i}",
                 "teacher_think": f"why{i}",
                 "teacher_content": f"do{i}",
                 "teacher_tool_calls": [],
-                "sft_history_messages": [{"role": "user", "content": f"q{i}"}],
+                "sft_history_messages": list(messages),
             }
         )
+        messages = list(messages) + [
+            {
+                "role": "assistant",
+                "reasoning_content": f"local{i}why{i}",
+                "content": f"do{i}",
+            },
+            {"role": "user", "content": f"q{i + 1}"},
+        ]
     grpo = Sample(
         index=3,
         group_index=1,
@@ -189,58 +388,72 @@ def test_sft_max_samples_keeps_last_turns() -> None:
         metadata={"grading_solved": True, "turn_costs": turns},
     )
     out = build_sft_samples(grpo_samples=[grpo], tokenizer=tok, grading_solved=True)
-    assert len(out) == 2
-    assert [s.train_metadata["sft_turn_index"] for s in out] == [3, 4]
+    assert len(out) == 1
+    decoded = tok.decode(out[0].tokens)
+    assert "local1" in decoded
+    assert out[0].loss_mask.count(1) > 0
+    # Prior assistant stays in context but is not supervised when max_samples=1.
+    assert "local0why0" not in tok.decode(
+        [t for t, m in zip(out[0].tokens[-out[0].response_length :], out[0].loss_mask) if m == 1]
+    )
     os.environ.pop("OFFLOAD_SFT_MAX_SAMPLES", None)
     os.environ.pop("OFFLOAD_SFT_MAX_SEQ_LEN", None)
 
 
-def test_sft_left_trims_old_history_keeps_y() -> None:
+def test_sft_left_trims_old_history_keeps_tail() -> None:
     tok = _FakeTok()
+    os.environ["OFFLOAD_SFT_TAG_PROB"] = "0"
     old = "OLDCTX" * 40
-    history = [
-        {"role": "system", "content": "sys"},
-        {"role": "user", "content": old},
-        {"role": "assistant", "content": "old-reply"},
-        {"role": "user", "content": "latest-q"},
+    turn_costs = [
+        {
+            "valid_offload": True,
+            "n": 1,
+            "qwen_think_prefix": "local plan",
+            "teacher_think": "remote why",
+            "teacher_content": "edit foo.py",
+            "teacher_tool_calls": [],
+            "sft_history_messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": old},
+                {"role": "assistant", "content": "old-reply"},
+                {"role": "user", "content": "latest-q"},
+            ],
+        }
     ]
-    kwargs = dict(
-        tokenizer=tok,
-        history=history,
-        tools=None,
-        qwen_think="local plan",
-        glm_think="remote why",
-        glm_content="edit foo.py",
-        glm_tool_calls=None,
-    )
-    full = build_sft_token_sequence(**kwargs, max_seq=0)
+    full = build_multiturn_sft_token_sequence(tok, turn_costs, max_seq=0)
     assert full is not None
-    last_only = build_sft_token_sequence(
+    last_only = build_multiturn_sft_token_sequence(
         tok,
-        history=[{"role": "system", "content": "sys"}, {"role": "user", "content": "latest-q"}],
-        tools=None,
-        qwen_think="local plan",
-        glm_think="remote why",
-        glm_content="edit foo.py",
-        glm_tool_calls=None,
+        [
+            {
+                "valid_offload": True,
+                "n": 1,
+                "qwen_think_prefix": "local plan",
+                "teacher_think": "remote why",
+                "teacher_content": "edit foo.py",
+                "teacher_tool_calls": [],
+                "sft_history_messages": [
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "latest-q"},
+                ],
+            }
+        ],
         max_seq=0,
     )
     assert last_only is not None
-    cap = (len(last_only[0]) + len(full[0])) // 2
-    assert len(last_only[0]) < cap < len(full[0])
-
-    trimmed = build_sft_token_sequence(**kwargs, max_seq=cap)
+    cap = len(last_only[0]) + 80
+    assert len(full[0]) > cap > len(last_only[0])
+    trimmed = build_multiturn_sft_token_sequence(tok, turn_costs, max_seq=cap)
     assert trimmed is not None
     tokens, loss_mask, response_length = trimmed
     assert len(tokens) <= cap
     decoded = tok.decode(tokens)
     assert "latest-q" in decoded
     assert "remote why" in decoded
-    assert "edit foo.py" in decoded
     assert old not in decoded
-    assert 0 in loss_mask and 1 in loss_mask
-    assert len(loss_mask) == response_length
-    assert build_sft_token_sequence(**kwargs, max_seq=8) is None
+    assert 1 in loss_mask
+    assert build_multiturn_sft_token_sequence(tok, turn_costs, max_seq=8) is None
+    os.environ.pop("OFFLOAD_SFT_TAG_PROB", None)
 
 
 def test_post_process_skips_sft_in_group() -> None:
@@ -260,11 +473,16 @@ def test_post_process_skips_sft_in_group() -> None:
 
 if __name__ == "__main__":
     test_strip_offload_not_in_x()
-    test_turn_eligible_requires_glm_payload()
-    test_sft_mask_zeros_x_ones_glm()
+    test_turn_eligible_requires_history_and_payload()
+    test_sft_mask_supervises_all_assistant_spans()
+    test_sft_random_offload_tag()
+    test_multiturn_two_assistants_both_supervised()
+    test_multiturn_history_reset_keeps_longest_segment()
+    test_build_assistant_target_merges_slm_and_glm_think()
+    test_build_assistant_target_offload_tag_toggle()
     test_sft_tool_calls_accept_openai_json_arguments()
-    test_build_sft_samples_only_when_lambda_and_pass()
+    test_build_sft_samples_emits_one_multiturn_row()
     test_sft_max_samples_keeps_last_turns()
-    test_sft_left_trims_old_history_keeps_y()
+    test_sft_left_trims_old_history_keeps_tail()
     test_post_process_skips_sft_in_group()
     print("ok")
