@@ -45,24 +45,23 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 SLIME_DIR="${SLIME_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 
 export SAVE_INTERVAL="${SAVE_INTERVAL:-20}"
-# ---- Phase3 (2026-08): multiturn SFT + solo cost shaping + moderate help_seeking ----
-# Lessons from sft03: λ=0.1 + α=0.2 + NO_SEEK=0.2 → spam offload then cliff at ~step10.
-# sft02 decayed slower (λ=0.5) but still high offload; phase3 balances cost + seek + SFT.
-export EXP_TAG="${EXP_TAG:-agent_offload_pyrodash4b_phase3}"
-# Warm-start from sft02 iter_59 (last ckpt before long decay). Override or copy ckpt as needed.
-# export SAVE_DIR="${SAVE_DIR:-/workspace/work/spt/slime/runs/agent_offload_pyrodash4b_phase2_sft02_20260820_031605/checkpoints}"
+# ---- Phase4 from scratch (after 030125): keep offload skill, stop 100% spam ----
+# 030125 (λ_sft=0.3, TAG=0.3, efficiency=0.1): 100% offload → cliff@10–15 → rebound to 100%.
+# From-scratch on SFT-0803. Leave SAVE_DIR unset (empty --load → --ref-load).
+# Resume a crashed run of this recipe with SAVE_DIR=/path/to/that/checkpoints.
+export EXP_TAG="${EXP_TAG:-agent_offload_pyrodash4b_phase4_scratch}"
 export NUM_ROLLOUT="${NUM_ROLLOUT:-200}"
 # ---- mid-turn offload ----
 export SLIME_AGENT_OFFLOAD=1
-export OFFLOAD_EFFICIENCY_LAMBDA=0.1
+export OFFLOAD_EFFICIENCY_LAMBDA="${OFFLOAD_EFFICIENCY_LAMBDA:-0.3}"
 # help_seeking + SEEK_ONLY_WHEN_ALL_WRONG: withhold α only if a sibling
 # solved without offload (see offload.shape_group_help_seeking_rewards).
 export OFFLOAD_REWARD_MODE=help_seeking
 export OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG=1
-export OFFLOAD_SEEK_ALPHA="${OFFLOAD_SEEK_ALPHA:-0.15}"
+export OFFLOAD_SEEK_ALPHA="${OFFLOAD_SEEK_ALPHA:-0.18}"
 export OFFLOAD_SEEK_EMPTY_SCALE=0.5
 export OFFLOAD_UNIQUE_SOLVER_BONUS="${OFFLOAD_UNIQUE_SOLVER_BONUS:-0.1}"
-export OFFLOAD_NO_SEEK_PENALTY="${OFFLOAD_NO_SEEK_PENALTY:-0.1}"
+export OFFLOAD_NO_SEEK_PENALTY="${OFFLOAD_NO_SEEK_PENALTY:-0.15}"
 # Compact: any open-without-close → remove_sample (loss_mask=0). Aligned with
 # malformed open-run threshold (see offload.DEFAULT_COMPACT_*).
 export OFFLOAD_COMPACT_ORPHAN_OPEN_K="${OFFLOAD_COMPACT_ORPHAN_OPEN_K:-1}"
@@ -88,11 +87,12 @@ export SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS="${SLIME_FORK_MERGE_MAX_RESPONSE_TOK
 # Embed GLM continuation into Sample.tokens with loss_mask=0 (default on).
 export SLIME_OFFLOAD_EMBED_IN_TRAJECTORY="${SLIME_OFFLOAD_EMBED_IN_TRAJECTORY:-1}"
 # Mixed L = L_GRPO + λ_sft L_SFT. Multiturn: one long seq / episode, all assistant turns.
-export OFFLOAD_SFT_LAMBDA="${OFFLOAD_SFT_LAMBDA:-0.3}"
+export OFFLOAD_SFT_LAMBDA="${OFFLOAD_SFT_LAMBDA:-0.16}"
 # Cap SFT assistant turns from the end. Default 0 = include every round in one multiturn row.
 export OFFLOAD_SFT_MAX_SAMPLES="${OFFLOAD_SFT_MAX_SAMPLES:-0}"
 # Per offload turn: probability of supervising <|llm_offload|>N<|/llm_offload|> in SFT CE.
-export OFFLOAD_SFT_TAG_PROB="${OFFLOAD_SFT_TAG_PROB:-0.3}"
+# Keep high so tag skill does not cliff; efficiency λ fights spam, not TAG_PROB.
+export OFFLOAD_SFT_TAG_PROB="${OFFLOAD_SFT_TAG_PROB:-0.6}"
 # 0 = no cap (same context as GRPO). Positive → left-trim history, keep GLM y.
 export OFFLOAD_SFT_MAX_SEQ_LEN="${OFFLOAD_SFT_MAX_SEQ_LEN:-0}"
 # Leave MAX_TOKENS_PER_GPU unset so async launcher uses MAX_CONTEXT_LEN/CP
@@ -108,7 +108,6 @@ fi
 # SGLang loads padded HF vocab rows; Megatron torch_dist is padded to 248320.
 export HF_CHECKPOINT="${HF_CHECKPOINT:-/workspace/models/pyromind/PyroDash-4B-SFT-0803}"
 export REF_MODEL_PATH="${REF_MODEL_PATH:-/workspace/models/pyromind/PyroDash-4B-SFT-0803_torch_dist}"
-export EXP_TAG="${EXP_TAG:-agent_offload_pyrodash4b_docker_async}"
 # FP8 KV cache for longer agent decode contexts (rollout only; weights stay BF16).
 export SGLANG_KV_CACHE_DTYPE="${SGLANG_KV_CACHE_DTYPE:-fp8_e4m3}"
 

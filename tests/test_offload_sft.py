@@ -10,6 +10,8 @@ from pathlib import Path
 _REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO))
 
+import pytest  # noqa: E402
+
 from examples.coding_agent_rl import offload  # noqa: E402
 from examples.coding_agent_rl.offload_sft import (  # noqa: E402
     build_assistant_target,
@@ -32,6 +34,9 @@ class _FakeTok:
         return "".join(chr(t) for t in token_ids)
 
     def apply_chat_template(self, messages, tokenize=True, tools=None, add_generation_prompt=False, **kwargs):
+        # Match Qwen/PyroDash: reject system-only prefixes.
+        if not any(m.get("role") == "user" for m in messages):
+            raise ValueError("No user query found in messages.")
         parts = []
         for m in messages:
             role = m["role"]
@@ -81,6 +86,72 @@ def test_turn_eligible_requires_history_and_payload() -> None:
             "sft_history_messages": [{"role": "user", "content": "q"}],
         }
     )
+
+
+class _RewriteTok(_FakeTok):
+    """Prefix-unstable template: later user turns rewrite earlier user encoding."""
+
+    def apply_chat_template(self, messages, tokenize=True, tools=None, add_generation_prompt=False, **kwargs):
+        if not any(m.get("role") == "user" for m in messages):
+            raise ValueError("No user query found in messages.")
+        users = [m for m in messages if m.get("role") == "user"]
+        # Merging consecutive users changes earlier ids once a second user appears.
+        merged_users = [{"role": "user", "content": "|".join(str(u.get("content") or "") for u in users)}]
+        rest = [m for m in messages if m.get("role") != "user"]
+        # Keep system first, then one merged user, then non-user turns in order.
+        systems = [m for m in rest if m.get("role") == "system"]
+        others = [m for m in rest if m.get("role") != "system"]
+        return super().apply_chat_template(
+            systems + merged_users + others,
+            tokenize=tokenize,
+            tools=tools,
+            add_generation_prompt=add_generation_prompt,
+            **kwargs,
+        )
+
+
+def test_tokenize_skips_system_only_prefix() -> None:
+    """Regression: must not call chat template on [system] alone."""
+    tok = _FakeTok()
+    turn_costs = [
+        {
+            "slm_raw_output": "think",
+            "sft_assistant_message": {"role": "assistant", "reasoning_content": "think", "content": "ans"},
+            "sft_history_messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "q"},
+            ],
+        }
+    ]
+    built = build_multiturn_sft_token_sequence(tok, turn_costs)
+    assert built is not None
+    tokens, loss_mask, response_length = built
+    assert response_length > 0 and 1 in loss_mask
+    assert "think" in tok.decode(tokens[-response_length:])
+
+
+def test_tokenize_realigns_when_template_rewrites_prefix() -> None:
+    """Consecutive users that rewrite earlier ids must not abort the whole sample."""
+    tok = _RewriteTok()
+    turn_costs = [
+        {
+            "slm_raw_output": "solo",
+            "sft_assistant_message": {"role": "assistant", "reasoning_content": "solo", "content": "ok"},
+            "sft_history_messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "q1"},
+                {"role": "user", "content": "q2"},
+            ],
+        }
+    ]
+    built = build_multiturn_sft_token_sequence(tok, turn_costs)
+    assert built is not None
+    tokens, loss_mask, response_length = built
+    assert 1 in loss_mask
+    supervised = tok.decode([t for t, m in zip(tokens[-response_length:], loss_mask) if m])
+    assert "solo" in supervised
+    # Rewritten user prefix is context, not a wiped assistant span.
+    assert loss_mask.count(1) >= len("solo")
 
 
 def test_sft_mask_supervises_all_assistant_spans() -> None:
@@ -139,6 +210,32 @@ def test_sft_random_offload_tag() -> None:
     dec_wo = tok.decode(without_tag[0][-resp_wo:])
     assert offload.OFFLOAD_OPEN in dec_w and offload.OFFLOAD_CLOSE in dec_w
     assert offload.OFFLOAD_OPEN not in dec_wo
+
+
+def test_tokenize_skips_system_only_prefix() -> None:
+    """Qwen templates reject system-only prefixes; multiturn SFT must still emit."""
+    tok = _FakeTok()
+    turn_costs = [
+        {
+            "valid_offload": True,
+            "n": 2,
+            "slm_raw_output": f"{offload.OFFLOAD_OPEN}2{offload.OFFLOAD_CLOSE}",
+            "teacher_think": "remote",
+            "teacher_content": "do it",
+            "teacher_tool_calls": [],
+            "sft_history_messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "q"},
+            ],
+        }
+    ]
+    built = build_multiturn_sft_token_sequence(tok, turn_costs, rng=__import__("random").Random(0))
+    assert built is not None
+    tokens, loss_mask, response_length = built
+    assert len(loss_mask) == response_length
+    assert 1 in loss_mask
+    decoded = tok.decode(tokens)
+    assert "sys" in decoded and "remote" in decoded and "do it" in decoded
 
 
 def test_multiturn_two_assistants_both_supervised() -> None:
@@ -471,11 +568,35 @@ def test_post_process_skips_sft_in_group() -> None:
     assert norm[0] > 0 > norm[1]
 
 
+def test_post_process_excludes_remove_sample_from_baseline() -> None:
+    class _Args:
+        grpo_std_normalization = False
+        reward_key = None
+
+    kept_hi = Sample(index=0, group_index=1, reward=1.0, train_metadata={"objective": "grpo"})
+    removed = Sample(
+        index=1,
+        group_index=1,
+        reward=1.0,
+        remove_sample=True,
+        train_metadata={"objective": "grpo"},
+    )
+    kept_lo = Sample(index=2, group_index=1, reward=0.0, train_metadata={"objective": "grpo"})
+    raw, norm = post_process_rewards_grpo_only(_Args(), [kept_hi, removed, kept_lo])
+    assert raw == [1.0, 1.0, 0.0]
+    # Baseline uses only kept rows (mean 0.5), not the compact-removed solved row.
+    assert norm[0] == pytest.approx(0.5)
+    assert norm[1] == 0.0
+    assert norm[2] == pytest.approx(-0.5)
+
+
 if __name__ == "__main__":
     test_strip_offload_not_in_x()
     test_turn_eligible_requires_history_and_payload()
     test_sft_mask_supervises_all_assistant_spans()
     test_sft_random_offload_tag()
+    test_tokenize_skips_system_only_prefix()
+    test_tokenize_realigns_when_template_rewrites_prefix()
     test_multiturn_two_assistants_both_supervised()
     test_multiturn_history_reset_keeps_longest_segment()
     test_build_assistant_target_merges_slm_and_glm_think()
@@ -485,4 +606,5 @@ if __name__ == "__main__":
     test_sft_max_samples_keeps_last_turns()
     test_sft_left_trims_old_history_keeps_tail()
     test_post_process_skips_sft_in_group()
+    test_post_process_excludes_remove_sample_from_baseline()
     print("ok")

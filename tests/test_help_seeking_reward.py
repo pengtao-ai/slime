@@ -416,6 +416,71 @@ def test_compact_removes_orphan_spam():
     assert reason == "orphan_open"
 
 
+def test_compact_keeps_paired_offload_despite_high_tag_density():
+    """Valid OPEN/CLOSE pairs must not trip special_token_ratio on short SLM turns."""
+    from slime.utils.types import Sample
+
+    turns = [_turn(valid=True, small_o=3, glm_o=80, opens=1, closes=1) for _ in range(19)]
+    stats = {
+        "turn_costs": turns,
+        "offload_count": 19,
+        "offload_outside_think_count": 0,
+        "small_output_tokens": 57,
+    }
+    s = Sample(
+        index=0,
+        prompt="p",
+        response="x",
+        response_length=57,
+        status=Sample.Status.COMPLETED,
+        metadata={"grading_solved": True, "offload_stats": stats},
+    )
+    remove, reason = offload.compact_should_remove_sample(s)
+    assert not remove
+    assert reason is None
+
+
+def test_compact_special_ratio_uses_unmatched_marks_only():
+    from slime.utils.types import Sample
+
+    # Extra CLOSEs (no orphan OPEN): open/close ratio stays below 3.0, unmatched
+    # density still trips special_token_ratio.
+    extra_close = [_turn(valid=True, small_o=2, glm_o=0, opens=1, closes=1) for _ in range(2)]
+    extra_close.append(
+        {
+            "small_prompt_tokens": 100,
+            "small_output_tokens": 6,
+            "glm_input_tokens": 0,
+            "glm_output_tokens": 0,
+            "valid_offload": False,
+            "outside_think": False,
+            "orphan_open_count": 0,
+            "malformed_count": 4,
+            "open_count": 0,
+            "close_count": 4,
+            "max_open_run": 0,
+            "special_mark_count": 4,
+        }
+    )
+    stats = {
+        "turn_costs": extra_close,
+        "offload_count": 2,
+        "offload_outside_think_count": 0,
+        "small_output_tokens": 10,
+    }
+    s = Sample(
+        index=1,
+        prompt="p",
+        response="x",
+        response_length=10,
+        status=Sample.Status.COMPLETED,
+        metadata={"offload_stats": stats},
+    )
+    remove, reason = offload.compact_should_remove_sample(s)
+    assert remove
+    assert reason == "special_token_ratio"
+
+
 def test_compact_removes_timeout_and_max_steps():
     from slime.utils.types import Sample
 

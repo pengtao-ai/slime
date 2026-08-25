@@ -2070,8 +2070,12 @@ def compact_should_remove_sample(sample: Any) -> tuple[bool, str | None]:
         return True, "open_close_ratio"
     if tags["max_open_run"] >= special_run:
         return True, "special_token_run"
+    # Paired OPEN/CLOSE are legitimate offload calls and often the whole SLM
+    # turn; counting both toward the ratio false-drops those GRPO rows.
+    # Use unmatched marks only (orphan / extra CLOSE density).
     out_tok = max(1, tags["small_output_tokens"], int(getattr(sample, "response_length", 0) or 0))
-    if tags["special_mark_count"] / out_tok >= special_ratio and tags["special_mark_count"] >= k:
+    unmatched = abs(open_c - close_c)
+    if unmatched / out_tok >= special_ratio and unmatched >= k:
         return True, "special_token_ratio"
     return False, None
 

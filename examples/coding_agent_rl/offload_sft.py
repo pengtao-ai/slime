@@ -266,6 +266,10 @@ def _split_system_prefix(history: list[dict[str, Any]]) -> tuple[list[dict[str, 
     return history[:i], history[i:]
 
 
+def _prefix_has_user(messages: list[dict[str, Any]]) -> bool:
+    return any(m.get("role") == "user" for m in messages)
+
+
 def left_trim_messages_to_fit(
     tokenizer: Any,
     messages: list[dict[str, Any]],
@@ -282,10 +286,15 @@ def left_trim_messages_to_fit(
     except Exception:
         return None
     sys_msgs, rest = _split_system_prefix(messages)
+    # Qwen-style templates reject system-only prefixes ("No user query found").
     if not rest:
-        return sys_msgs if len(_render_ids(tokenizer, sys_msgs, tools=tools, add_generation_prompt=False)) <= max_seq else None
+        return None
     for start in range(len(rest)):
         trimmed = sys_msgs + rest[start:]
+        # Keep a valid chat shape: first non-system turn must be user.
+        first_non_sys = next((m for m in trimmed if m.get("role") != "system"), None)
+        if first_non_sys is None or first_non_sys.get("role") != "user":
+            continue
         try:
             if len(_render_ids(tokenizer, trimmed, tools=tools, add_generation_prompt=False)) <= max_seq:
                 return trimmed
@@ -347,53 +356,116 @@ def turn_eligible_for_sft(tc: dict[str, Any]) -> bool:
     return build_assistant_target(tc, include_offload_tag=False) is not None
 
 
+def _common_prefix_len(a: list[int], b: list[int]) -> int:
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
 def _tokenize_multiturn(
     tokenizer: Any,
     messages: list[dict[str, Any]],
     *,
     tools: list[dict] | None,
     supervise_assistant_indices: set[int] | None = None,
-) -> tuple[list[int], list[int]] | None:
-    """Tokenize a conversation; mask=1 on selected assistant spans only."""
-    tokens: list[int] = []
-    loss_mask: list[int] = []
-    for i in range(len(messages)):
-        try:
-            ids_prev = (
-                _render_ids(tokenizer, messages[:i], tools=tools, add_generation_prompt=False)
-                if i > 0
-                else []
-            )
-            ids_curr = _render_ids(tokenizer, messages[: i + 1], tools=tools, add_generation_prompt=False)
-        except Exception as exc:
-            logger.warning("[offload_sft] apply_chat_template failed at message %d: %s", i, exc)
-            return None
-        chunk = ids_curr[len(ids_prev) :]
-        if not chunk and i < len(messages):
-            return None
-        tokens.extend(chunk)
-        supervise = messages[i].get("role") == "assistant" and (
-            supervise_assistant_indices is None or i in supervise_assistant_indices
-        )
-        loss_mask.extend([1 if supervise else 0] * len(chunk))
-    return tokens, loss_mask
+) -> tuple[list[int], list[int], int] | None:
+    """Tokenize a conversation; mask=1 on selected assistant spans only.
 
+    Canonical ids come from one full ``apply_chat_template`` call. Per-message
+    spans are cut on that sequence by walking backwards: each prefix render's
+    common prefix with the full ids is the cut before that message. That keeps
+    supervision on the *final* encoding of earlier assistants when a later turn
+    rewrites the template prefix (instead of zeroing the rewritten tail).
 
-def _leading_prompt_len(
-    tokenizer: Any,
-    messages: list[dict[str, Any]],
-    *,
-    tools: list[dict] | None,
-) -> int | None:
+    Qwen/PyroDash chat templates reject prefixes with no ``user`` turn; prefix
+    renders that fail are treated as an empty prefix (cut at 0).
+    """
+    first_renderable = next(
+        (i for i in range(len(messages)) if _prefix_has_user(messages[: i + 1])),
+        None,
+    )
+    if first_renderable is None:
+        logger.warning("[offload_sft] no user message in conversation; skip tokenize")
+        return None
+
     try:
-        first_asst = next(i for i, m in enumerate(messages) if m.get("role") == "assistant")
-        return len(
-            _render_ids(tokenizer, messages[:first_asst], tools=tools, add_generation_prompt=True)
-        )
-    except StopIteration:
+        full_ids = _render_ids(tokenizer, messages, tools=tools, add_generation_prompt=False)
+    except Exception as exc:
+        logger.warning("[offload_sft] apply_chat_template failed on full conversation: %s", exc)
         return None
-    except Exception:
+    if not full_ids:
         return None
+
+    spans: dict[int, tuple[int, int]] = {}
+    attributed_end = len(full_ids)
+    for i in range(len(messages) - 1, first_renderable - 1, -1):
+        try:
+            prefix_ids = _render_ids(
+                tokenizer, messages[:i], tools=tools, add_generation_prompt=False
+            )
+        except Exception:
+            prefix_ids = []
+        start = min(_common_prefix_len(prefix_ids, full_ids), attributed_end)
+        if start < attributed_end:
+            spans[i] = (start, attributed_end)
+            attributed_end = start
+
+    loss_mask = [0] * len(full_ids)
+    for i, (start, end) in spans.items():
+        if i == first_renderable and first_renderable > 0:
+            supervise = False
+        else:
+            supervise = messages[i].get("role") == "assistant" and (
+                supervise_assistant_indices is None or i in supervise_assistant_indices
+            )
+        if supervise:
+            for j in range(start, end):
+                loss_mask[j] = 1
+
+    # Relocate each supervised assistant's unique tail onto the full sequence so
+    # a later rewrite that stole the backwards span still keeps those tokens.
+    for i, msg in enumerate(messages):
+        if i == first_renderable and first_renderable > 0:
+            continue
+        if msg.get("role") != "assistant":
+            continue
+        if supervise_assistant_indices is not None and i not in supervise_assistant_indices:
+            continue
+        try:
+            before = _render_ids(tokenizer, messages[:i], tools=tools, add_generation_prompt=False)
+            after = _render_ids(tokenizer, messages[: i + 1], tools=tools, add_generation_prompt=False)
+        except Exception:
+            continue
+        tail = after[_common_prefix_len(before, after) :]
+        if not tail:
+            continue
+        n = len(tail)
+        prefer = spans[i][0] if i in spans else 0
+        found: tuple[int, int] | None = None
+        if prefer + n <= len(full_ids) and full_ids[prefer : prefer + n] == tail:
+            found = (prefer, prefer + n)
+        else:
+            for pos in range(0, len(full_ids) - n + 1):
+                if full_ids[pos : pos + n] == tail:
+                    found = (pos, pos + n)
+                    break
+        if found is not None:
+            for j in range(found[0], found[1]):
+                loss_mask[j] = 1
+
+    if not any(loss_mask):
+        return None
+
+    first_asst = next((i for i, m in enumerate(messages) if m.get("role") == "assistant"), None)
+    if first_asst is not None and first_asst in spans:
+        leading = spans[first_asst][0]
+    else:
+        leading = next((j for j, bit in enumerate(loss_mask) if bit), 0)
+    if leading <= 0 or leading >= len(full_ids):
+        return None
+    return full_ids, loss_mask, leading
 
 
 def build_multiturn_sft_messages(
@@ -500,12 +572,10 @@ def build_multiturn_sft_token_sequence(
     )
     if tokenized is None:
         return None
-    tokens, full_mask = tokenized
+    tokens, full_mask, leading = tokenized
     if not tokens or not any(full_mask):
         return None
-
-    leading = _leading_prompt_len(tokenizer, messages, tools=tools)
-    if leading is None or leading >= len(tokens):
+    if leading >= len(tokens):
         return None
 
     response_length = len(tokens) - leading
@@ -636,7 +706,12 @@ def build_sft_samples(
 
 
 def post_process_rewards_grpo_only(args: Any, samples: list[Sample]):
-    """GRPO mean/std by ``group_index``; SFT rows stay at reward 0 and are excluded."""
+    """GRPO mean/std by ``group_index``.
+
+    SFT rows and compact-removed rows stay at advantage 0 and are excluded from
+    the group baseline (zero-masked compact rows would otherwise inflate the
+    mean when they still carry a solved reward).
+    """
     import torch
     from collections import defaultdict
 
@@ -644,7 +719,7 @@ def post_process_rewards_grpo_only(args: Any, samples: list[Sample]):
     groups: dict[Any, list[tuple[int, float]]] = defaultdict(list)
     out = [0.0] * len(samples)
     for i, s in enumerate(samples):
-        if is_sft_sample(s):
+        if is_sft_sample(s) or getattr(s, "remove_sample", False):
             continue
         groups[getattr(s, "group_index", i)].append((i, float(raw_rewards[i])))
 
