@@ -114,7 +114,8 @@ export SGLANG_KV_CACHE_DTYPE="${SGLANG_KV_CACHE_DTYPE:-fp8_e4m3}"
 # Pre-baked ScaleSWE agent images (Node22 + Claude Code + pre_commands).
 # Override with PROMPT_DATA=.../swe_train_scaleswe_200.jsonl for the raw bases.
 # export PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/data/swe_train_scaleswe_200_baked.jsonl}"
-export PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/data/mixed_reward1_agents_first200_baked_shuffled.jsonl}"
+# export PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/data/mixed_reward1_agents_first200_baked_shuffled.jsonl}"
+export PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/data/release/mixed_reward1_agents_baked.jsonl}"
 
 # Multi-agent CLI packages for mixed_*_agents.jsonl (codex/pi/opencode/miniswe).
 # Claude Code + Node are set in run_qwen35_4b_swe_1node_async.sh; these four must
