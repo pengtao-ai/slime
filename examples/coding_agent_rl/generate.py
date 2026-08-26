@@ -46,7 +46,7 @@ from slime.utils.misc import SingletonMeta
 from slime.utils.processing_utils import load_tokenizer
 from slime.utils.types import Sample
 
-from . import offload, swe
+from . import gigpo, offload, swe
 from .agents_registry import AdapterProtocol, resolve_agent
 from .offload_sft import build_sft_samples
 
@@ -91,16 +91,26 @@ class _OffloadMixin:
     def pop_turn_git_diffs(self, sid: str) -> list[dict[str, Any]]:
         return self._sid_turn_git_diffs.pop(sid, [])
 
-    async def _capture_turn_git_diff(self, sid: str, session: Session) -> None:
-        state = self._sid_repo_state.get(sid)
-        if not state:
-            return
+    async def _capture_turn_git_diff(
+        self,
+        sid: str,
+        session: Session,
+        manager_message: dict[str, Any] | None = None,
+    ) -> None:
+        from . import gigpo
+
         turn_index = int(((session.timing or {}).get("current_turn", 0) or 0))
-        record = {"turn_index": turn_index, "git_diff": ""}
-        try:
-            record["git_diff"] = await swe.capture_turn_git_diff(state["sb"], state["workdir"])
-        except Exception as exc:
-            record["capture_error"] = f"{type(exc).__name__}: {exc}"
+        record: dict[str, Any] = {
+            "turn_index": turn_index,
+            "git_diff": "",
+            "tool_calls": gigpo.parse_manager_tool_calls(manager_message),
+        }
+        state = self._sid_repo_state.get(sid)
+        if state:
+            try:
+                record["git_diff"] = await swe.capture_turn_git_diff(state["sb"], state["workdir"])
+            except Exception as exc:
+                record["capture_error"] = f"{type(exc).__name__}: {exc}"
         self._sid_turn_git_diffs.setdefault(sid, []).append(record)
 
     def _preprocess_body(self, body: dict) -> None:
@@ -128,7 +138,7 @@ class _OffloadMixin:
             tokenizer=self.tokenizer,
             tools_schema=tools_schema,
         )
-        await self._capture_turn_git_diff(sid, session)
+        await self._capture_turn_git_diff(sid, session, manager_message=reply.manager_message)
         return reply
 
 
@@ -613,6 +623,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 tid=tid,
                 args={"instance_id": instance_id, "session_id": session_id},
             ):
+                turn_git_diffs = state.pop_turn_git_diffs(session_id)
+                gigpo_turns = gigpo.compact_turns(md.get("protocol"), turn_git_diffs)
                 samples = await state.finish_session(
                     session_id,
                     base_sample=base_sample,
@@ -630,7 +642,8 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         "max_steps_reached": bool(offload_stats.get("max_steps_reached")),
                         "timeout": agent_exit_code < 0,
                         "timeline": timeline,
-                        "turn_git_diffs": state.pop_turn_git_diffs(session_id),
+                        "turn_git_diffs": turn_git_diffs,
+                        "gigpo_turns": gigpo_turns,
                     },
                 )
             if not samples:
@@ -664,11 +677,19 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                         or offload_stats.get("max_steps_reached")
                     ),
                 }
-                if getattr(s, "train_metadata", None) is None and (s.metadata or {}).get("turn_rewards"):
-                    s.train_metadata = {
-                        "turn_rewards": s.metadata.get("turn_rewards"),
-                        "turn_token_spans": s.metadata.get("turn_token_spans"),
-                    }
+                tmd = dict(getattr(s, "train_metadata", None) or {})
+                if not tmd and (s.metadata or {}).get("turn_rewards"):
+                    tmd["turn_rewards"] = s.metadata.get("turn_rewards")
+                    tmd["turn_token_spans"] = s.metadata.get("turn_token_spans")
+                smd = s.metadata or {}
+                if smd.get("gigpo_turns") is not None:
+                    tmd["gigpo_turns"] = smd.get("gigpo_turns")
+                if smd.get("protocol") is not None:
+                    tmd["protocol"] = smd.get("protocol")
+                if smd.get("instance_id") is not None:
+                    tmd["instance_id"] = smd.get("instance_id")
+                if tmd:
+                    s.train_metadata = tmd
 
             # Online SFT: PASS + valid offload turns → separate Sample rows (not in GRPO group).
             if offload.offload_enabled() and solved == 1.0:

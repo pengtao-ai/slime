@@ -972,6 +972,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--gigpo-gamma",
+                type=float,
+                default=0.95,
+                help="GiGPO discount γ for per-step returns (Eq. 5). Used by examples.coding_agent_rl.gigpo.",
+            )
+            parser.add_argument(
+                "--gigpo-step-advantage-w",
+                type=float,
+                default=1.0,
+                help="Weight w on step advantage A_S in A = A_E + w·A_S (Eq. 8).",
+            )
+            parser.add_argument(
                 "--use-kl-loss", action="store_true", default=False, help="whether to use KL loss from GRPO"
             )
             parser.add_argument(

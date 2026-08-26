@@ -2004,6 +2004,9 @@ def attach_turn_advantage_metadata(
             train_md["turn_token_spans"] = spans
         else:
             train_md.pop("turn_token_spans", None)
+        for key in ("gigpo_turns", "protocol", "instance_id"):
+            if key in md:
+                train_md[key] = md[key]
         sample.train_metadata = train_md
 
 
