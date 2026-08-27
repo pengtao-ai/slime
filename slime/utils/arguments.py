@@ -981,7 +981,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--gigpo-step-advantage-w",
                 type=float,
                 default=1.0,
-                help="Weight w on step advantage A_S in A = A_E + w·A_S (Eq. 8).",
+                help="Weight w on step advantages in A = A_E + w·(A_S + A_I).",
             )
             parser.add_argument(
                 "--use-kl-loss", action="store_true", default=False, help="whether to use KL loss from GRPO"

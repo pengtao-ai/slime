@@ -2,7 +2,7 @@
 """Render GiGPO HTML for a Tmax (or ScaleSWE) instance from a rollout dump.
 
 Intra-traj segments: git-diff (scaleswe) or Edit/Write (tmax).
-Inter-traj groups: intent + tools. Per-turn: dump r_i and GiGPO G / A_E / A_S / A.
+Inter-traj groups: intent + tools. Per-turn: dump r_i and GiGPO G / G_t / A_E / A_S / A_I / A.
 """
 
 from __future__ import annotations
@@ -72,13 +72,13 @@ def _records_from_sample(sample: dict[str, Any]) -> list[dict[str, Any]]:
     for i in range(n):
         git = diffs[i] if i < len(diffs) else {}
         tc = costs[i] if i < len(costs) else {}
-        out.append(
-            {
-                "turn_index": int(git.get("turn_index") if git.get("turn_index") is not None else i),
-                "git_diff": str(git.get("git_diff") or ""),
-                "tool_calls": _tool_calls_from_turn_cost(tc),
-            }
-        )
+        calls = git.get("tool_calls") if git.get("tool_calls") else _tool_calls_from_turn_cost(tc)
+        rec = {
+            "turn_index": int(git.get("turn_index") if git.get("turn_index") is not None else i),
+            "git_diff": str(git.get("git_diff") or ""),
+            "tool_calls": calls,
+        }
+        out.append(rec)
     return out
 
 
@@ -135,36 +135,76 @@ def _signed(v: float) -> str:
     return f"<span class='{cls}'>{v:+.4f}</span>"
 
 
-def render_html(instance_id: str, trajs: list[dict[str, Any]], *, rollout_id: int, gamma: float, step_w: float) -> str:
+def _gid(kind: str, label: str, color: str, *, sk: str = "", t: str = "") -> str:
+    esc = html_lib.escape(label)
+    if kind == "t":
+        attrs = f" data-kind='t' data-t='{html_lib.escape(t or label, quote=True)}'"
+    else:
+        attrs = f" data-kind='s' data-sk='{html_lib.escape(sk, quote=True)}'"
+    return f"<span class='gid'{attrs} style='background:{color}'>{esc}</span>"
+
+
+def render_html(
+    instance_id: str,
+    trajs: list[dict[str, Any]],
+    *,
+    rollout_id: int,
+    gamma: float,
+    step_w: float,
+    proto: str = "tmax",
+) -> str:
     n_traj = len(trajs)
     legend_t: dict[str, dict[str, Any]] = {}
     columns = []
     for traj in trajs:
         cards = []
         last_seg = None
+        traj_i = int(traj["index"])
         for row in traj["turns"]:
             if row["t_label"] != "·" and row["t_label"] not in legend_t:
                 legend_t[row["t_label"]] = row
+            first_seg = last_seg is None
             seg_break = last_seg is not None and int(row["seg"]) != last_seg
             last_seg = int(row["seg"])
             brk = " seg-break" if seg_break else ""
             r_turn = row.get("r_turn")
             r_turn_s = f"{float(r_turn):.4f}" if r_turn is not None else "—"
+            sk = f"{traj_i}:{row['s_label']}"
+            tlab = row["t_label"]
+            files = str(row.get("files") or "")
+            git_html = ""
+            if gigpo.is_tmax(proto):
+                git_html = (
+                    f"<div class='git'>修改：{html_lib.escape(files) if files else '尚未修改'}</div>"
+                )
+            else:
+                files = files or ("<empty diff>" if row.get("empty_diff") else "")
+                git_html = f"<div class='git'>git：{html_lib.escape(files)}</div>"
+                if seg_break or first_seg:
+                    body = str(row.get("git_diff") or "")
+                    git_html += (
+                        f"<pre class='diff'>{html_lib.escape(body)}</pre>"
+                        if body.strip()
+                        else "<div class='empty-diff'>&lt;empty diff&gt;</div>"
+                    )
             cards.append(
-                f"<section class='turn{brk}'>"
+                f"<section class='turn{brk}' data-t='{html_lib.escape(tlab, quote=True)}' data-sk='{html_lib.escape(sk, quote=True)}'>"
                 f"<div class='turn-title'>t{row['turn']}"
-                f"<span class='gid' style='background:{row['s_color']}'>{html_lib.escape(row['s_label'])}</span>"
-                f"<span class='gid' style='background:{row['t_color']}'>{html_lib.escape(row['t_label'])}</span>"
+                f"{_gid('s', row['s_label'], row['s_color'], sk=sk)}"
+                f"{_gid('t', tlab, row['t_color'], t=tlab)}"
                 f"</div>"
                 f"<div class='intent'>意图：{html_lib.escape(row['intent'])}"
                 f"<br>工具：{html_lib.escape(row['tools_str'])}"
                 f"<br>轨迹间：{row['group_n_traj']}/{n_traj} 条 · size={row['group_size']}</div>"
+                f"{git_html}"
                 f"<div class='reward' style='border-left:4px solid {row['t_color']}'>"
                 f"<span class='chip'>r_i={r_turn_s}</span>"
                 f"<span class='chip'>r_imm={row['r_imm']:.4f}</span>"
                 f"<span class='chip'>G={row['G']:.4f}</span>"
+                f"<span class='chip'>G_t={float(row.get('G_turn', row['G'])):.4f}</span>"
                 f"<span class='chip'>A_E={row['A_E']:+.4f}</span>"
                 f"<span class='chip'>A_S={row['A_S']:+.4f}</span>"
+                f"<span class='chip'>A_I={float(row.get('A_I', 0.0)):+.4f}</span>"
                 f"<span class='chip A'>A={row['A']:+.4f}</span>"
                 f"</div></section>"
             )
@@ -180,7 +220,7 @@ def render_html(instance_id: str, trajs: list[dict[str, Any]], *, rollout_id: in
     for label, row in sorted(legend_t.items(), key=lambda kv: int(kv[0][1:]) if kv[0][1:].isdigit() else 999):
         cap = f"{row['intent']} · {row['tools_str']}"
         t_parts.append(
-            f"<span class='chip' style='background:{row['t_color']}'>"
+            f"<span class='chip' data-t='{html_lib.escape(label, quote=True)}' style='background:{row['t_color']}'>"
             f"{html_lib.escape(label)} ×{row['group_size']} · {row['group_n_traj']}traj · {html_lib.escape(cap[:90])}</span>"
         )
     legend = " ".join(t_parts) or "<span class='muted'>无跨轨迹 T 组</span>"
@@ -197,23 +237,44 @@ def render_html(instance_id: str, trajs: list[dict[str, Any]], *, rollout_id: in
             if row is None:
                 cells.append("<td class='empty'></td>")
                 continue
+            sk = f"{int(traj['index'])}:{row['s_label']}"
+            tlab = row["t_label"]
+            files = str(row.get("files") or "")
+            file_line = (
+                f"<div class='muted'>修改：{html_lib.escape(files) if files else '尚未修改'}</div>"
+                if gigpo.is_tmax(proto)
+                else f"<div class='muted'>git：{html_lib.escape(files)}</div>"
+            )
             cells.append(
-                "<td class='cell'>"
+                f"<td class='cell' data-t='{html_lib.escape(tlab, quote=True)}' data-sk='{html_lib.escape(sk, quote=True)}'>"
                 f"<div class='bar' style='background:{row['t_color']}'></div>"
-                f"<div><span class='gid' style='background:{row['s_color']}'>{html_lib.escape(row['s_label'])}</span> "
-                f"<span class='gid' style='background:{row['t_color']}'>{html_lib.escape(row['t_label'])}</span></div>"
+                f"<div>{_gid('s', row['s_label'], row['s_color'], sk=sk)} "
+                f"{_gid('t', tlab, row['t_color'], t=tlab)}</div>"
                 f"<div class='muted'>{html_lib.escape(row['intent'])}</div>"
                 f"<div class='muted'>{html_lib.escape(row['tools_str'])}</div>"
+                f"{file_line}"
                 f"<div>r_i={float(row['r_turn']):.3f}</div>"
+                f"<div>G_t={float(row.get('G_turn', row['G'])):.3f} A_I={_signed(float(row.get('A_I', 0.0)))}</div>"
                 f"<div>G={row['G']:.3f} A_E={_signed(row['A_E'])} A_S={_signed(row['A_S'])}</div>"
                 f"<div><b>A={_signed(row['A'])}</b></div>"
                 "</td>"
             )
         body_rows.append("<tr>" + "".join(cells) + "</tr>")
 
+    proto_name = "Tmax" if gigpo.is_tmax(proto) else "ScaleSWE"
+    seg_rule = (
+        "Edit/Write/Bash改文件 执行前的累计修改一切开（改文件是旧组的最后一轮）"
+        if gigpo.is_tmax(proto)
+        else "工具执行前的累计 git diff 一切开（Edit 是旧 diff 组的最后一轮；绿横线处展开 diff）"
+    )
+    intent_rule = (
+        "意图：实现修复 / 复现试跑 / 验证运行 / 改后阅读 / 探索定位"
+        if gigpo.is_tmax(proto)
+        else "意图：探索定位 · 写/改测试 · 实现修复 · 复现失败 · 验证修复 · 改后阅读"
+    )
     return f"""<!doctype html>
 <html lang="zh"><head><meta charset="utf-8">
-<title>{html_lib.escape(instance_id)} Tmax GiGPO</title>
+<title>{html_lib.escape(instance_id)} {proto_name} GiGPO</title>
 <style>
 * {{ box-sizing: border-box; }}
 body {{ margin: 0; background: #0d1117; color: #c9d1d9; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }}
@@ -222,6 +283,16 @@ header h1 {{ margin: 0 0 4px; font: 600 15px sans-serif; color: #f0f6fc; }}
 header .sub {{ color: #8b949e; font: 12px sans-serif; }}
 .legend {{ margin-top: 8px; display: flex; flex-wrap: wrap; gap: 4px; font-family: sans-serif; }}
 .legend .chip, .chip {{ font-size: 10px; padding: 2px 7px; border-radius: 8px; color: #fff; background: #21262d; }}
+.legend .chip, .gid {{ cursor: pointer; user-select: none; }}
+.legend .chip:hover, .gid:hover {{ filter: brightness(1.18); }}
+.turn, td.cell {{ cursor: pointer; transition: opacity .12s, box-shadow .12s; }}
+body.picking .turn, body.picking td.cell {{ opacity: .22; }}
+body.picking .turn.on, body.picking td.cell.on {{
+  opacity: 1;
+  box-shadow: inset 0 0 0 2px #f0c674;
+}}
+body.picking .legend .chip {{ opacity: .35; }}
+body.picking .legend .chip.on {{ opacity: 1; outline: 2px solid #f0c674; }}
 .grid {{ display: grid; grid-template-columns: repeat({n_traj}, minmax(300px, 1fr)); gap: 8px; min-width: {width}px; padding: 10px; align-items: start; }}
 .traj {{ background: #161b22; border: 1px solid #30363d; border-radius: 6px; overflow: hidden; }}
 .traj-title {{ padding: 8px; background: #21262d; font: 600 12px sans-serif; color: #f0f6fc; }}
@@ -232,6 +303,9 @@ header .sub {{ color: #8b949e; font: 12px sans-serif; }}
 .reward {{ padding: 6px 8px; background: #18232f; font: 11px sans-serif; display: flex; flex-wrap: wrap; gap: 4px; }}
 .reward .chip.A {{ background: #1f6feb; color: #fff; font-weight: 700; }}
 .gid {{ display: inline-block; min-width: 22px; padding: 0 5px; border-radius: 6px; color: #fff; font-weight: 700; }}
+.git {{ padding: 4px 8px; color: #79c0ff; font: 11px sans-serif; border-top: 1px solid #30363d; }}
+pre.diff {{ margin: 0; padding: 8px; max-height: 260px; overflow: auto; background: #0d1117; white-space: pre; }}
+.empty-diff {{ padding: 8px; color: #8b949e; font-style: italic; }}
 .pos {{ color: #56d364; }}
 .neg {{ color: #f85149; }}
 .zero {{ color: #8b949e; }}
@@ -245,11 +319,13 @@ td.cell .bar {{ position: absolute; left: 0; top: 2px; bottom: 2px; width: 4px; 
 td.empty {{ background: transparent; }}
 </style></head><body>
 <header>
-  <h1>{html_lib.escape(instance_id)} · Tmax GiGPO</h1>
+  <h1>{html_lib.escape(instance_id)} · {proto_name} GiGPO</h1>
   <div class="sub">rollout {rollout_id} · {n_traj} sibling · γ={gamma} · w={step_w} ·
-    轨迹内 <b>S#</b> = Edit/Write 切开的 segment（同段共享 G）·
-    轨迹间 <b>T#</b> = 相同「意图 + 工具」·
-    A = A_E + w·A_S · r_i 是 dump 里的 turn_rewards，r_imm 只在最后一段 = episode R</div>
+    轨迹内 <b>S#</b> = {seg_rule} ·
+    段内 G_t = G_seg·γ^{{距段末}}，A_I = G_t − mean(G_t | 同 S#)，越靠近段末 A_I 越大 ·
+    轨迹间 <b>T#</b> = 相同「意图 + 工具」· {intent_rule} ·
+    A = A_E + w·(A_S + A_I) · r_i 是 dump 里的 turn_rewards，r_imm 只在最后一段 = episode R<br>
+    点击 <b>T#</b> 高亮跨轨迹同组，点击 <b>S#</b> 高亮本轨迹同段；再点一次取消</div>
   <div class="legend"><span class="muted">轨迹间 T 组：</span>{legend}</div>
 </header>
 <h2>每轮卡片（绿横线 = 新的轨迹内 segment）</h2>
@@ -259,6 +335,45 @@ td.empty {{ background: transparent; }}
 <tr><th></th>{th}</tr>
 {''.join(body_rows)}
 </table>
+<script>
+(function () {{
+  let cur = null;
+  function clear() {{
+    document.body.classList.remove('picking');
+    document.querySelectorAll('.on').forEach(el => el.classList.remove('on'));
+    cur = null;
+  }}
+  function pick(kind, key) {{
+    if (!key || key === '·') return;
+    if (cur && cur.kind === kind && cur.key === key) {{ clear(); return; }}
+    clear();
+    cur = {{kind, key}};
+    document.body.classList.add('picking');
+    document.querySelectorAll(kind === 't' ? '[data-t]' : '[data-sk]').forEach(el => {{
+      const val = kind === 't' ? el.dataset.t : el.dataset.sk;
+      if (val === key) el.classList.add('on');
+    }});
+  }}
+  document.addEventListener('click', (e) => {{
+    const gid = e.target.closest('.gid[data-kind]');
+    if (gid) {{
+      const kind = gid.dataset.kind;
+      pick(kind, kind === 't' ? gid.dataset.t : gid.dataset.sk);
+      e.stopPropagation();
+      return;
+    }}
+    const chip = e.target.closest('.legend .chip[data-t]');
+    if (chip) {{ pick('t', chip.dataset.t); return; }}
+    const unit = e.target.closest('.turn[data-t], td.cell[data-t]');
+    if (unit) {{
+      if (unit.dataset.t && unit.dataset.t !== '·') pick('t', unit.dataset.t);
+      else pick('s', unit.dataset.sk);
+      return;
+    }}
+    clear();
+  }});
+}})();
+</script>
 </body></html>"""
 
 
@@ -295,9 +410,18 @@ def main() -> int:
         rows = list(md.get("gigpo_step_rows") or [])
         last_seg = max((int(r["seg"]) for r in rows), default=0)
         turn_rewards = list((md.get("turn_rewards") or []))
+        tmd = s.train_metadata or {}
+        turns_meta = list(tmd.get("gigpo_turns") or [])
+        orig = next((x for x in raw if x.get("index") == s.index), None)
+        recs = _records_from_sample(orig) if orig else []
         for i, r in enumerate(rows):
             r["r_imm"] = float(s.reward) if int(r["seg"]) == last_seg else 0.0
             r["r_turn"] = float(turn_rewards[i]) if i < len(turn_rewards) else None
+            src = turns_meta[i] if i < len(turns_meta) else {}
+            r["files"] = src.get("files") or ""
+            if not gigpo.is_tmax(proto):
+                r["empty_diff"] = bool(src.get("empty_diff"))
+                r["git_diff"] = str((recs[i].get("git_diff") if i < len(recs) else "") or "")
         trajs.append(
             {
                 "index": int(s.index or 0),
@@ -307,8 +431,16 @@ def main() -> int:
             }
         )
     _label_groups(trajs)
-    html = render_html(args.instance, trajs, rollout_id=int(data.get("rollout_id") or args.rollout), gamma=args.gamma, step_w=args.step_w)
-    out = args.run_dir / f"gigpo_tmax_{args.instance}_turn_rewards.html"
+    html = render_html(
+        args.instance,
+        trajs,
+        rollout_id=int(data.get("rollout_id") or args.rollout),
+        gamma=args.gamma,
+        step_w=args.step_w,
+        proto=proto,
+    )
+    tag = "tmax" if gigpo.is_tmax(proto) else "scaleswe"
+    out = args.run_dir / f"gigpo_{tag}_{args.instance}_turn_rewards.html"
     out.write_text(html, encoding="utf-8")
     print(f"wrote {out}")
     n_cross = sum(1 for t in trajs for r in t["turns"] if r["t_label"] != "·")

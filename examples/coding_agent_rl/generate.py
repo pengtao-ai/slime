@@ -82,8 +82,8 @@ class _OffloadMixin:
         self._sid_repo_state: dict[str, dict[str, Any]] = {}
         self._sid_turn_git_diffs: dict[str, list[dict[str, Any]]] = {}
 
-    def bind_repo_state(self, sid: str, *, sb: Any, workdir: str) -> None:
-        self._sid_repo_state[sid] = {"sb": sb, "workdir": workdir}
+    def bind_repo_state(self, sid: str, *, sb: Any, workdir: str, capture_git_diff: bool = True) -> None:
+        self._sid_repo_state[sid] = {"sb": sb, "workdir": workdir, "capture_git_diff": capture_git_diff}
 
     def unbind_repo_state(self, sid: str) -> None:
         self._sid_repo_state.pop(sid, None)
@@ -106,8 +106,9 @@ class _OffloadMixin:
             "tool_calls": gigpo.parse_manager_tool_calls(manager_message),
         }
         state = self._sid_repo_state.get(sid)
-        if state:
+        if state and state.get("capture_git_diff", True):
             try:
+                # Snapshot before this turn's tools run, so Edit still belongs to the old diff group.
                 record["git_diff"] = await swe.capture_turn_git_diff(state["sb"], state["workdir"])
             except Exception as exc:
                 record["capture_error"] = f"{type(exc).__name__}: {exc}"
@@ -370,8 +371,10 @@ class _AdapterService(metaclass=SingletonMeta):
         self._sid_protocol[session_id] = protocol
         return adapter.store[session_id]
 
-    def bind_repo_state(self, session_id: str, *, sb: Any, workdir: str) -> None:
-        self.adapter_for(self._sid_protocol[session_id]).bind_repo_state(session_id, sb=sb, workdir=workdir)
+    def bind_repo_state(self, session_id: str, *, sb: Any, workdir: str, capture_git_diff: bool = True) -> None:
+        self.adapter_for(self._sid_protocol[session_id]).bind_repo_state(
+            session_id, sb=sb, workdir=workdir, capture_git_diff=capture_git_diff
+        )
 
     def unbind_repo_state(self, session_id: str) -> None:
         protocol = self._sid_protocol.get(session_id)
@@ -457,7 +460,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     args={"instance_id": instance_id},
                 ):
                     await swe.prepare_workspace(sb, md["workdir"], md)
-                state.bind_repo_state(session_id, sb=sb, workdir=md["workdir"])
+                state.bind_repo_state(
+                    session_id, sb=sb, workdir=md["workdir"], capture_git_diff=not is_tmax
+                )
                 with chrome_span(
                     trace_events,
                     "agent_run",

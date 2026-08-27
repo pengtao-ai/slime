@@ -3,14 +3,16 @@
 Paper: https://arxiv.org/abs/2505.10978 (verl-agent ``gigpo/core_gigpo.py``).
 
   r_imm[last segment] = episode reward, else 0
-  G_t                 = discounted return along intra-traj segments (γ)
+  G_seg               = discounted return along intra-traj segments (γ)
+  G_t                 = G_seg · γ^{distance to segment end}
   A_E                 = episode mean-norm within (protocol, instance)
-  A_S                 = step mean-norm of G within (protocol, instance, intent, tools)
-  A                   = A_E + w · A_S
+  A_S                 = step mean-norm of G_seg within (protocol, instance, intent, tools)
+  A_I                 = step mean-norm of G_t within the same intra-traj segment
+  A                   = A_E + w · (A_S + A_I)
 
 Intra-traj segments:
-  * scaleswe — split when cumulative git diff changes
-  * tmax     — split when an Edit/Write happens (no meaningful git)
+  * scaleswe — split when the pre-tool cumulative git diff changes (Edit is last of the old-diff group)
+  * tmax     — split when the pre-tool Edit/Write/Bash-write key changes (the mutating turn is last of the old group)
 
 Inter-traj groups never mix ScaleSWE with Tmax.
 
@@ -63,7 +65,20 @@ _BASH_PYTHON = {"python", "python3", "pypy", "pypy3"}
 _BASH_PYTEST = {"pytest", "py.test"}
 _BASH_LS = {"ls", "tree", "pwd", "find", "stat", "realpath"}
 _BASH_BUILD = {"gcc", "g++", "cc", "make", "cmake", "cargo", "go", "javac", "mvn", "gradle"}
+_BASH_MUTATE = {"mv", "cp", "rm", "rmdir", "unlink", "touch", "mkdir", "ln", "install", "truncate", "dd", "patch"}
 _ENV = {"pip", "pip3", "pipx", "poetry", "uv", "conda", "apt", "apt-get", "npm", "pnpm", "yarn"}
+_REDIR_WRITE = re.compile(
+    r"(?:^|[\s;|&]|(?<![2\-<=]))(?:1)?(?:>>|>)(?![>&=])\s*(?:(['\"])(.*?)\1|(\S+))"
+)
+_TEE_WRITE = re.compile(r"\btee(?:\s+-a)?\s+(\S+)")
+_PY_WRITE_MODE = re.compile(r"""['"](?:w|wb|wt|a|ab|at|x|xb|r\+|w\+)['"]""")
+_PY_WRITE_CALL = re.compile(
+    r"os\.(?:unlink|remove|replace|rename|rmdir|makedirs)\s*\("
+    r"|shutil\.(?:copy|copy2|copytree|move|rmtree)"
+    r"|Path\([^)]*\)\.(?:write_text|write_bytes|unlink|replace)"
+    r"|(?<!sys\.stdout)(?<!sys\.stderr)\.write(?:_text|_bytes)?\s*\("
+)
+_DEV_NULL = {"/dev/null", "/dev/stderr", "/dev/stdout", "/dev/tty"}
 _TEST_RUN_HINT = re.compile(
     r"\b(pytest|py\.test|unittest|nose2?|tox|nox|hatch\s+test|npm\s+test|cargo\s+test|go\s+test|make\s+test)\b",
     re.I,
@@ -112,6 +127,102 @@ def _bash_binaries(command: str) -> list[str]:
     return binaries
 
 
+def _unquote(token: str) -> str:
+    token = (token or "").strip()
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in {"'", '"'}:
+        return token[1:-1]
+    return token
+
+
+def _short_hash(text: str) -> str:
+    return hashlib.sha1((text or "").encode("utf-8", errors="replace")).hexdigest()[:12]
+
+
+def _redir_write_paths(command: str) -> list[str]:
+    paths: list[str] = []
+    for m in _REDIR_WRITE.finditer(command or ""):
+        path = _unquote(m.group(2) or m.group(3) or "")
+        if not path or path in _DEV_NULL or path.startswith("/dev/"):
+            continue
+        paths.append(path)
+    for m in _TEE_WRITE.finditer(command or ""):
+        path = _unquote(m.group(1) or "")
+        if path and path not in _DEV_NULL and not path.startswith("/dev/"):
+            paths.append(path)
+    return paths
+
+
+def _mutate_bin_paths(command: str) -> list[str]:
+    paths: list[str] = []
+    hit = False
+    for part in re.split(r"\s*(?:&&|\|\||;)\s*", command or ""):
+        toks = part.split()
+        while toks and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[0]):
+            toks = toks[1:]
+        if toks and toks[0] in {"sudo", "time", "env", "command"}:
+            toks = toks[1:]
+        if not toks:
+            continue
+        binary = toks[0].rsplit("/", 1)[-1]
+        if binary not in _BASH_MUTATE:
+            continue
+        hit = True
+        for tok in toks[1:]:
+            if tok.startswith("-") or tok == "--":
+                continue
+            if any(ch in tok for ch in "><"):
+                continue
+            paths.append(_unquote(tok))
+    if hit and not paths:
+        return [f"#{_short_hash(command)}"]
+    return paths
+
+
+def _inplace_edit_paths(command: str) -> list[str]:
+    paths: list[str] = []
+    for part in re.split(r"\s*(?:&&|\|\||;)\s*", command or ""):
+        toks = part.split()
+        if not toks:
+            continue
+        binary = toks[0].rsplit("/", 1)[-1]
+        if binary not in {"sed", "gsed", "perl", "ruby"}:
+            continue
+        inplace = any(t == "-i" or t.startswith("-i") or t.startswith("-pi") for t in toks[1:])
+        if not inplace:
+            continue
+        for tok in reversed(toks[1:]):
+            if tok.startswith("-"):
+                continue
+            paths.append(_unquote(tok))
+            break
+        else:
+            paths.append(f"#{_short_hash(part)}")
+    return paths
+
+
+def _python_writes(command: str) -> bool:
+    bins = _bash_binaries(command)
+    if not any(b in _BASH_PYTHON for b in bins):
+        return False
+    if _PY_WRITE_CALL.search(command or ""):
+        return True
+    return "open(" in (command or "") and bool(_PY_WRITE_MODE.search(command or ""))
+
+
+def bash_write_parts(command: str) -> list[str]:
+    """Paths / tokens for Bash that mutates files (not compilers, not /dev/null)."""
+    cmd = command or ""
+    if not cmd.strip():
+        return []
+    parts = _redir_write_paths(cmd) + _mutate_bin_paths(cmd) + _inplace_edit_paths(cmd)
+    if _python_writes(cmd):
+        parts.append(f"python#{_short_hash(cmd)}")
+    bins = _bash_binaries(cmd)
+    if any(b == "git" for b in bins) and re.search(r"\b(apply|checkout|mv|rm|restore|reset)\b", cmd):
+        parts.append(f"git#{_short_hash(cmd)}")
+    return list(dict.fromkeys(p for p in parts if p))
+
+
 def bash_kind(command: str) -> str:
     bins = _bash_binaries(command)
     text = (command or "").lower()
@@ -158,7 +269,11 @@ def parse_manager_tool_calls(message: dict[str, Any] | None) -> list[dict[str, A
             args = {}
         rec: dict[str, Any] = {"name": name}
         if name == "Bash":
-            rec["kind"] = bash_kind(str(args.get("command") or ""))
+            command = str(args.get("command") or "")
+            rec["kind"] = bash_kind(command)
+            writes = bash_write_parts(command)
+            if writes:
+                rec["writes"] = writes
         path = args.get("file_path") or args.get("path") or args.get("target_file")
         if path:
             rec["path"] = str(path)
@@ -195,13 +310,35 @@ def _diff_hash(diff: str) -> str:
     return hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
+def _call_write_parts(rec: dict[str, Any]) -> list[str]:
+    raw = rec.get("writes")
+    if isinstance(raw, list) and raw:
+        return [str(x) for x in raw if x]
+    if str(rec.get("name") or "") == "Bash":
+        return bash_write_parts(str(rec.get("command") or ""))
+    return []
+
+
 def _edit_signature(calls: list[dict[str, Any]]) -> str:
     parts: list[str] = []
     for rec in calls:
         name = str(rec.get("name") or "")
         if name in _EDIT_TOOLS:
             parts.append(f"{name}:{rec.get('path') or ''}")
+        elif name == "Bash":
+            for path in _call_write_parts(rec):
+                parts.append(f"write:{path}")
     return "|".join(parts)
+
+
+def _edit_files(seen_edits: list[str]) -> str:
+    paths: list[str] = []
+    for sig in seen_edits:
+        for part in sig.split("|"):
+            path = part.split(":", 1)[-1] if ":" in part else part
+            if path:
+                paths.append(path)
+    return ", ".join(dict.fromkeys(paths))
 
 
 def scaleswe_intent(labels: list[str], *, empty_diff: bool, diff_has_test: bool, edit_paths: list[str]) -> str:
@@ -234,52 +371,51 @@ def tmax_intent(labels: list[str], *, dirty: bool, edit_paths: list[str]) -> str
     return "探索定位"
 
 
-def intent_for_turn(protocol: str, labels: list[str], *, empty_diff: bool, diff_has_test: bool, edit_paths: list[str], dirty: bool) -> str:
-    if is_tmax(protocol):
-        return tmax_intent(labels, dirty=dirty, edit_paths=edit_paths)
-    return scaleswe_intent(labels, empty_diff=empty_diff, diff_has_test=diff_has_test, edit_paths=edit_paths)
-
-
 def compact_turns(protocol: str | None, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Build compact per-turn records for train_metadata (no full git diffs)."""
     proto = PROTOCOL_TMAX if is_tmax(protocol) else PROTOCOL_SCALESWE
-    dirty = False
+    recs = list(records or [])
     seen_edits: list[str] = []
     out: list[dict[str, Any]] = []
-    for i, rec in enumerate(records or []):
+    for i, rec in enumerate(recs):
         if not isinstance(rec, dict):
             continue
-        diff = str(rec.get("git_diff") or "")
         calls = list(rec.get("tool_calls") or [])
         labels = tool_labels_from_calls(calls)
         edit_paths = [str(c.get("path") or "") for c in calls if str(c.get("name") or "") in _EDIT_TOOLS]
+        if is_tmax(proto):
+            for call in calls:
+                if str(call.get("name") or "") == "Bash":
+                    edit_paths.extend(_call_write_parts(call))
+        edit_paths = [p for p in edit_paths if p]
         edit_sig = _edit_signature(calls)
+        edit_key = "\n".join(seen_edits)
         if edit_sig:
             seen_edits.append(edit_sig)
-        empty_diff = not diff.strip()
-        if is_tmax(proto):
-            dirty = bool(seen_edits)
-        else:
-            dirty = (not empty_diff) or bool(seen_edits)
-        paths = _diff_paths(diff)
-        diff_has_test = any(_is_test_path(p) for p in paths) or "test" in ",".join(paths).lower()
-        turn = {
+        turn: dict[str, Any] = {
             "turn": int(rec.get("turn_index") if rec.get("turn_index") is not None else i),
-            "diff_key": _diff_hash(diff),
-            "empty_diff": empty_diff,
-            "diff_has_test": bool(diff_has_test),
-            "edit_key": "\n".join(seen_edits),
+            "edit_key": edit_key,
             "tools": labels,
             "tools_str": ", ".join(labels) or "无 tool",
         }
-        turn["intent"] = intent_for_turn(
-            proto,
-            labels,
-            empty_diff=empty_diff,
-            diff_has_test=diff_has_test,
-            edit_paths=edit_paths,
-            dirty=dirty,
-        )
+        if is_tmax(proto):
+            turn["files"] = _edit_files(seen_edits)
+            turn["intent"] = tmax_intent(labels, dirty=bool(seen_edits), edit_paths=edit_paths)
+        else:
+            diff = str(rec.get("git_diff") or "")
+            empty_diff = not diff.strip()
+            paths = _diff_paths(diff)
+            diff_has_test = any(_is_test_path(p) for p in paths) or "test" in ",".join(paths).lower()
+            turn["diff_key"] = _diff_hash(diff)
+            turn["empty_diff"] = empty_diff
+            turn["diff_has_test"] = bool(diff_has_test)
+            turn["files"] = ", ".join(paths) or ("<empty diff>" if empty_diff else "")
+            turn["intent"] = scaleswe_intent(
+                labels,
+                empty_diff=empty_diff,
+                diff_has_test=diff_has_test,
+                edit_paths=edit_paths,
+            )
         out.append(turn)
     return out
 
@@ -352,7 +488,7 @@ def assign_gigpo_to_samples(
     gamma: float = DEFAULT_GAMMA,
     step_w: float = DEFAULT_STEP_W,
 ) -> None:
-    """Write per-turn A_E / A_S / A onto each sample's train_metadata.
+    """Write per-turn A_E / A_S / A_I / A onto each sample's train_metadata.
 
     Must run on the full rollout (all sibling trajectories visible).
     """
@@ -404,6 +540,17 @@ def assign_gigpo_to_samples(
     for (key, _), value in zip(seg_order, g_seg.tolist(), strict=True):
         g_by_seg[key] = float(value)
     g = torch.tensor([g_by_seg[(r["traj_uid"], int(r["seg"]))] for r in rows], dtype=torch.float32)
+    g_turn = torch.zeros(len(rows), dtype=torch.float32)
+    intra_keys: list[str] = []
+    members: dict[tuple[str, int], list[int]] = defaultdict(list)
+    for i, row in enumerate(rows):
+        members[(row["traj_uid"], int(row["seg"]))].append(i)
+        intra_keys.append(f"{row['traj_uid']}::{row['seg']}")
+    for idxs in members.values():
+        g_s = float(g[idxs[0]])
+        n = len(idxs)
+        for k, i in enumerate(idxs):
+            g_turn[i] = g_s * (gamma ** (n - 1 - k))
 
     episode = torch.tensor([r["episode_reward"] for r in rows], dtype=torch.float32)
     masks = [torch.ones(1, dtype=torch.float32) for _ in rows]
@@ -422,11 +569,14 @@ def assign_gigpo_to_samples(
     anchors = [f"{r['intent']}||{r['tools_str']}" for r in rows]
     step_uids = build_step_group(np.asarray(anchors, dtype=object), episode_keys, summarize=False)
     a_s = _scalar_list(step_norm_reward(g, masks, step_uids, remove_std=True))
+    a_i = _scalar_list(step_norm_reward(g_turn, masks, intra_keys, remove_std=True))
 
     by_sample: dict[int, list[float]] = defaultdict(list)
     by_sample_meta: dict[int, list[dict[str, Any]]] = defaultdict(list)
-    for row, ae, as_, g_i, uid in zip(rows, a_e, a_s, g.tolist(), step_uids.tolist(), strict=True):
-        adv = float(ae) + float(step_w) * float(as_)
+    for row, ae, as_, ai, g_i, g_t, uid in zip(
+        rows, a_e, a_s, a_i, g.tolist(), g_turn.tolist(), step_uids.tolist(), strict=True
+    ):
+        adv = float(ae) + float(step_w) * (float(as_) + float(ai))
         by_sample[row["sample_i"]].append(adv)
         by_sample_meta[row["sample_i"]].append(
             {
@@ -435,8 +585,10 @@ def assign_gigpo_to_samples(
                 "intent": row["intent"],
                 "tools_str": row["tools_str"],
                 "G": float(g_i),
+                "G_turn": float(g_t),
                 "A_E": float(ae),
                 "A_S": float(as_),
+                "A_I": float(ai),
                 "A": adv,
                 "step_uid": str(uid),
             }

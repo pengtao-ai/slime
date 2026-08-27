@@ -85,11 +85,7 @@ def test_compact_and_split_scaleswe_by_git_diff():
     records = [
         {"turn_index": 0, "git_diff": "", "tool_calls": [{"name": "Read", "path": "a.py"}]},
         {"turn_index": 1, "git_diff": "", "tool_calls": [{"name": "Read", "path": "b.py"}]},
-        {
-            "turn_index": 2,
-            "git_diff": "diff --git a/a.py b/a.py\n",
-            "tool_calls": [{"name": "Edit", "path": "a.py"}],
-        },
+        {"turn_index": 2, "git_diff": "", "tool_calls": [{"name": "Edit", "path": "a.py"}]},
         {
             "turn_index": 3,
             "git_diff": "diff --git a/a.py b/a.py\n",
@@ -97,10 +93,38 @@ def test_compact_and_split_scaleswe_by_git_diff():
         },
     ]
     turns = gigpo.compact_turns("scaleswe", records)
-    assert gigpo.segment_ids(turns, "scaleswe") == [0, 0, 1, 1]
+    # Pre-tool snapshot: Edit still sees empty diff, so it is last of S0.
+    assert gigpo.segment_ids(turns, "scaleswe") == [0, 0, 0, 1]
     assert turns[0]["intent"] == "探索定位"
     assert turns[2]["intent"] == "实现修复"
     assert turns[3]["intent"] == "验证修复"
+
+
+def test_scaleswe_edit_is_last_of_old_diff_group():
+    records = [
+        {"turn_index": 0, "git_diff": "", "tool_calls": [{"name": "Read", "path": "a.py"}]},
+        {"turn_index": 1, "git_diff": "", "tool_calls": [{"name": "Edit", "path": "a.py"}]},
+        {
+            "turn_index": 2,
+            "git_diff": "diff --git a/a.py b/a.py\n+one\n",
+            "tool_calls": [{"name": "Bash", "kind": "python"}],
+        },
+        {
+            "turn_index": 3,
+            "git_diff": "diff --git a/a.py b/a.py\n+one\n",
+            "tool_calls": [{"name": "Edit", "path": "a.py"}],
+        },
+        {
+            "turn_index": 4,
+            "git_diff": "diff --git a/a.py b/a.py\n+two\n",
+            "tool_calls": [{"name": "Bash", "kind": "pytest"}],
+        },
+    ]
+    turns = gigpo.compact_turns("scaleswe", records)
+    assert gigpo.segment_ids(turns, "scaleswe") == [0, 0, 1, 1, 2]
+    assert [t["intent"] for t in turns] == ["探索定位", "实现修复", "改后阅读", "实现修复", "验证修复"]
+    assert turns[1]["files"] == "<empty diff>"
+    assert turns[3]["files"] == "a.py"
 
 
 def test_compact_and_split_tmax_by_edit():
@@ -109,12 +133,120 @@ def test_compact_and_split_tmax_by_edit():
         {"turn_index": 1, "git_diff": "", "tool_calls": [{"name": "Bash", "kind": "cat"}]},
         {"turn_index": 2, "git_diff": "", "tool_calls": [{"name": "Edit", "path": "main.c"}]},
         {"turn_index": 3, "git_diff": "", "tool_calls": [{"name": "Bash", "kind": "build"}]},
+        {"turn_index": 4, "git_diff": "", "tool_calls": [{"name": "Write", "path": "out.c"}]},
+        {"turn_index": 5, "git_diff": "", "tool_calls": [{"name": "Bash", "kind": "build"}]},
     ]
     turns = gigpo.compact_turns("tmax", records)
-    assert gigpo.segment_ids(turns, "tmax") == [0, 0, 1, 1]
-    assert turns[0]["intent"] == "探索定位"
-    assert turns[2]["intent"] == "实现修复"
-    assert turns[3]["intent"] == "验证运行"
+    # Pre-tool edit_key: Edit/Write stay in the old group as its last turn.
+    assert gigpo.segment_ids(turns, "tmax") == [0, 0, 0, 1, 1, 2]
+    assert [t["intent"] for t in turns] == [
+        "探索定位",
+        "探索定位",
+        "实现修复",
+        "验证运行",
+        "实现修复",
+        "验证运行",
+    ]
+    assert [t["files"] for t in turns] == ["", "", "main.c", "main.c", "main.c, out.c", "main.c, out.c"]
+    assert all("diff_key" not in t for t in turns)
+
+
+def test_tmax_bash_write_splits_like_edit():
+    records = [
+        {
+            "turn_index": 0,
+            "tool_calls": [{"name": "Bash", "command": "cat /home/user/main.c"}],
+        },
+        {
+            "turn_index": 1,
+            "tool_calls": [{"name": "Bash", "command": "cat > /home/user/main.c <<'EOF'\nint x;\nEOF"}],
+        },
+        {
+            "turn_index": 2,
+            "tool_calls": [{"name": "Bash", "command": "g++ -o main /home/user/main.c"}],
+        },
+        {
+            "turn_index": 3,
+            "tool_calls": [{"name": "Bash", "command": "sed -i 's/x/y/' /home/user/main.c"}],
+        },
+        {
+            "turn_index": 4,
+            "tool_calls": [{"name": "Bash", "command": "g++ -o main /home/user/main.c"}],
+        },
+    ]
+    turns = gigpo.compact_turns("tmax", records)
+    assert gigpo.segment_ids(turns, "tmax") == [0, 0, 1, 1, 2]
+    assert [t["intent"] for t in turns] == ["探索定位", "实现修复", "验证运行", "实现修复", "验证运行"]
+    assert "/home/user/main.c" in turns[1]["files"]
+
+
+def test_tmax_python_write_splits_not_python_read():
+    records = [
+        {
+            "turn_index": 0,
+            "tool_calls": [{"name": "Bash", "command": "python3 -c \"print(open('f').read())\""}],
+        },
+        {
+            "turn_index": 1,
+            "tool_calls": [{"name": "Bash", "command": "python3 -c \"open('f','w').write('x')\""}],
+        },
+        {
+            "turn_index": 2,
+            "tool_calls": [{"name": "Bash", "command": "python3 -c \"print(1)\""}],
+        },
+    ]
+    turns = gigpo.compact_turns("tmax", records)
+    assert gigpo.segment_ids(turns, "tmax") == [0, 0, 1]
+    assert [t["intent"] for t in turns] == ["复现试跑", "实现修复", "验证运行"]
+
+
+def test_tmax_mv_splits():
+    records = [
+        {"turn_index": 0, "tool_calls": [{"name": "Read", "path": "a.txt"}]},
+        {"turn_index": 1, "tool_calls": [{"name": "Bash", "command": "mv a.txt b.txt"}]},
+        {"turn_index": 2, "tool_calls": [{"name": "Bash", "command": "ls"}]},
+    ]
+    turns = gigpo.compact_turns("tmax", records)
+    assert gigpo.segment_ids(turns, "tmax") == [0, 0, 1]
+    assert [t["intent"] for t in turns] == ["探索定位", "实现修复", "改后阅读"]
+    assert "b.txt" in turns[1]["files"]
+
+
+def test_bash_write_parts_ignores_devnull_and_compiler():
+    assert gigpo.bash_write_parts("ls 2>/dev/null") == []
+    assert gigpo.bash_write_parts("iconv -f utf-8 -t utf-8 >/dev/null") == []
+    assert gigpo.bash_write_parts("g++ -o main main.c") == []
+    assert gigpo.bash_write_parts("cat /home/user/main.c") == []
+    assert "/tmp/a.py" in gigpo.bash_write_parts("cat > /tmp/a.py <<'EOF'\nx\nEOF")
+    assert "main.c" in gigpo.bash_write_parts("sed -i 's/x/y/' main.c")
+    assert "*" in gigpo.bash_write_parts("rm -f -- * 2>/dev/null")
+    assert "2>/dev/null" not in gigpo.bash_write_parts("rm -f -- * 2>/dev/null")
+    assert gigpo.bash_write_parts("print(repr(f), '->', [hex(b) for b in f])") == []
+    assert gigpo.bash_write_parts("python3 -c \"print(x, '->', y)\"") == []
+
+
+def test_tmax_ignores_git_diff():
+    records = [
+        {
+            "turn_index": 0,
+            "git_diff": "diff --git a/x.c b/x.c\n+one\n",
+            "tool_calls": [{"name": "Read", "path": "x.c"}],
+        },
+        {
+            "turn_index": 1,
+            "git_diff": "diff --git a/x.c b/x.c\n+one\n",
+            "tool_calls": [{"name": "Edit", "path": "x.c"}],
+        },
+        {
+            "turn_index": 2,
+            "git_diff": "diff --git a/x.c b/x.c\n+two\n",
+            "tool_calls": [{"name": "Bash", "kind": "build"}],
+        },
+    ]
+    turns = gigpo.compact_turns("tmax", records)
+    assert gigpo.segment_ids(turns, "tmax") == [0, 0, 1]
+    assert [t["intent"] for t in turns] == ["探索定位", "实现修复", "验证运行"]
+    assert [t["files"] for t in turns] == ["", "x.c", "x.c"]
 
 
 def test_scaleswe_and_tmax_episode_groups_are_separate():
@@ -157,6 +289,36 @@ def test_step_group_by_intent_and_tool():
     assert b_rows[0]["A_S"] == pytest.approx(-0.25)
     # Edit turn is a singleton step group → A_S = 0
     assert a_rows[1]["A_S"] == pytest.approx(0.0)
+
+
+def test_intra_segment_advantage_closer_is_larger():
+    explore = _turn(tools=["Read"], intent="探索定位")
+    edit = _turn(tools=["Edit"], intent="实现修复", diff_key="d1", empty=False)
+    a = _sample(
+        protocol="scaleswe",
+        instance_id="pr1",
+        group_index=1,
+        reward=1.0,
+        turns=[explore, explore, explore, edit],
+        index=0,
+    )
+    b = _sample(
+        protocol="scaleswe",
+        instance_id="pr1",
+        group_index=1,
+        reward=0.0,
+        turns=[explore],
+        index=1,
+    )
+    gigpo.assign_gigpo_to_samples([a, b], gamma=0.5, step_w=1.0)
+    rows = a.metadata["gigpo_step_rows"]
+    assert [r["seg"] for r in rows] == [0, 0, 0, 1]
+    # S0 G_seg = γ R = 0.5; G_turn = 0.5 · [γ², γ, 1] = [0.125, 0.25, 0.5]
+    assert [r["G_turn"] for r in rows[:3]] == pytest.approx([0.125, 0.25, 0.5])
+    assert rows[0]["A_I"] < rows[1]["A_I"] < rows[2]["A_I"]
+    assert rows[0]["A_I"] + rows[1]["A_I"] + rows[2]["A_I"] == pytest.approx(0.0, abs=1e-6)
+    assert rows[3]["A_I"] == pytest.approx(0.0)
+    assert rows[2]["A"] > rows[0]["A"]
 
 
 def test_compute_advantages_paints_spans():
