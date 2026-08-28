@@ -93,8 +93,10 @@ export OFFLOAD_SFT_MAX_SAMPLES="${OFFLOAD_SFT_MAX_SAMPLES:-0}"
 # Per offload turn: probability of supervising <|llm_offload|>N<|/llm_offload|> in SFT CE.
 # Keep high so tag skill does not cliff; efficiency λ fights spam, not TAG_PROB.
 export OFFLOAD_SFT_TAG_PROB="${OFFLOAD_SFT_TAG_PROB:-0.6}"
-# 0 = no cap (same context as GRPO). Positive → left-trim history, keep GLM y.
-export OFFLOAD_SFT_MAX_SEQ_LEN="${OFFLOAD_SFT_MAX_SEQ_LEN:-0}"
+# Left-trim SFT history, keep the tail (GLM y). SFT response_length ≈ full seq so
+# a 177k row OOMs on [T,V] FP32 softmax even with CP=6; 148746 already trained.
+# 0 = no cap. GRPO packing is unchanged.
+export OFFLOAD_SFT_MAX_SEQ_LEN="${OFFLOAD_SFT_MAX_SEQ_LEN:-145000}"
 # Leave MAX_TOKENS_PER_GPU unset so async launcher uses MAX_CONTEXT_LEN/CP
 # (GRPO-only default, ~26667 at CP=6). Override only if mixed train still OOMs.
 # export MAX_TOKENS_PER_GPU=8192
@@ -200,7 +202,7 @@ echo "  OFFLOAD_MALFORMED_PENALTY=${OFFLOAD_MALFORMED_PENALTY:-0.25}"
 echo "  OFFLOAD_SFT_LAMBDA=${OFFLOAD_SFT_LAMBDA:-0.15}"
 echo "  OFFLOAD_SFT_MAX_SAMPLES=${OFFLOAD_SFT_MAX_SAMPLES:-0}"
 echo "  OFFLOAD_SFT_TAG_PROB=${OFFLOAD_SFT_TAG_PROB:-0.3}"
-echo "  OFFLOAD_SFT_MAX_SEQ_LEN=${OFFLOAD_SFT_MAX_SEQ_LEN:-0}"
+echo "  OFFLOAD_SFT_MAX_SEQ_LEN=${OFFLOAD_SFT_MAX_SEQ_LEN:-145000}"
 echo "  MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-<async default MAX_CONTEXT_LEN/CP>}"
 echo "  OFFLOAD_COMPACT_ORPHAN_OPEN_K=${OFFLOAD_COMPACT_ORPHAN_OPEN_K}"
 echo "  OFFLOAD_COMPACT_SPECIAL_TOKEN_RUN=${OFFLOAD_COMPACT_SPECIAL_TOKEN_RUN}"
