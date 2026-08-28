@@ -7,6 +7,8 @@ import json
 from examples.coding_agent_rl import offload
 from slime.agent.adapters.common import Reply
 
+NUM_GPUS = 0
+
 
 def test_build_offload_messages_openai_tool_protocol():
     translated = [
@@ -59,8 +61,12 @@ def test_build_offload_messages_openai_tool_protocol():
 
     asst = messages[2]
     assert asst["role"] == "assistant"
-    assert "<think>" in asst["content"]
-    assert "I'll start by exploring" in asst["content"]
+    assert asst["content"].startswith("<part_think>")
+    assert "</part_think>" in asst["content"]
+    inner = asst["content"].split("<part_think>", 1)[1].split("</part_think>", 1)[0]
+    assert "Let me start by exploring" in inner
+    assert "I'll start by exploring" in inner
+    assert "<think>" not in asst["content"]
     assert "[tool_calls]" not in (asst["content"] or "")
     assert len(asst["tool_calls"]) == 2
     assert asst["tool_calls"][0]["id"] == "chatcmpl-tool-8a09ddebc7f20d0d"
@@ -104,6 +110,30 @@ def test_build_offload_messages_pairs_tools_without_ids_in_order():
     ids = [tc["id"] for tc in asst["tool_calls"]]
     tools = [m for m in messages if m["role"] == "tool"]
     assert [t["tool_call_id"] for t in tools] == ids
+
+
+def test_build_offload_messages_keeps_glm_content_outside_part_think():
+    translated = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "fix foo"},
+        {
+            "role": "assistant",
+            "content": "edit foo.py",
+            "reasoning_content": f"<think>\npartial plan {offload.OFFLOAD_OPEN}5{offload.OFFLOAD_CLOSE}\nremote-why",
+        },
+        {"role": "user", "content": "continue"},
+    ]
+    messages = offload.build_offload_messages(
+        translated, f"<think>\nnow {offload.OFFLOAD_OPEN}2{offload.OFFLOAD_CLOSE}"
+    )
+    asst = next(m for m in messages if m["role"] == "assistant" and "edit foo.py" in (m.get("content") or ""))
+    assert asst["content"].startswith("<part_think>")
+    inner, rest = asst["content"].split("</part_think>", 1)
+    assert "partial plan" in inner
+    assert "remote-why" in inner
+    assert offload.OFFLOAD_OPEN not in asst["content"]
+    assert "edit foo.py" in rest
+    assert "edit foo.py" not in inner
 
 
 def test_normalize_openai_tools_and_request_body_includes_tools(monkeypatch):

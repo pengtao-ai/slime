@@ -58,7 +58,11 @@ def sft_max_samples() -> int:
 
 
 def sft_max_seq_len() -> int:
-    """Optional SFT length budget. Default 0 = no cap (same as GRPO trajectories)."""
+    """Optional SFT length budget. Default 0 = no cap.
+
+    Positive → left-trim old history and keep the tail. SFT rows treat almost
+    the whole conversation as response, so they need a tighter cap than GRPO.
+    """
     raw = (os.environ.get("OFFLOAD_SFT_MAX_SEQ_LEN") or "0").strip()
     try:
         n = int(raw)
@@ -577,6 +581,13 @@ def build_multiturn_sft_token_sequence(
         return None
     if leading >= len(tokens):
         return None
+    if cap > 0 and len(tokens) > cap:
+        logger.warning(
+            "[offload_sft] skip: tokenized length %d exceeds OFFLOAD_SFT_MAX_SEQ_LEN=%d",
+            len(tokens),
+            cap,
+        )
+        return None
 
     response_length = len(tokens) - leading
     loss_mask = full_mask[leading:]
@@ -696,9 +707,10 @@ def build_sft_samples(
         },
     )
     logger.info(
-        "[offload_sft] emitted 1 multiturn SFT sample from index=%s (%d assistant turns, λ=%.4f, tag_p=%.2f)",
+        "[offload_sft] emitted 1 multiturn SFT sample from index=%s (%d assistant turns, %d tokens, λ=%.4f, tag_p=%.2f)",
         base_index,
         n_assistant,
+        len(tokens),
         sft_lambda(),
         sft_tag_prob(),
     )
