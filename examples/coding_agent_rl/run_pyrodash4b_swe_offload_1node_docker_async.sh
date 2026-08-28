@@ -45,6 +45,9 @@ export SAVE_INTERVAL="${SAVE_INTERVAL:-20}"
 # ---- mid-turn offload ----
 export SLIME_AGENT_OFFLOAD=1
 export OFFLOAD_EFFICIENCY_LAMBDA=0.3
+# Turn advantages: GiGPO (wired in run_qwen35_4b_swe_1node_async.sh).
+export GIGPO_GAMMA="${GIGPO_GAMMA:-0.95}"
+export GIGPO_STEP_ADVANTAGE_W="${GIGPO_STEP_ADVANTAGE_W:-1.0}"
 # help_seeking + SEEK_ONLY_WHEN_ALL_WRONG: withhold α only if a sibling
 # solved without offload (see offload.shape_group_help_seeking_rewards).
 # Set OFFLOAD_REWARD_MODE=cost_aware to restore the old "fail → 0" shaping.

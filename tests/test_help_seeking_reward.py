@@ -268,7 +268,13 @@ def test_repair_skips_already_valid():
 
 def test_compute_turn_rewards_solved_solo_uses_cost_formula():
     turns = [_turn(valid=False, small_o=50), _turn(valid=True, small_o=50, glm_o=20)]
-    stats = {"turn_costs": turns}
+    stats = {
+        "turn_costs": turns,
+        "small_prompt_tokens": 100,
+        "small_output_tokens": 100,
+        "glm_input_tokens": 50,
+        "glm_output_tokens": 20,
+    }
     lam = 0.5
     out = offload.compute_turn_rewards(
         1.0, stats, completion_tokens=100, metadata={"completion_tokens": 100}, lam=lam
@@ -282,6 +288,10 @@ def test_compute_turn_rewards_solved_solo_uses_cost_formula():
         assert r == pytest.approx(expected)
     # Offload turn pays GLM cost → lower reward than solo on the same SLM budget.
     assert out["turn_rewards"][1] < out["turn_rewards"][0]
+    # Episode scalar is cost_aware (1 - λ · actual/baseline), not mean(r_i).
+    expected_ep = offload.cost_aware_reward(1.0, stats, usage=None, lam=lam)
+    assert out["reward"] == pytest.approx(expected_ep)
+    assert out["reward"] != pytest.approx(sum(out["turn_rewards"]) / len(out["turn_rewards"]))
 
 
 def test_compute_turn_rewards_repaired_no_alpha_unsolved(monkeypatch):
@@ -576,29 +586,6 @@ def test_resolved_train_config_and_dump(tmp_path, monkeypatch):
     # second call is a no-op for logging / overwrite is fine; flag stays set
     offload.log_train_config_once(None)
     assert offload._TRAIN_CONFIG_LOGGED is True
-
-
-def test_turn_advantage_paints_residuals():
-    import torch
-
-    from examples.coding_agent_rl.offload_turn_advantage import compute_turn_advantages
-
-    kl = [torch.zeros(6)]
-    rollout_data = {
-        "kl": kl,
-        "rewards": [0.5],  # already group-demeaned A_s
-        "metadata": [
-            {
-                "turn_rewards": [1.0, 0.0],
-                "turn_token_spans": [[0, 3], [3, 6]],
-            }
-        ],
-    }
-    compute_turn_advantages(None, rollout_data)
-    adv = rollout_data["advantages"][0]
-    # mean_r = 0.5; residual +0.5 / -0.5
-    assert adv[0].item() == pytest.approx(1.0)
-    assert adv[3].item() == pytest.approx(0.0)
 
 
 def test_per_turn_baseline_uses_completion_over_n():

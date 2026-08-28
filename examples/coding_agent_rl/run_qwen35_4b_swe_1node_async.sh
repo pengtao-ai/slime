@@ -218,24 +218,15 @@ if (( TP_SIZE > 1 )); then
   PERF_ARGS+=(--sequence-parallel)
 fi
 
-# Set CODING_AGENT_GIGPO=1 to use GiGPO (ScaleSWE/Tmax split + intent/tool groups).
-if [[ "${CODING_AGENT_GIGPO:-0}" == "1" ]]; then
-  _ADV_FN="examples.coding_agent_rl.gigpo.compute_advantages"
-  _REWARD_PP="examples.coding_agent_rl.gigpo.post_process_rewards"
-  GIGPO_ARGS=(
-    --gigpo-gamma "${GIGPO_GAMMA:-0.95}"
-    --gigpo-step-advantage-w "${GIGPO_STEP_ADVANTAGE_W:-1.0}"
-  )
-else
-  _ADV_FN="examples.coding_agent_rl.offload_turn_advantage.compute_turn_advantages"
-  _REWARD_PP="examples.coding_agent_rl.offload_sft.post_process_rewards_grpo_only"
-  GIGPO_ARGS=()
-fi
-
+# Turn advantages: GiGPO (ScaleSWE/Tmax segment split + intent/tool step groups).
+# Episode scalar reward stays help_seeking / cost-aware; cost turn-residual painting
+# (offload_turn_advantage) is retired.
 ALGO_ARGS=(
    --advantage-estimator grpo
-   --custom-advantage-function-path ${_ADV_FN}
-   --custom-reward-post-process-path ${_REWARD_PP}
+   --custom-advantage-function-path examples.coding_agent_rl.gigpo.compute_advantages
+   --custom-reward-post-process-path examples.coding_agent_rl.gigpo.post_process_rewards
+   --gigpo-gamma "${GIGPO_GAMMA:-0.95}"
+   --gigpo-step-advantage-w "${GIGPO_STEP_ADVANTAGE_W:-1.0}"
    --loss-type custom_loss
    --custom-loss-function-path examples.coding_agent_rl.grpo_sft_loss.grpo_sft_loss_function
    --kl-loss-coef 0.00
@@ -244,7 +235,6 @@ ALGO_ARGS=(
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
-   "${GIGPO_ARGS[@]}"
 )
 
 OPTIMIZER_ARGS=(

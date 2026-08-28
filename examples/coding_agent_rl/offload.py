@@ -26,8 +26,9 @@ with ``output_loss_mask=0`` so rollout dumps contain the full assistant turn
 without contributing to the policy loss (``SLIME_OFFLOAD_EMBED_IN_TRAJECTORY``).
 
 Train shaping (when ``SLIME_AGENT_OFFLOAD=1``):
-  - Per-turn costs in ``offload_stats["turn_costs"]``; ``r_i`` via
-    :func:`compute_turn_rewards` (baseline completion = ``metadata.completion_tokens / n``).
+  - Per-turn costs in ``offload_stats["turn_costs"]`` (diagnostics / spans);
+    episode scalar is :func:`cost_aware_reward` /
+    :func:`help_seeking_reward` (``1 - λ · actual/baseline``), not ``mean(r_i)``.
   - Incomplete offload (orphan OPEN / missing digit) is
     :func:`repair_incomplete_offload`'d then still calls GLM; turn is marked
     ``repaired`` and gets flat ``−β`` (no help_seeking α).
@@ -37,8 +38,8 @@ Train shaping (when ``SLIME_AGENT_OFFLOAD=1``):
     GLM / agent flush (does not stop SGLang mid-generate).
   - Hard compact filter + group α:
     :func:`compact_and_shape_group_help_seeking_rewards`.
-  - Turn-painted advantages:
-    ``examples.coding_agent_rl.offload_turn_advantage.compute_turn_advantages``.
+  - Turn advantages via GiGPO (``examples.coding_agent_rl.gigpo``); episode
+    scalar reward is help_seeking / cost-aware (not turn-mean).
   - tmax ``empty_patch`` does **not** multiply ``empty_scale``.
 
 Enable with ``SLIME_AGENT_OFFLOAD=1`` (see ``generate.py`` Offload* adapters).
@@ -1847,16 +1848,17 @@ def compute_turn_rewards(
     encourage_seek: bool = True,
     protocol: str | None = None,
 ) -> dict[str, Any]:
-    """Per-turn rewards ``r_i`` and scalar ``mean(r_i)``.
+    """Per-turn ledger ``r_i`` plus episode scalar (not ``mean(r_i)``).
 
-    Solved (solo and offload share the same cost term):
-      - every turn → ``max(0, 1 - λ·c_i/b_i - format - β?)``
-      - ``c_i`` is SLM-only on solo turns; adds GLM tokens when offloaded
-      - outside-think → subtract format penalty; repaired / orphan / malformed → ``-β``
-    Unsolved help_seeking:
-      - clean valid in-think offload → α' (unless deferred)
-      - repaired / orphan / malformed → flat ``-β`` (never α)
-      - else 0
+    Episode reward:
+      - solved → :func:`cost_aware_reward` (``1 - λ · actual/baseline``)
+      - unsolved help_seeking → :func:`help_seeking_reward` (α / 0); if any
+        turn is flat ``-β`` (malformed/orphan/repaired) and worse, use that
+      - unsolved cost_aware → 0, or worst ``-β`` if present
+
+    Per-turn ``r_i`` (diagnostics / spans only; GiGPO uses episode R):
+      - solved: ``max(0, 1 - λ·c_i/b_i - format - β?)``
+      - unsolved help_seeking: α' on clean in-think offload, else ``-β`` / 0
     """
     st = dict(stats or {})
     turns: list[dict[str, Any]] = list(st.get("turn_costs") or [])
@@ -1868,24 +1870,43 @@ def compute_turn_rewards(
     emp_scale = float(empty_scale if empty_scale is not None else seek_empty_scale())
     proto = protocol if protocol is not None else (metadata or {}).get("protocol")
 
-    if n == 0:
-        # Fallback to legacy scalar when no turn ledger (compat).
+    def _episode_scalar(turn_rs: list[float]) -> float:
+        if float(solved) > 0.0:
+            return float(
+                cost_aware_reward(
+                    solved, st, usage=usage, lam=lam_v, format_penalty=fmt_pen
+                )
+            )
         if reward_mode() == "help_seeking":
-            r = help_seeking_reward(
-                solved,
-                st,
-                usage=usage,
-                lam=lam_v,
-                format_penalty=fmt_pen,
-                alpha=alpha_v,
-                empty_patch=empty_patch,
-                empty_scale=emp_scale,
-                encourage_seek=encourage_seek,
-                protocol=proto,
+            r = float(
+                help_seeking_reward(
+                    solved,
+                    st,
+                    usage=usage,
+                    lam=lam_v,
+                    format_penalty=fmt_pen,
+                    alpha=alpha_v,
+                    empty_patch=empty_patch,
+                    empty_scale=emp_scale,
+                    encourage_seek=encourage_seek,
+                    protocol=proto,
+                )
             )
         else:
-            r = cost_aware_reward(solved, st, usage=usage, lam=lam_v, format_penalty=fmt_pen)
-        return {"reward": float(r), "turn_rewards": [], "turn_costs": turns}
+            r = 0.0
+        if turn_rs:
+            worst = float(min(turn_rs))
+            if worst < r:
+                return worst
+        return r
+
+    if n == 0:
+        # Fallback to legacy scalar when no turn ledger (compat).
+        return {
+            "reward": _episode_scalar([]),
+            "turn_rewards": [],
+            "turn_costs": turns,
+        }
 
     b_i = per_turn_baseline_cost(
         n_turns=n, usage=usage, completion_tokens=completion_tokens, metadata=metadata
@@ -1904,7 +1925,7 @@ def compute_turn_rewards(
                 r_i += mal_r  # already negative (repaired / orphan / malformed)
             turn_rewards.append(max(0.0, float(r_i)))
     elif reward_mode() != "help_seeking":
-        # cost_aware: unsolved → zeros, or flat −β on orphan/malformed/repaired.
+        # cost_aware: unsolved → zeros, or flat -β on orphan/malformed/repaired.
         for tc in turns:
             mal_r = turn_malformed_penalty_value(tc, mal_pen=mal_pen)
             turn_rewards.append(0.0 if mal_r is None else float(mal_r))
@@ -1915,7 +1936,7 @@ def compute_turn_rewards(
         for tc in turns:
             mal_r = turn_malformed_penalty_value(tc, mal_pen=mal_pen)
             if mal_r is not None:
-                # repaired / orphan / malformed: flat −β, never α.
+                # repaired / orphan / malformed: flat -β, never α.
                 turn_rewards.append(float(mal_r))
                 continue
             if (
@@ -1928,8 +1949,11 @@ def compute_turn_rewards(
             else:
                 turn_rewards.append(0.0)
 
-    reward = float(sum(turn_rewards) / max(len(turn_rewards), 1))
-    return {"reward": reward, "turn_rewards": turn_rewards, "turn_costs": turns}
+    return {
+        "reward": _episode_scalar(turn_rewards),
+        "turn_rewards": turn_rewards,
+        "turn_costs": turns,
+    }
 
 
 def build_turn_token_spans(
@@ -2242,14 +2266,22 @@ def shape_group_help_seeking_rewards(args: Any, groups: list) -> None:
                     ):
                         if float(turn_rewards[i]) <= 0.0:
                             turn_rewards[i] = credit
-                mean_r = float(sum(turn_rewards) / max(len(turn_rewards), 1))
-                if all_wrong and not sought and no_seek_pen > 0.0:
-                    # Prefer keeping a worse malformed −β if already present.
-                    if mean_r > -no_seek_pen:
-                        turn_rewards = [-no_seek_pen] * len(turn_rewards)
-                        mean_r = -no_seek_pen
+                # Episode scalar: α once / −no_seek / worst −β — not mean(r_i).
+                if sought:
+                    episode_r = float(credit)
+                elif all_wrong and no_seek_pen > 0.0:
+                    episode_r = -float(no_seek_pen)
+                else:
+                    episode_r = 0.0
+                if turn_rewards:
+                    worst = float(min(turn_rewards))
+                    if worst < episode_r:
+                        episode_r = worst
+                if all_wrong and not sought and no_seek_pen > 0.0 and episode_r > -no_seek_pen:
+                    turn_rewards = [-no_seek_pen] * len(turn_rewards)
+                    episode_r = -float(no_seek_pen)
                 _write_session_turn_rewards(
-                    segs, turn_rewards=turn_rewards, turn_costs=turn_costs, reward=mean_r
+                    segs, turn_rewards=turn_rewards, turn_costs=turn_costs, reward=episode_r
                 )
                 continue
 

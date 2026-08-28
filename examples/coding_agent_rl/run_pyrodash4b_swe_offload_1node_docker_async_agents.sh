@@ -51,6 +51,9 @@ export SAVE_INTERVAL="${SAVE_INTERVAL:-20}"
 # Resume a crashed run of this recipe with SAVE_DIR=/path/to/that/checkpoints.
 export EXP_TAG="${EXP_TAG:-agent_offload_pyrodash4b_phase4_scratch}"
 export NUM_ROLLOUT="${NUM_ROLLOUT:-200}"
+# Turn advantages: GiGPO (wired in run_qwen35_4b_swe_1node_async.sh).
+export GIGPO_GAMMA="${GIGPO_GAMMA:-0.95}"
+export GIGPO_STEP_ADVANTAGE_W="${GIGPO_STEP_ADVANTAGE_W:-1.0}"
 # ---- mid-turn offload ----
 export SLIME_AGENT_OFFLOAD=1
 export OFFLOAD_EFFICIENCY_LAMBDA="${OFFLOAD_EFFICIENCY_LAMBDA:-0.3}"
