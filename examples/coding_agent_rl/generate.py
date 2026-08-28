@@ -685,8 +685,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                 tmd = dict(getattr(s, "train_metadata", None) or {})
                 if not tmd and (s.metadata or {}).get("turn_rewards"):
                     tmd["turn_rewards"] = s.metadata.get("turn_rewards")
-                    tmd["turn_token_spans"] = s.metadata.get("turn_token_spans")
                 smd = s.metadata or {}
+                if smd.get("turn_token_spans") is not None:
+                    tmd["turn_token_spans"] = smd.get("turn_token_spans")
+                if smd.get("trained_turn_indices") is not None:
+                    tmd["trained_turn_indices"] = smd.get("trained_turn_indices")
                 if smd.get("gigpo_turns") is not None:
                     tmd["gigpo_turns"] = smd.get("gigpo_turns")
                 if smd.get("protocol") is not None:

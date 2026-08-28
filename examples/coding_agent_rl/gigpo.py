@@ -58,6 +58,26 @@ PROTOCOL_TMAX = "tmax"
 PROTOCOL_SWEBENCH = "swebench"
 
 _EDIT_TOOLS = {"Edit", "Write", "NotebookEdit"}
+# Pi / OpenCode / MiniSWE emit lowercase (or snake) names; map to Claude-Code canonical
+# so tmax edit_key splits and ScaleSWE intent / tools_str stay comparable across agents.
+_TOOL_NAME_ALIASES = {
+    "bash": "Bash",
+    "shell": "Bash",
+    "write": "Write",
+    "create": "Write",
+    "create_file": "Write",
+    "edit": "Edit",
+    "strreplace": "Edit",
+    "str_replace": "Edit",
+    "replace": "Edit",
+    "notebookedit": "NotebookEdit",
+    "notebook_edit": "NotebookEdit",
+    "read": "Read",
+    "view": "Read",
+    "grep": "Grep",
+    "glob": "Glob",
+}
+_CANONICAL_TOOL_NAMES = _EDIT_TOOLS | {"Bash", "Read", "Grep", "Glob"}
 _BASH_READ = {"cat", "head", "tail", "less", "more", "nl", "bat"}
 _BASH_GREP = {"grep", "egrep", "fgrep", "rg", "ag"}
 _BASH_SED = {"sed", "awk"}
@@ -108,6 +128,32 @@ def protocol_of(sample_or_md: Any) -> str:
 
 def is_tmax(protocol: str | None) -> bool:
     return str(protocol or "").strip().lower() == PROTOCOL_TMAX
+
+
+def canonicalize_tool_name(name: str) -> str:
+    """Map Pi/OpenCode/MiniSWE tool names onto Claude-Code canonical forms."""
+    raw = str(name or "").strip()
+    if not raw:
+        return ""
+    if raw in _CANONICAL_TOOL_NAMES:
+        return raw
+    return _TOOL_NAME_ALIASES.get(raw.lower(), raw)
+
+
+def _tool_path_from_args(args: dict[str, Any]) -> str:
+    for key in ("file_path", "path", "target_file", "filePath", "filepath", "file"):
+        val = args.get(key)
+        if val:
+            return str(val)
+    return ""
+
+
+def _bash_command_from_args(args: dict[str, Any]) -> str:
+    for key in ("command", "cmd"):
+        val = args.get(key)
+        if val:
+            return str(val)
+    return ""
 
 
 def _bash_binaries(command: str) -> list[str]:
@@ -258,7 +304,7 @@ def parse_manager_tool_calls(message: dict[str, Any] | None) -> list[dict[str, A
         if not isinstance(tc, dict):
             continue
         fn = tc.get("function") if isinstance(tc.get("function"), dict) else tc
-        name = str(fn.get("name") or tc.get("name") or "")
+        name = canonicalize_tool_name(str(fn.get("name") or tc.get("name") or ""))
         args = fn.get("arguments") if "arguments" in fn else tc.get("input") or tc.get("arguments") or {}
         if isinstance(args, str):
             try:
@@ -269,14 +315,16 @@ def parse_manager_tool_calls(message: dict[str, Any] | None) -> list[dict[str, A
             args = {}
         rec: dict[str, Any] = {"name": name}
         if name == "Bash":
-            command = str(args.get("command") or "")
+            command = _bash_command_from_args(args)
+            if command:
+                rec["command"] = command
             rec["kind"] = bash_kind(command)
             writes = bash_write_parts(command)
             if writes:
                 rec["writes"] = writes
-        path = args.get("file_path") or args.get("path") or args.get("target_file")
+        path = _tool_path_from_args(args)
         if path:
-            rec["path"] = str(path)
+            rec["path"] = path
         out.append(rec)
     return out
 
@@ -284,7 +332,7 @@ def parse_manager_tool_calls(message: dict[str, Any] | None) -> list[dict[str, A
 def tool_labels_from_calls(calls: list[dict[str, Any]]) -> list[str]:
     labels: list[str] = []
     for rec in calls:
-        name = str(rec.get("name") or "")
+        name = canonicalize_tool_name(str(rec.get("name") or ""))
         if name == "Bash":
             labels.append(f"Bash:{rec.get('kind') or bash_kind(str(rec.get('command') or ''))}")
         elif name:
@@ -314,7 +362,7 @@ def _call_write_parts(rec: dict[str, Any]) -> list[str]:
     raw = rec.get("writes")
     if isinstance(raw, list) and raw:
         return [str(x) for x in raw if x]
-    if str(rec.get("name") or "") == "Bash":
+    if canonicalize_tool_name(str(rec.get("name") or "")) == "Bash":
         return bash_write_parts(str(rec.get("command") or ""))
     return []
 
@@ -322,7 +370,7 @@ def _call_write_parts(rec: dict[str, Any]) -> list[str]:
 def _edit_signature(calls: list[dict[str, Any]]) -> str:
     parts: list[str] = []
     for rec in calls:
-        name = str(rec.get("name") or "")
+        name = canonicalize_tool_name(str(rec.get("name") or ""))
         if name in _EDIT_TOOLS:
             parts.append(f"{name}:{rec.get('path') or ''}")
         elif name == "Bash":
@@ -382,10 +430,14 @@ def compact_turns(protocol: str | None, records: list[dict[str, Any]]) -> list[d
             continue
         calls = list(rec.get("tool_calls") or [])
         labels = tool_labels_from_calls(calls)
-        edit_paths = [str(c.get("path") or "") for c in calls if str(c.get("name") or "") in _EDIT_TOOLS]
+        edit_paths = [
+            str(c.get("path") or "")
+            for c in calls
+            if canonicalize_tool_name(str(c.get("name") or "")) in _EDIT_TOOLS
+        ]
         if is_tmax(proto):
             for call in calls:
-                if str(call.get("name") or "") == "Bash":
+                if canonicalize_tool_name(str(call.get("name") or "")) == "Bash":
                     edit_paths.extend(_call_write_parts(call))
         edit_paths = [p for p in edit_paths if p]
         edit_sig = _edit_signature(calls)
@@ -631,6 +683,35 @@ def post_process_rewards(args: Namespace, samples: list[Any]):
     return post_process_rewards_grpo_only(args, samples)
 
 
+def _owned_turn_advantages(
+    turn_adv: list[float],
+    spans: list | None,
+    owned: object,
+) -> tuple[list[float], list | None]:
+    """Slice full-trajectory GiGPO advantages down to this Sample's owned turns.
+
+    FORK fragments keep the whole-traj ``gigpo_turn_advantages`` list but only a
+    subset of SLM tokens. Pairing that list with builder-owned spans (or,
+    on length mismatch, broadcasting the owned-turn mean) avoids painting
+    earlier turns' A onto later tokens.
+    """
+    if not isinstance(owned, list) or not owned:
+        return turn_adv, spans
+    owned_i = [int(i) for i in owned]
+    if isinstance(spans, list) and len(spans) == len(owned_i):
+        adv: list[float] = []
+        kept: list = []
+        for k, i in enumerate(owned_i):
+            if 0 <= i < len(turn_adv):
+                adv.append(turn_adv[i])
+                kept.append(spans[k])
+        return adv, kept
+    adv = [turn_adv[i] for i in owned_i if 0 <= i < len(turn_adv)]
+    if isinstance(spans, list) and len(spans) == len(adv):
+        return adv, spans
+    return adv, None
+
+
 def _paint_turn_advantages(
     base: torch.Tensor,
     *,
@@ -643,7 +724,7 @@ def _paint_turn_advantages(
         return adv
     n = int(adv.numel())
     if not turn_token_spans or len(turn_token_spans) != len(advantages):
-        # No reliable spans: broadcast the trajectory-mean GiGPO advantage.
+        # No reliable spans: broadcast the mean of the (already owned-sliced) advantages.
         return torch.ones_like(base, dtype=torch.float32) * float(sum(advantages) / max(len(advantages), 1))
     for span, value in zip(turn_token_spans, advantages, strict=False):
         if not span or len(span) < 2:
@@ -675,6 +756,7 @@ def compute_advantages(args: Namespace, rollout_data: dict[str, Any]) -> None:
         spans = md.get("turn_token_spans")
         if spans is not None and not isinstance(spans, list):
             spans = None
+        turn_adv, spans = _owned_turn_advantages(turn_adv, spans, md.get("trained_turn_indices"))
         fallback = float(rewards[i]) if i < len(rewards) else 0.0
         advantages.append(
             _paint_turn_advantages(

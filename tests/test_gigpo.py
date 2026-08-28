@@ -337,6 +337,66 @@ def test_compute_advantages_paints_spans():
     assert rollout_data["advantages"][0].tolist() == pytest.approx([0.5, 0.5, -0.25, -0.25])
 
 
+def test_compute_advantages_paints_owned_turn_slice():
+    """FORK fragment: paint only the Sample's owned turn, leave the rest as episode fallback."""
+    kl = [torch.zeros(5)]
+    traj_a = [float(i) * 0.1 for i in range(17)]
+    traj_a[6] = 1.25
+    rollout_data = {
+        "kl": kl,
+        "rewards": [0.3],
+        "metadata": [
+            {
+                "gigpo_turn_advantages": traj_a,
+                "turn_token_spans": [[0, 3]],
+                "trained_turn_indices": [6],
+            }
+        ],
+    }
+    gigpo.compute_advantages(None, rollout_data)
+    assert rollout_data["advantages"][0].tolist() == pytest.approx([1.25, 1.25, 1.25, 0.3, 0.3])
+
+
+def test_compute_advantages_owned_mismatch_broadcasts_owned_mean():
+    """Owned turns + full-traj empty spans: broadcast mean of owned A, not whole-traj mean."""
+    kl = [torch.zeros(4)]
+    rollout_data = {
+        "kl": kl,
+        "rewards": [0.0],
+        "metadata": [
+            {
+                "gigpo_turn_advantages": [1.0, 3.0, 5.0],
+                "turn_token_spans": [[0, 0], [0, 0], [0, 0]],
+                "trained_turn_indices": [1, 2],
+            }
+        ],
+    }
+    gigpo.compute_advantages(None, rollout_data)
+    assert rollout_data["advantages"][0].tolist() == pytest.approx([4.0, 4.0, 4.0, 4.0])
+
+
+def test_attach_keeps_builder_owned_spans():
+    from examples.coding_agent_rl.offload import attach_turn_advantage_metadata
+
+    sample = SimpleNamespace(
+        response_length=3,
+        loss_mask=[1, 1, 1],
+        metadata={
+            "trained_turn_indices": [6],
+            "turn_token_spans": [[0, 3]],
+        },
+        train_metadata={},
+    )
+    turn_rewards = [0.0] * 8
+    turn_costs = [{"small_output_tokens": 10}] * 8
+    attach_turn_advantage_metadata([sample], turn_rewards=turn_rewards, turn_costs=turn_costs)
+    assert sample.metadata["trained_turn_indices"] == [6]
+    assert sample.metadata["turn_token_spans"] == [[0, 3]]
+    assert sample.train_metadata["trained_turn_indices"] == [6]
+    assert sample.train_metadata["turn_token_spans"] == [[0, 3]]
+    assert sample.train_metadata["turn_rewards"] == turn_rewards
+
+
 def test_sft_rows_get_zero_advantage():
     kl = [torch.ones(3)]
     rollout_data = {
@@ -360,6 +420,69 @@ def test_parse_manager_tool_calls():
     assert calls[0]["name"] == "Bash"
     assert calls[0]["kind"] == "pytest"
     assert calls[1] == {"name": "Edit", "path": "src/a.py"}
+
+
+def test_canonicalize_pi_opencode_tool_aliases():
+    """Pi/OpenCode lowercase names must map to Claude-Code forms for tmax edit_key."""
+    assert gigpo.canonicalize_tool_name("write") == "Write"
+    assert gigpo.canonicalize_tool_name("edit") == "Edit"
+    assert gigpo.canonicalize_tool_name("bash") == "Bash"
+    assert gigpo.canonicalize_tool_name("read") == "Read"
+    assert gigpo.canonicalize_tool_name("grep") == "Grep"
+    assert gigpo.canonicalize_tool_name("glob") == "Glob"
+    assert gigpo.canonicalize_tool_name("Write") == "Write"
+
+    msg = {
+        "role": "assistant",
+        "tool_calls": [
+            {"type": "function", "function": {"name": "write", "arguments": {"filePath": "src/a.py"}}},
+            {"type": "function", "function": {"name": "edit", "arguments": {"path": "src/b.py"}}},
+            {"type": "function", "function": {"name": "bash", "arguments": {"cmd": "pytest -q"}}},
+        ],
+    }
+    calls = gigpo.parse_manager_tool_calls(msg)
+    assert calls[0] == {"name": "Write", "path": "src/a.py"}
+    assert calls[1] == {"name": "Edit", "path": "src/b.py"}
+    assert calls[2]["name"] == "Bash"
+    assert calls[2]["kind"] == "pytest"
+    assert calls[2]["command"] == "pytest -q"
+
+
+def test_tmax_edit_key_splits_on_lowercase_write():
+    records = [
+        {"turn_index": 1, "tool_calls": [{"name": "bash", "command": "ls"}]},
+        {"turn_index": 2, "tool_calls": [{"name": "write", "path": "main.c"}]},
+        {"turn_index": 3, "tool_calls": [{"name": "bash", "command": "g++ main.c"}]},
+        {"turn_index": 4, "tool_calls": [{"name": "edit", "path": "main.c"}]},
+        {"turn_index": 5, "tool_calls": [{"name": "bash", "command": "g++ main.c"}]},
+    ]
+    turns = gigpo.compact_turns("tmax", records)
+    assert turns[0]["edit_key"] == ""
+    assert turns[1]["edit_key"] == ""  # write lands in this turn; key is prior edits
+    assert "Write:main.c" in turns[2]["edit_key"]
+    assert "Write:main.c" in turns[3]["edit_key"]
+    assert "Edit:main.c" in turns[4]["edit_key"]
+    assert turns[1]["tools"] == ["Write"]
+    assert turns[3]["tools"] == ["Edit"]
+    # Segment anchors share canonical tools_str across agents.
+    assert turns[1]["tools_str"] == "Write"
+    assert turns[3]["intent"] == "实现修复"
+
+
+def test_scaleswe_tools_str_canonical_for_anchor_match():
+    """ScaleSWE splits on diff_key, but intent/tools_str still need aliases for GiGPO anchors."""
+    records = [
+        {"turn_index": 1, "git_diff": "", "tool_calls": [{"name": "bash", "kind": "cat"}]},
+        {
+            "turn_index": 2,
+            "git_diff": "diff --git a/src/a.py b/src/a.py\n+x\n",
+            "tool_calls": [{"name": "write", "path": "src/a.py"}],
+        },
+    ]
+    turns = gigpo.compact_turns("scaleswe", records)
+    assert turns[1]["tools"] == ["Write"]
+    assert turns[1]["tools_str"] == "Write"
+    assert turns[1]["intent"] == "实现修复"
 
 
 if __name__ == "__main__":

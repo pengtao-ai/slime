@@ -172,6 +172,10 @@ class _SampleBuilder:
         self.logprobs: list[float] = []
         self.last_response_start_idx: int | None = None
         self.leading_prompt_len: int = 0
+        # (0-based turn_index, start, end) in full-sequence coordinates, covering
+        # only this builder's trainable output tokens. FORK fragments therefore
+        # own a subset of the trajectory's turns instead of the whole list.
+        self._trained_turns: list[tuple[int, int, int]] = []
 
     def classify_token_drift(self, turn: TurnRecord) -> DriftKind:
         """Decide how this builder should absorb ``turn``'s prompt.
@@ -206,7 +210,14 @@ class _SampleBuilder:
             return DriftKind.REALIGN
         return DriftKind.FORK
 
-    def append_turn(self, turn: TurnRecord, kind: DriftKind, *, trained: bool = True) -> None:
+    def append_turn(
+        self,
+        turn: TurnRecord,
+        kind: DriftKind,
+        *,
+        trained: bool = True,
+        turn_index: int | None = None,
+    ) -> None:
         """Append one turn into this SampleBuilder, branching on ``kind``: for REALIGN
         we overwrite the already-saved response span, for CLEAN we just append this
         turn's prompt tail."""
@@ -216,16 +227,34 @@ class _SampleBuilder:
 
         # --- append this turn's prompt tail (loss_mask=0) ---
         if kind is DriftKind.REALIGN:
+            # REALIGN wipes the previous response to loss_mask=0; drop its owned span.
+            self._drop_trained_turns_from(self.last_response_start_idx)
             self._align_to_prompt(turn.prompt_ids)  # drop the drifted tail, re-append from prompt
         else:  # CLEAN: held tokens are an exact prefix of prompt_ids; append the tail beyond them
             self._append_tokens(turn.prompt_ids[len(self.tokens) :], loss_mask=0)
 
         # --- append this turn's generated response (loss_mask=1 unless re-emitted as context) ---
         self.last_response_start_idx = len(self.tokens)
+        response_start = self.last_response_start_idx
         self._append_output_tokens(turn, trained=trained)
+        if trained and turn_index is not None:
+            self._note_trained_turn(int(turn_index), response_start)
 
         if is_first_turn:
             self.leading_prompt_len = len(turn.prompt_ids)
+
+    def _drop_trained_turns_from(self, seq_idx: int | None) -> None:
+        """Drop owned-turn spans that overlap ``seq_idx`` (inclusive) onward."""
+        if seq_idx is None:
+            return
+        self._trained_turns = [(i, a, b) for (i, a, b) in self._trained_turns if b <= seq_idx]
+
+    def _note_trained_turn(self, turn_index: int, output_start: int) -> None:
+        """Record the trainable [start, end) of this turn in full-sequence coordinates."""
+        ones = [i for i in range(output_start, len(self.tokens)) if int(self.loss_mask[i])]
+        if not ones:
+            return
+        self._trained_turns.append((turn_index, ones[0], ones[-1] + 1))
 
     def _align_to_prompt(self, prompt_ids: list[int]) -> None:
         """Heal REALIGN drift by overwriting the most-recent response span with
@@ -303,6 +332,26 @@ class _SampleBuilder:
             loss_mask = loss_mask[:max_sample_tokens]
             logprobs = logprobs[:max_sample_tokens]
         md = dict(extra_metadata or {})
+        resp_len = len(loss_mask) - start
+        seq_end = len(tokens)
+        indices: list[int] = []
+        spans: list[list[int]] = []
+        for ti, a, b in self._trained_turns:
+            if a >= seq_end:
+                continue
+            b = min(b, seq_end)
+            ra = a - start
+            rb = b - start
+            if rb <= 0 or ra >= resp_len:
+                continue
+            ra = max(0, ra)
+            rb = min(resp_len, rb)
+            if rb > ra:
+                indices.append(int(ti))
+                spans.append([int(ra), int(rb)])
+        if indices:
+            md["trained_turn_indices"] = indices
+            md["turn_token_spans"] = spans
         return Sample(
             index=base_sample.index,
             group_index=base_sample.group_index,
@@ -530,12 +579,17 @@ class TrajectoryManager:
         for asst_node in asst_nodes:
             trained = not asst_node.response_trained
             asst_node.response_trained = True
+            raw_idx = asst_node.turn_index
+            # MessageNode.turn_index is 1-based; GiGPO / turn_costs are 0-based.
+            turn_index = None if raw_idx is None else max(0, int(raw_idx) - 1)
 
             if not builders or (kind := builders[-1].classify_token_drift(asst_node.turn)) is DriftKind.FORK:
                 builders.append(_SampleBuilder(self._fork_threshold))
-                builders[-1].append_turn(asst_node.turn, DriftKind.CLEAN, trained=trained)
+                builders[-1].append_turn(
+                    asst_node.turn, DriftKind.CLEAN, trained=trained, turn_index=turn_index
+                )
             else:
-                builders[-1].append_turn(asst_node.turn, kind, trained=trained)
+                builders[-1].append_turn(asst_node.turn, kind, trained=trained, turn_index=turn_index)
         return builders
 
     def _chain_to_samples(

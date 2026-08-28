@@ -2005,21 +2005,34 @@ def attach_turn_advantage_metadata(
     turn_rewards: list[float],
     turn_costs: list[dict[str, Any]],
 ) -> None:
-    """Write turn_rewards / spans into sample.metadata and train_metadata."""
+    """Write turn_rewards / spans into sample.metadata and train_metadata.
+
+    When TrajectoryManager already recorded ``trained_turn_indices`` and
+    matching ``turn_token_spans`` for this Sample (the turns whose SLM tokens
+    actually live here), keep those spans. Do not remap the full-trajectory
+    turn list onto a FORK fragment's few trainable tokens.
+    """
     for sample in samples:
         md = dict(getattr(sample, "metadata", None) or {})
         md["turn_rewards"] = list(turn_rewards)
         md["turn_costs"] = list(turn_costs)
-        spans = build_turn_token_spans(
-            int(getattr(sample, "response_length", 0) or 0),
-            getattr(sample, "loss_mask", None),
-            turn_costs,
-            turn_rewards,
-        )
-        if spans is not None:
-            md["turn_token_spans"] = spans
+        owned = md.get("trained_turn_indices")
+        builder_spans = md.get("turn_token_spans")
+        has_owned = isinstance(owned, list) and bool(owned)
+        has_builder_spans = isinstance(builder_spans, list) and bool(builder_spans)
+        if has_owned and has_builder_spans:
+            spans = builder_spans
         else:
-            md.pop("turn_token_spans", None)
+            spans = build_turn_token_spans(
+                int(getattr(sample, "response_length", 0) or 0),
+                getattr(sample, "loss_mask", None),
+                turn_costs,
+                turn_rewards,
+            )
+            if spans is not None:
+                md["turn_token_spans"] = spans
+            else:
+                md.pop("turn_token_spans", None)
         sample.metadata = md
         train_md = dict(getattr(sample, "train_metadata", None) or {})
         train_md.setdefault("objective", "grpo")
@@ -2028,6 +2041,8 @@ def attach_turn_advantage_metadata(
             train_md["turn_token_spans"] = spans
         else:
             train_md.pop("turn_token_spans", None)
+        if has_owned:
+            train_md["trained_turn_indices"] = [int(i) for i in owned]
         for key in ("gigpo_turns", "protocol", "instance_id"):
             if key in md:
                 train_md[key] = md[key]
@@ -2196,6 +2211,8 @@ def _write_session_turn_rewards(
         tmd["turn_rewards"] = list(turn_rewards)
         if "turn_token_spans" in smd:
             tmd["turn_token_spans"] = smd["turn_token_spans"]
+        if "trained_turn_indices" in smd:
+            tmd["trained_turn_indices"] = smd["trained_turn_indices"]
         sample.train_metadata = tmd
         cur = float(getattr(sample, "reward", 0.0) or 0.0)
         if cur <= 0.0:

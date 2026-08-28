@@ -220,12 +220,13 @@ def drift_replace(ids: list[int], at: int, sentinel: int = _DRIFT_BAND + 2) -> l
     return out
 
 
-def turn(prompt_ids, response_ids, *, finish_reason="stop", logprobs=None) -> TurnRecord:
+def turn(prompt_ids, response_ids, *, finish_reason="stop", logprobs=None, output_loss_mask=None) -> TurnRecord:
     return TurnRecord(
         prompt_ids=list(prompt_ids),
         output_ids=list(response_ids),
         finish_reason=finish_reason,
         output_log_probs=list(logprobs) if logprobs is not None else [],
+        output_loss_mask=list(output_loss_mask) if output_loss_mask is not None else [],
     )
 
 
@@ -256,6 +257,7 @@ def append(
     finish_reason="stop",
     logprobs=None,
     response_message=None,
+    output_loss_mask=None,
 ):
     p = list(prompt_ids) if prompt_ids is not None else render_prompt(prompt_msgs)
     if response_ids is not None:
@@ -281,7 +283,7 @@ def append(
     )
     mgr.record_turn(
         sid,
-        turn=turn(p, r, finish_reason=finish_reason, logprobs=lp),
+        turn=turn(p, r, finish_reason=finish_reason, logprobs=lp, output_loss_mask=output_loss_mask),
         prompt_messages=messages(prompt_msgs),
         response_message=rmsg,
     )
@@ -616,6 +618,8 @@ def test_2_1_single_turn_linearize():
     assert goldens(samples) == ["<sys> system:S </sys> <usr> user:u </usr> <gen> [r:a] [</ast>]"]
     assert s0.rollout_log_probs == [-0.5] * len(r)
     assert s0.reward == 1.0
+    assert s0.metadata["trained_turn_indices"] == [0]
+    assert s0.metadata["turn_token_spans"] == [[0, len(r)]]
     _check_invariants(samples)
     _record("2.1 single-turn linearize", mgr, sid, samples)
     print("PASS 2.1")
@@ -636,6 +640,8 @@ def test_2_2_clean_multiturn_linearize():
         "<tul> tool:4 </tul> <gen> [r:done] [</ast>]",
     ]
     assert s0.rollout_log_probs == [-0.5] * len(r1) + [0.0] * (len(p2) - L) + [-0.4] * len(r2)
+    assert s0.metadata["trained_turn_indices"] == [0, 1]
+    assert len(s0.metadata["turn_token_spans"]) == 2
     _check_invariants(samples)
     _record("2.2 clean 2-turn linearize", mgr, sid, samples)
     print("PASS 2.2")
@@ -690,6 +696,9 @@ def test_2_4_drift_case_B1_short_replaces():
         "<tul> tool:t </tul> <gen> [r:done] [</ast>]",
     ]
     assert s0.rollout_log_probs == [0.0] * (len(p2) - len(p1)) + [-0.4] * len(r2)
+    ones = [i for i, m in enumerate(s0.loss_mask) if int(m)]
+    assert s0.metadata["trained_turn_indices"] == [1]
+    assert s0.metadata["turn_token_spans"] == [[ones[0], ones[-1] + 1]]
     _check_invariants(samples)
     _record("2.4 drift case B1 (small) -> replace", mgr, sid, samples)
     print("PASS 2.4")
@@ -878,6 +887,61 @@ def test_2_12_drop_clears_sid():
     _check_invariants(samples)
     _record("2.12 drop clears sid (2nd get_trajectory -> [])", mgr, sid, samples)
     print("PASS 2.12")
+
+
+def test_2_13_offload_expand_fork_owned_turns():
+    """Longer assistant echo (GLM offload) forks; each Sample owns only its SLM tokens.
+
+    Turn 1 emits SLM tokens (loss=1) plus a GLM suffix (loss=0). Turn 2's prompt
+    diverges inside that response with a much longer echo, which expand_slack
+    classifies as FORK so the SLM tokens stay trainable on sample 0.
+    """
+    mgr = TrajectoryManager()
+    sid = "2.13"
+    s, u = sys_msg("S"), usr_msg("u")
+    a1, t1 = asst_msg("slm"), tool_msg("ok")
+    slm = render_response("slm")
+    glm = [4001, 4002, 4003]
+    TOKEN_NAMES[4001] = "glm:a"
+    TOKEN_NAMES[4002] = "glm:b"
+    TOKEN_NAMES[4003] = "glm:c"
+    p1, r1 = append(
+        mgr,
+        sid,
+        [s, u],
+        "slm",
+        finish_reason="tool_calls",
+        logprobs=[-0.5] * (len(slm) + len(glm)),
+        response_ids=slm + glm,
+        output_loss_mask=[1] * len(slm) + [0] * len(glm),
+    )
+    assert len(r1) == len(slm) + len(glm)
+    # Diverge after the first SLM token and splice a long GLM rewrite so
+    # new_tail_len > held_resp_len + expand_slack.
+    for i, tid in enumerate(range(4100, 4180)):
+        TOKEN_NAMES[tid] = f"glmE:{i}"
+    p2 = list(p1) + list(r1[:1]) + list(range(4100, 4180))
+    p2, r2 = append(
+        mgr,
+        sid,
+        [s, u, a1, t1],
+        "done",
+        prompt_ids=p2,
+        logprobs=[-0.4] * 2,
+    )
+    samples = get_traj(mgr, sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
+    assert len(samples) == 2
+    s0, s1 = samples
+    assert s0.metadata["trained_turn_indices"] == [0]
+    assert s0.metadata["turn_token_spans"] == [[0, len(slm)]]
+    assert s0.loss_mask[: len(slm)] == [1] * len(slm)
+    assert s0.loss_mask[len(slm) :] == [0] * len(glm)
+    assert s1.metadata["trained_turn_indices"] == [1]
+    ones = [i for i, m in enumerate(s1.loss_mask) if int(m)]
+    assert s1.metadata["turn_token_spans"] == [[ones[0], ones[-1] + 1]]
+    _check_invariants(samples)
+    _record("2.13 offload expand-fork owned turns", mgr, sid, samples)
+    print("PASS 2.13")
 
 
 # ===========================================================================
@@ -1287,6 +1351,10 @@ def _print_sample(idx: int, s: Sample) -> None:
     tok_row = " ".join(names[i].ljust(widths[i]) for i in range(len(toks)))
     loss_row = " ".join(loss[i].ljust(widths[i]) for i in range(len(toks)))
     print(f"  Sample#{idx} reward={s.reward:.3f} resp_len={s.response_length}")
+    owned = (s.metadata or {}).get("trained_turn_indices")
+    spans = (s.metadata or {}).get("turn_token_spans")
+    if owned is not None:
+        print(f"    owned: {owned} spans={spans}")
     print(f"    tok : {tok_row}")
     print(f"    loss: {loss_row}")
 
@@ -1359,6 +1427,7 @@ _CASES = [
     test_2_10_cross_leaf_dedup,
     test_2_11_routing_only_assistant_filtered,
     test_2_12_drop_clears_sid,
+    test_2_13_offload_expand_fork_owned_turns,
     test_3_1_rewrite_merge_absorbs_short,
     test_3_2_rewrite_merge_long_forks,
     test_3_3_rewrite_merge_threshold_zero_forks,
