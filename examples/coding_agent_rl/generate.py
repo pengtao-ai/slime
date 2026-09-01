@@ -3,10 +3,17 @@
     --custom-generate-function-path examples.coding_agent_rl.generate.generate
 
 generate() is a four-stage orchestrator: swe.prepare_workspace + harness.run
--> swe.git_diff -> swe.run_evaluation -> adapter.finish_session. The harness is
-chosen per sample via ``metadata.agent`` (fallback: ``SWE_AGENT`` env); see
-``agents_registry``. All agents except ``codex`` use the Anthropic (CC) adapter;
-``codex`` uses the OpenAI adapter. Both protocols share one HTTP server.
+-> swe.git_diff -> swe.run_evaluation -> adapter.finish_session. If teacher-force
+is on and the first pass is unsolved, that traj still enters GRPO, then
+``generate()`` reruns once with force-tag insert unless first-pass offload
+turns are already ≥ ``OFFLOAD_FORCE_TAG_TRAJ_FRAC``. A solved retry (GRPO + SFT)
+is concatenated onto the first pass, so the group can exceed
+``n_samples_per_prompt``. An unsolved or aborted retry is dropped: it does not
+enter GRPO or SFT. First-pass failures still train. SFT is solved-only. The
+harness is chosen per sample via ``metadata.agent``
+(fallback: ``SWE_AGENT`` env);
+see ``agents_registry``. All agents except ``codex`` use the Anthropic (CC)
+adapter; ``codex`` uses the OpenAI adapter. Both protocols share one HTTP server.
 Sandbox-side work is split across three layers: the provider-agnostic sandbox
 contract (slime.agent.sandbox), the swappable harness lifecycle
 (slime.agent.harness), and the SWE task layer (examples.coding_agent_rl.swe --
@@ -426,9 +433,14 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         max_context_tokens=state.max_context_len,
     )
     ensure_session_timing(session_obj, tid=tid, events=trace_events)
+    session_obj.offload_stats = dict(getattr(session_obj, "offload_stats", None) or {})
+    session_obj.offload_stats["allow_force_tag"] = bool(
+        (base_sample.metadata or {}).get("offload_force_retry")
+    )
 
     t0 = time.time()
     result_samples: list[Sample] | None = None
+    retry_force = False
     try:
         async with asyncio.timeout(CONFIG.rollout_guard_sec):
             async with boot_agent_sandbox(
@@ -533,6 +545,32 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             session_obj = state.session_store_get(session_id)
             if session_obj is not None and getattr(session_obj, "offload_stats", None):
                 offload_stats = dict(session_obj.offload_stats)
+            if offload.should_retry_unsolved_with_force_tag(
+                evaluation=evaluation,
+                solved=solved,
+                metadata=base_sample.metadata,
+                offload_stats=offload_stats,
+            ):
+                retry_force = True
+                logger.info(
+                    "[coding_agent_rl] %s: solo pass unsolved; keep GRPO traj and retry with force-tag insert",
+                    instance_id,
+                )
+            elif (
+                not evaluation
+                and float(solved) != 1.0
+                and not (base_sample.metadata or {}).get("offload_force_retry")
+                and offload.force_tag_prob() > 0.0
+            ):
+                frac = offload.offload_turn_frac(offload_stats)
+                cap = offload.force_tag_traj_frac()
+                if cap > 0.0 and frac >= cap:
+                    logger.info(
+                        "[coding_agent_rl] %s: unsolved but offload_frac=%.2f >= %.2f; skip force-tag retry",
+                        instance_id,
+                        frac,
+                        cap,
+                    )
             train_reward = solved
             turn_rewards: list[float] = []
             turn_costs: list[dict[str, Any]] = list(offload_stats.get("turn_costs") or [])
@@ -620,6 +658,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     extra_metadata={
                         "grading_solved": solved == 1.0,
                         "instance_id": instance_id,
+                        "session_id": session_id,
                         "solved": solved,
                         "empty_patch": empty_patch,
                         "protocol": md.get("protocol"),
@@ -643,66 +682,91 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     state.adapter_url,
                     (diag or "<empty>")[:1500],
                 )
-                result_samples = _abort_result(base_sample, "adapter_session_empty", instance_id)
-                _attach_timeline(result_samples, timeline)
-                return result_samples
+                if retry_force:
+                    # Empty first pass is not a useful GRPO row; still retry.
+                    # Do not abort base_sample in place — the retry reuses it.
+                    result_samples = []
+                else:
+                    result_samples = _abort_result(base_sample, "adapter_session_empty", instance_id)
+                    _attach_timeline(result_samples, timeline)
+                    return result_samples
+            else:
+                if offload.offload_enabled() and turn_rewards:
+                    offload.attach_turn_advantage_metadata(
+                        samples, turn_rewards=turn_rewards, turn_costs=turn_costs
+                    )
 
-            if offload.offload_enabled() and turn_rewards:
-                offload.attach_turn_advantage_metadata(
-                    samples, turn_rewards=turn_rewards, turn_costs=turn_costs
-                )
-
-            for s in samples:
-                s.metadata = {
-                    **(s.metadata or {}),
-                    "agent_exit_code": agent_exit_code,
-                    "agent": agent_spec.name,
-                    "timeline": timeline,
-                    "timeout": agent_exit_code < 0 or bool((s.metadata or {}).get("timeout")),
-                    "max_steps_reached": bool(
-                        (s.metadata or {}).get("max_steps_reached")
-                        or offload_stats.get("max_steps_reached")
-                    ),
-                }
-                if getattr(s, "train_metadata", None) is None and (s.metadata or {}).get("turn_rewards"):
-                    s.train_metadata = {
-                        "turn_rewards": s.metadata.get("turn_rewards"),
-                        "turn_token_spans": s.metadata.get("turn_token_spans"),
+                for s in samples:
+                    s.session_id = session_id
+                    s.metadata = {
+                        **(s.metadata or {}),
+                        "session_id": session_id,
+                        "agent_exit_code": agent_exit_code,
+                        "agent": agent_spec.name,
+                        "timeline": timeline,
+                        "timeout": agent_exit_code < 0 or bool((s.metadata or {}).get("timeout")),
+                        "max_steps_reached": bool(
+                            (s.metadata or {}).get("max_steps_reached")
+                            or offload_stats.get("max_steps_reached")
+                        ),
                     }
+                    if getattr(s, "train_metadata", None) is None and (s.metadata or {}).get("turn_rewards"):
+                        s.train_metadata = {
+                            "turn_rewards": s.metadata.get("turn_rewards"),
+                            "turn_token_spans": s.metadata.get("turn_token_spans"),
+                        }
 
-            # Online SFT: PASS + valid offload turns → separate Sample rows (not in GRPO group).
-            if offload.offload_enabled() and solved == 1.0:
-                sft_samples = build_sft_samples(
-                    grpo_samples=samples,
-                    tokenizer=state.tokenizer,
-                    grading_solved=True,
-                )
-                if sft_samples:
-                    samples = list(samples) + sft_samples
+                is_force_retry = bool((base_sample.metadata or {}).get("offload_force_retry"))
+                # Failed teacher-force retry: do not train GRPO or SFT.
+                if is_force_retry and float(solved) != 1.0:
+                    logger.info(
+                        "[coding_agent_rl] %s: force-tag retry unsolved; drop GRPO/SFT n=%d",
+                        instance_id,
+                        len(samples),
+                    )
+                    result_samples = []
+                    return result_samples
 
-            if agent_exit_code != 0:
-                reason = "time budget exceeded" if agent_exit_code < 0 else f"CLI error (exit {agent_exit_code})"
-                logger.warning(
-                    "[coding_agent_rl] %s: agent=%s agent_exit_code=%d (%s)",
+                # Online SFT: solved trajectories only (solo or offload). Failures stay GRPO-only.
+                if offload.offload_enabled() and solved == 1.0:
+                    sft_samples = build_sft_samples(
+                        grpo_samples=samples,
+                        tokenizer=state.tokenizer,
+                        grading_solved=True,
+                    )
+                    if sft_samples:
+                        samples = list(samples) + sft_samples
+
+                if agent_exit_code != 0:
+                    reason = "time budget exceeded" if agent_exit_code < 0 else f"CLI error (exit {agent_exit_code})"
+                    logger.warning(
+                        "[coding_agent_rl] %s: agent=%s agent_exit_code=%d (%s)",
+                        instance_id,
+                        agent_spec.name,
+                        agent_exit_code,
+                        reason,
+                    )
+                logger.info(
+                    "[coding_agent_rl] %s: agent=%s reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs "
+                    "segments=%d timeline_events=%d",
                     instance_id,
                     agent_spec.name,
+                    float(train_reward),
+                    bool(applied_cleanly),
                     agent_exit_code,
-                    reason,
+                    time.time() - t0,
+                    len(samples),
+                    len(trace_events),
                 )
-            logger.info(
-                "[coding_agent_rl] %s: agent=%s reward=%.2f applied=%s agent_exit_code=%d elapsed=%.1fs "
-                "segments=%d timeline_events=%d",
-                instance_id,
-                agent_spec.name,
-                float(train_reward),
-                bool(applied_cleanly),
-                agent_exit_code,
-                time.time() - t0,
-                len(samples),
-                len(trace_events),
-            )
-            result_samples = samples
-            return result_samples
+                result_samples = samples
+                if retry_force:
+                    logger.info(
+                        "[coding_agent_rl] %s: first-pass GRPO n=%d; running force-tag retry",
+                        instance_id,
+                        len(samples),
+                    )
+                else:
+                    return result_samples
 
     except asyncio.TimeoutError:
         _log_timeout_diagnostic(t0, instance_id)
@@ -733,6 +797,27 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             await asyncio.sleep(10)
         if result_samples is not None:
             _attach_timeline(result_samples, timeline)
+
+    if retry_force:
+        first_pass = list(result_samples or [])
+        md = dict(base_sample.metadata or {})
+        md["offload_force_retry"] = True
+        base_sample.metadata = md
+        base_sample.session_id = f"{session_id}-force"
+        second_pass = await generate(args, base_sample, sampling_params, evaluation)
+        kept = _keep_solved_retry_samples(list(second_pass or []))
+        _stamp_compact_rollout_id(first_pass or [base_sample], kept)
+        if not kept:
+            logger.info(
+                "[coding_agent_rl] %s: force-tag retry produced no solved traj; keep first-pass GRPO only",
+                instance_id,
+            )
+        out = first_pass + kept
+        if out:
+            return out
+        # Both passes empty (e.g. silent agent + failed retry): one aborted
+        # placeholder, not an empty compact list.
+        return _abort_result(base_sample, "force_tag_retry_empty", instance_id)
 
 
 def _log_timeout_diagnostic(t0: float, instance_id: str) -> None:
@@ -765,6 +850,52 @@ def _session_id(sample: Sample, instance_id: str) -> str:
     return f"cagent-{instance_id}-{secrets.token_hex(8)}"
 
 
+def _ensure_rollout_id(sample: Sample) -> None:
+    """Compact siblings must share a non-None ``rollout_id`` (see ``to_sample``)."""
+    if sample.rollout_id is None:
+        sample.rollout_id = sample.index
+
+
+def _sample_is_solved(sample: Sample) -> bool:
+    md = sample.metadata or {}
+    if md.get("grading_solved") is True:
+        return True
+    try:
+        return float(md.get("solved") or 0) == 1.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _keep_solved_retry_samples(samples: list[Sample]) -> list[Sample]:
+    """Retry trains only when the second pass graded solved (GRPO + SFT)."""
+    kept: list[Sample] = []
+    for sample in samples:
+        if getattr(sample, "status", None) == Sample.Status.ABORTED:
+            continue
+        if (sample.metadata or {}).get("abort_reason"):
+            continue
+        if _sample_is_solved(sample):
+            kept.append(sample)
+    return kept
+
+
+def _stamp_compact_rollout_id(src: list[Sample], dst: list[Sample]) -> None:
+    """Copy ``rollout_id`` from first-pass siblings onto retry samples missing it."""
+    rid = None
+    for sample in src:
+        if sample.rollout_id is not None:
+            rid = sample.rollout_id
+            break
+        if sample.index is not None:
+            rid = sample.index
+            break
+    if rid is None:
+        return
+    for sample in dst:
+        if sample.rollout_id is None:
+            sample.rollout_id = rid
+
+
 def _abort_result(sample: Sample, reason: str, instance_id: str) -> list[Sample]:
     """Mark ``sample`` aborted in place and return it in the list shape this
     fan-out generate function always yields."""
@@ -776,6 +907,7 @@ def _abort_result(sample: Sample, reason: str, instance_id: str) -> list[Sample]
     sample.reward = 0.0
     sample.remove_sample = True
     sample.status = Sample.Status.ABORTED
+    _ensure_rollout_id(sample)
     sample.metadata = {
         **(sample.metadata or {}),
         "abort_reason": reason,
@@ -803,6 +935,7 @@ def _eval_result(
     sample.reward = float(reward)
     sample.remove_sample = True
     sample.status = Sample.Status.COMPLETED
+    _ensure_rollout_id(sample)
     sample.metadata = {
         **(sample.metadata or {}),
         "instance_id": instance_id,

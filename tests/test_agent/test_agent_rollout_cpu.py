@@ -154,6 +154,13 @@ def _patch_generate(monkeypatch, tokenizer: FakeTokenizer, sandbox_factory) -> N
     SingletonMeta.clear_instances(gen._AdapterService)
 
 
+def _patch_sglang_turns(monkeypatch, tokenizer: FakeTokenizer, n_turns: int) -> None:
+    script = _two_turn_script() * ((n_turns + 1) // 2)
+    monkeypatch.setattr(
+        adapters_common, "call_sglang_generate", fake_call_sglang_generate(script[:n_turns], tokenizer)
+    )
+
+
 async def _noop_install(self, sb) -> None:
     return None
 
@@ -214,6 +221,7 @@ def test_generate_aborts_on_empty_trajectory():
         assert len(samples) == 1
         assert samples[0].status == Sample.Status.ABORTED
         assert samples[0].metadata.get("abort_reason") == "adapter_session_empty"
+        assert samples[0].rollout_id == samples[0].index == 0
 
     with pytest.MonkeyPatch.context() as mp:
         asyncio.run(run_case(mp))
@@ -228,6 +236,142 @@ def test_generate_aborts_on_missing_image():
         assert len(samples) == 1
         assert samples[0].status == Sample.Status.ABORTED
         assert samples[0].metadata.get("abort_reason") == "missing_image_or_workdir"
+        assert samples[0].rollout_id == 0
+
+    with pytest.MonkeyPatch.context() as mp:
+        asyncio.run(run_case(mp))
+
+
+def test_abort_result_sets_rollout_id_for_compact_concat():
+    """Abort used to leave rollout_id=None; compact first_pass+[abort] then
+    failed ``_validate_rollout_id_annotated`` at depth ≥ 2."""
+    abort = gen._abort_result(Sample(index=4, group_index=0, prompt="x"), "exception:RuntimeError", "demo")[0]
+    assert abort.rollout_id == 4
+    trained = Sample(
+        index=4,
+        group_index=0,
+        rollout_id=4,
+        prompt="x",
+        tokens=[1, 2],
+        loss_mask=[1],
+        response_length=1,
+        rollout_log_probs=[0.0],
+        status=Sample.Status.COMPLETED,
+    )
+    compact = [trained, abort]
+    rids = [s.rollout_id for s in compact]
+    assert None not in rids
+    assert len(set(rids)) == 1
+
+
+def test_keep_solved_retry_samples_drops_failures_and_aborts():
+    solved = Sample(
+        index=1,
+        rollout_id=1,
+        status=Sample.Status.COMPLETED,
+        metadata={"grading_solved": True, "solved": 1.0, "session_id": "s-force"},
+    )
+    sft = Sample(
+        index=1,
+        rollout_id=1,
+        status=Sample.Status.COMPLETED,
+        metadata={"grading_solved": True, "solved": 1.0, "objective": "sft", "session_id": "s-force"},
+    )
+    failed = Sample(
+        index=1,
+        rollout_id=1,
+        status=Sample.Status.COMPLETED,
+        metadata={"grading_solved": False, "solved": 0.0, "session_id": "s-force"},
+    )
+    abort = Sample(
+        index=1,
+        status=Sample.Status.ABORTED,
+        metadata={"abort_reason": "exception:RuntimeError", "solved": 0.0},
+    )
+    kept = gen._keep_solved_retry_samples([solved, failed, abort, sft])
+    assert kept == [solved, sft]
+
+
+def test_generate_drops_unsolved_force_tag_retry():
+    """Failed teacher-force retry must not enter GRPO (or SFT)."""
+
+    n_eval = {"n": 0}
+
+    async def fail_eval(_md, *, diff_text, timeout_sec):
+        n_eval["n"] += 1
+        return swe.EvalResult(0.0, True)
+
+    async def run_case(monkeypatch):
+        tok = FakeTokenizer()
+        sandbox_factory = FakeSandbox.factory(on_launch=_anthropic_agent)
+        _patch_generate(monkeypatch, tok, sandbox_factory)
+        _patch_sglang_turns(monkeypatch, tok, 4)
+        monkeypatch.setattr(gen.asyncio, "sleep", _fast_sleep)
+        monkeypatch.setattr(swe, "run_evaluation", fail_eval)
+        monkeypatch.setenv("OFFLOAD_FORCE_TAG_PROB", "1")
+
+        sample = _base_sample()
+        sample.index = 3
+        samples = await gen.generate(_args(), sample, sampling_params={"max_new_tokens": 32})
+
+        assert n_eval["n"] == 2
+        assert samples, "first-pass unsolved GRPO should still train"
+        assert all(not str(s.session_id or "").endswith("-force") for s in samples)
+        assert all(not str((s.metadata or {}).get("session_id") or "").endswith("-force") for s in samples)
+        assert all(not (s.metadata or {}).get("offload_force_retry") for s in samples)
+        assert all(float((s.metadata or {}).get("solved") or 0) != 1.0 for s in samples)
+        assert all((s.metadata or {}).get("objective") != "sft" for s in samples)
+        rids = [s.rollout_id for s in samples]
+        assert None not in rids
+        assert len(set(rids)) == 1
+
+    with pytest.MonkeyPatch.context() as mp:
+        asyncio.run(run_case(mp))
+
+
+def test_generate_keeps_solved_force_tag_retry():
+    """Retry that actually solves is concatenated onto first-pass GRPO."""
+
+    n_eval = {"n": 0}
+
+    async def fail_then_pass(_md, *, diff_text, timeout_sec):
+        n_eval["n"] += 1
+        return swe.EvalResult(0.0 if n_eval["n"] == 1 else 1.0, True)
+
+    async def run_case(monkeypatch):
+        tok = FakeTokenizer()
+        sandbox_factory = FakeSandbox.factory(on_launch=_anthropic_agent)
+        _patch_generate(monkeypatch, tok, sandbox_factory)
+        _patch_sglang_turns(monkeypatch, tok, 4)
+        monkeypatch.setattr(gen.asyncio, "sleep", _fast_sleep)
+        monkeypatch.setattr(swe, "run_evaluation", fail_then_pass)
+        async def nonempty_diff(_sb, _workdir):
+            return "diff --git a/f.py b/f.py\n+fixed\n"
+
+        monkeypatch.setattr(swe, "git_diff", nonempty_diff)
+        monkeypatch.setenv("OFFLOAD_FORCE_TAG_PROB", "1")
+
+        sample = _base_sample()
+        sample.index = 5
+        samples = await gen.generate(_args(), sample, sampling_params={"max_new_tokens": 32})
+
+        assert n_eval["n"] == 2
+        retry = [
+            s
+            for s in samples
+            if str(s.session_id or "").endswith("-force")
+            or str((s.metadata or {}).get("session_id") or "").endswith("-force")
+        ]
+        first = [s for s in samples if s not in retry]
+        assert first, "unsolved first pass stays in GRPO"
+        assert retry, "solved retry should enter GRPO"
+        assert all(
+            float((s.metadata or {}).get("solved") or 0) == 1.0 or (s.metadata or {}).get("grading_solved")
+            for s in retry
+        )
+        rids = [s.rollout_id for s in samples]
+        assert None not in rids
+        assert len(set(rids)) == 1
 
     with pytest.MonkeyPatch.context() as mp:
         asyncio.run(run_case(mp))

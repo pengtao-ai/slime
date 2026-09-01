@@ -4,10 +4,11 @@
 from __future__ import annotations
 
 import os
+import random
 import sys
 from pathlib import Path
 
-_REPO = Path(__file__).resolve().parents[2]
+_REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
 
 import pytest  # noqa: E402
@@ -15,13 +16,17 @@ import pytest  # noqa: E402
 from examples.coding_agent_rl import offload  # noqa: E402
 from examples.coding_agent_rl.offload_sft import (  # noqa: E402
     build_assistant_target,
+    build_multiturn_sft_messages,
     build_multiturn_sft_token_sequence,
     build_sft_samples,
     build_sft_token_sequence,
+    episode_has_valid_offload,
     post_process_rewards_grpo_only,
     turn_eligible_for_sft,
 )
 from slime.utils.types import Sample  # noqa: E402
+
+NUM_GPUS = 0
 
 
 class _FakeTok:
@@ -373,6 +378,33 @@ def test_build_assistant_target_offload_tag_toggle() -> None:
     assert "local planwhy" in (without_tag.get("reasoning_content") or "")
 
 
+def test_forced_offload_sft_keeps_tag_even_if_tag_prob_zero() -> None:
+    prev = os.environ.get("OFFLOAD_SFT_TAG_PROB")
+    os.environ["OFFLOAD_SFT_TAG_PROB"] = "0"
+    try:
+        tc = {
+            "valid_offload": True,
+            "forced_offload": True,
+            "n": 5,
+            "slm_raw_output": "local plan",
+            "qwen_think_prefix": "local plan",
+            "teacher_think": "why",
+            "teacher_content": "do",
+            "teacher_tool_calls": [],
+            "sft_history_messages": [{"role": "user", "content": "fix"}],
+        }
+        out = build_multiturn_sft_messages([tc], rng=random.Random(0))
+        assert out is not None
+        messages, idxs = out
+        asst = messages[max(idxs)]
+        assert offload.OFFLOAD_OPEN in (asst.get("reasoning_content") or "")
+    finally:
+        if prev is None:
+            os.environ.pop("OFFLOAD_SFT_TAG_PROB", None)
+        else:
+            os.environ["OFFLOAD_SFT_TAG_PROB"] = prev
+
+
 def test_sft_tool_calls_accept_openai_json_arguments() -> None:
     tok = _FakeTok()
     history = [{"role": "user", "content": "fix B.py"}]
@@ -444,8 +476,40 @@ def test_build_sft_samples_emits_one_multiturn_row() -> None:
     assert out[0].rollout_id == 7
     assert sum(out[0].loss_mask) > 0
 
-    assert build_sft_samples(grpo_samples=[grpo], tokenizer=tok, grading_solved=False) == []
+    fail_out = build_sft_samples(grpo_samples=[grpo], tokenizer=tok, grading_solved=False)
+    assert fail_out == []
     os.environ.pop("OFFLOAD_SFT_TAG_PROB", None)
+    os.environ.pop("OFFLOAD_SFT_LAMBDA", None)
+
+
+def test_build_sft_samples_includes_solo_pass_skips_fail() -> None:
+    tok = _FakeTok()
+    os.environ["OFFLOAD_SFT_LAMBDA"] = "0.1"
+    solo = {
+        "slm_raw_output": "I can do this",
+        "sft_history_messages": [{"role": "user", "content": "q"}],
+    }
+    grpo = Sample(
+        index=3,
+        tokens=[1, 2, 3],
+        response_length=2,
+        loss_mask=[1, 1],
+        reward=1.0,
+        metadata={"grading_solved": True, "turn_costs": [solo]},
+    )
+    assert not episode_has_valid_offload([solo])
+    out = build_sft_samples(grpo_samples=[grpo], tokenizer=tok, grading_solved=True)
+    assert len(out) == 1
+    unsolved = Sample(
+        index=4,
+        tokens=[1, 2, 3],
+        response_length=2,
+        loss_mask=[1, 1],
+        reward=0.0,
+        metadata={"grading_solved": False, "turn_costs": [solo]},
+    )
+    assert build_sft_samples(grpo_samples=[unsolved], tokenizer=tok, grading_solved=False) == []
+    os.environ.pop("OFFLOAD_SFT_LAMBDA", None)
 
 
 def test_sft_max_samples_keeps_last_turns() -> None:
@@ -601,8 +665,10 @@ if __name__ == "__main__":
     test_multiturn_history_reset_keeps_longest_segment()
     test_build_assistant_target_merges_slm_and_glm_think()
     test_build_assistant_target_offload_tag_toggle()
+    test_forced_offload_sft_keeps_tag_even_if_tag_prob_zero()
     test_sft_tool_calls_accept_openai_json_arguments()
     test_build_sft_samples_emits_one_multiturn_row()
+    test_build_sft_samples_includes_solo_pass_skips_fail()
     test_sft_max_samples_keeps_last_turns()
     test_sft_left_trims_old_history_keeps_tail()
     test_post_process_skips_sft_in_group()

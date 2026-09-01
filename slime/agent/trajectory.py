@@ -12,12 +12,28 @@ from __future__ import annotations
 import dataclasses
 import enum
 import logging
+import os
 from collections.abc import Iterator
 from typing import Any
 
 from slime.utils.types import Sample
 
 logger = logging.getLogger(__name__)
+
+
+def _output_has_offload_tag(output_ids: list[int]) -> bool:
+    """True if the abandoned response contains an offload OPEN/CLOSE token."""
+
+    def _tid(name: str, default: int) -> int:
+        raw = (os.environ.get(name) or str(default)).strip()
+        try:
+            return int(raw)
+        except ValueError:
+            return default
+
+    open_id = _tid("OFFLOAD_OPEN_TOKEN_ID", 248077)
+    close_id = _tid("OFFLOAD_CLOSE_TOKEN_ID", 248078)
+    return any(t == open_id or t == close_id for t in output_ids)
 
 
 # ===========================================================================
@@ -451,7 +467,9 @@ class TrajectoryManager:
         a cleanup. So we merge only when the mount point has exactly one assistant
         child that is a leaf, generated (``turn`` set), and short (response <
         ``fork_threshold``), and fork otherwise, since absorbing destroys a
-        generated TurnRecord irreversibly.
+        generated TurnRecord irreversibly. Offload OPEN/CLOSE tags are 3 tokens
+        so they always look "short"; never demote those — the tag is the
+        trainable help-seeking action.
         """
         if self._fork_threshold <= 0:
             return node, depth  # feature off
@@ -475,6 +493,7 @@ class TrajectoryManager:
             rewritten_node.children
             or rewritten_node.turn is None
             or len(rewritten_node.turn.output_ids) >= self._fork_threshold
+            or _output_has_offload_tag(rewritten_node.turn.output_ids)
         ):
             return node, depth
 

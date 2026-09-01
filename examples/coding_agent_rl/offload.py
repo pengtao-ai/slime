@@ -35,6 +35,19 @@ Train shaping (when ``SLIME_AGENT_OFFLOAD=1``):
     unrepaired spam (``OFFLOAD_COMPACT_ORPHAN_OPEN_K``, default 1).
   - Post-decode :func:`truncate_offload_open_spam` cuts runaway OPEN spam before
     GLM / agent flush (does not stop SGLang mid-generate).
+  - Optional teacher-force tag (``OFFLOAD_FORCE_TAG_PROB``, default off): first
+    agent pass never splices (keep solo solves clean). If that pass is unsolved
+    and p>0, ``generate()`` keeps the failed traj for GRPO and retries with
+    insert enabled, unless first-pass offload turns are already ≥
+    ``OFFLOAD_FORCE_TAG_TRAJ_FRAC`` (launcher 0.3). A solved retry joins GRPO
+    (and SFT); an unsolved or aborted retry is discarded. Group size may exceed
+    ``n_samples_per_prompt`` when the retry solves. On retry, skip if this turn
+    already has a tag, or retry offload turns are already ≥ the same frac. Else
+    splice
+    ``OPEN+N+CLOSE`` inside think with independent probability (launcher 0.5),
+    **drop all SLM text after the tag**, then call GLM on the normal offload
+    path. Prefix SLM tokens stay trainable; the spliced tag and GLM suffix are
+    ``loss_mask=0``. ``N`` uniform 0–9. At most once per turn.
   - Hard compact filter + group α:
     :func:`compact_and_shape_group_help_seeking_rewards`.
   - Turn-painted advantages:
@@ -51,6 +64,7 @@ import copy
 import json
 import logging
 import os
+import random
 import re
 import secrets
 from typing import Any
@@ -225,6 +239,230 @@ def offload_close_token_id() -> int:
     return int(os.environ.get("OFFLOAD_CLOSE_TOKEN_ID", str(DEFAULT_OFFLOAD_CLOSE_TOKEN_ID)))
 
 
+def force_tag_prob() -> float:
+    """Independent per-turn splice probability on the unsolved retry pass.
+
+    Default 0: off. Launcher sets 0.5. The first (solo) pass never splices.
+    """
+    raw = (os.environ.get("OFFLOAD_FORCE_TAG_PROB") or "0").strip()
+    try:
+        return min(1.0, max(0.0, float(raw)))
+    except ValueError:
+        return 0.0
+
+
+def force_tag_traj_frac() -> float:
+    """Skip teacher-force when offload turns / completed turns ≥ this.
+
+    Default 0.3. 0 disables the cap. Launcher sets 0.3.
+    """
+    raw = (os.environ.get("OFFLOAD_FORCE_TAG_TRAJ_FRAC") or "0.3").strip()
+    try:
+        return min(1.0, max(0.0, float(raw)))
+    except ValueError:
+        return 0.3
+
+
+def force_tag_min_turn() -> int:
+    """Earliest 0-based agent turn that may be teacher-forced. Default 0."""
+    raw = (os.environ.get("OFFLOAD_FORCE_TAG_MIN_TURN") or "0").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def force_tag_max_per_session() -> int:
+    """Optional absolute cap on forced tags per episode. 0 = no extra cap."""
+    raw = (os.environ.get("OFFLOAD_FORCE_TAG_MAX") or "0").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def force_tag_n_pin() -> int | None:
+    """Optional ``OFFLOAD_FORCE_TAG_N`` pin; ``None`` means sample 0–9."""
+    raw = (os.environ.get("OFFLOAD_FORCE_TAG_N") or "").strip()
+    if not raw:
+        return None
+    try:
+        return min(9, max(0, int(raw)))
+    except ValueError:
+        return None
+
+
+def sample_force_tag_n(rng: random.Random | None = None) -> int:
+    """Digit N for a forced span: uniform ``{0…9}`` unless ``OFFLOAD_FORCE_TAG_N`` is set."""
+    pinned = force_tag_n_pin()
+    if pinned is not None:
+        return pinned
+    rnd = rng if rng is not None else random
+    return rnd.randint(0, 9)
+
+
+def splice_offload_tag_inside_think(
+    raw: str,
+    n: int,
+    *,
+    rng: random.Random | None = None,
+) -> str:
+    """Insert ``OPEN+N+CLOSE`` in think and drop everything after the tag.
+
+    Think is ``raw`` up to the first ``</think>`` (or the whole string if the
+    turn is still unclosed). The span is placed at a random offset; text after
+    it (rest of think and any visible tail) is discarded so GLM continues from
+    this prefix like a natural mid-think stop.
+    """
+    digit = min(9, max(0, int(n)))
+    span = f"{OFFLOAD_OPEN}{digit}{OFFLOAD_CLOSE}"
+    text = raw or ""
+    close_idx = text.find("</think>")
+    think = text if close_idx < 0 else text[:close_idx]
+    rnd = rng if rng is not None else random
+    pos = rnd.randint(0, len(think)) if think else 0
+    return think[:pos] + span
+
+
+def force_offload_eligible(raw_output: str) -> bool:
+    """True if this SLM turn can take a spliced in-think tag."""
+    text = raw_output or ""
+    if not text.strip():
+        return False
+    if OFFLOAD_OPEN in text or OFFLOAD_CLOSE in text:
+        return False
+    if "</think>" in text:
+        return False
+    return True
+
+
+def _session_turn_index(session: Session) -> int:
+    timing = getattr(session, "timing", None) or {}
+    return int((timing or {}).get("current_turn", 0) or 0)
+
+
+def offload_turn_frac(stats: dict[str, Any] | None) -> float:
+    """Fraction of completed turns that already offloaded (natural or forced)."""
+    turns = (stats or {}).get("turn_costs") or []
+    n = 0
+    n_off = 0
+    for tc in turns:
+        if not isinstance(tc, dict):
+            continue
+        n += 1
+        if tc.get("valid_offload") or tc.get("forced_offload"):
+            n_off += 1
+    if n <= 0:
+        return 0.0
+    return n_off / n
+
+
+def session_offload_turn_frac(session: Session) -> float:
+    """Fraction of completed turns that already offloaded (natural or forced)."""
+    return offload_turn_frac(_ensure_stats(session))
+
+
+def session_allow_force_tag(session: Session) -> bool:
+    """True only on the unsolved retry pass (``allow_force_tag``)."""
+    stats = _ensure_stats(session)
+    if stats.get("grading_solved") is True:
+        return False
+    return bool(stats.get("allow_force_tag"))
+
+
+def should_retry_unsolved_with_force_tag(
+    *,
+    evaluation: bool,
+    solved: float,
+    metadata: dict[str, Any] | None,
+    offload_stats: dict[str, Any] | None = None,
+) -> bool:
+    """First pass failed and teacher-force is on → keep that GRPO traj and rerun with insert.
+
+    Skip retry when the first pass already offloaded on ≥ ``OFFLOAD_FORCE_TAG_TRAJ_FRAC``
+    of completed turns (launcher 0.3): those episodes do not need a force-tag rerun.
+    """
+    if evaluation:
+        return False
+    if force_tag_prob() <= 0.0:
+        return False
+    if float(solved) == 1.0:
+        return False
+    if (metadata or {}).get("offload_force_retry"):
+        return False
+    cap = force_tag_traj_frac()
+    if cap > 0.0 and offload_turn_frac(offload_stats) >= cap:
+        return False
+    return True
+
+
+def decide_force_offload(
+    session: Session,
+    *,
+    raw_output: str,
+    rng: random.Random | None = None,
+) -> bool:
+    """Skip unless this is a failed-episode retry under the 30% / Bernoulli caps."""
+    if force_tag_prob() <= 0.0:
+        return False
+    if not session_allow_force_tag(session):
+        return False
+    if not force_offload_eligible(raw_output):
+        return False
+    cap = force_tag_traj_frac()
+    if cap > 0.0 and session_offload_turn_frac(session) >= cap:
+        return False
+    turn_index = _session_turn_index(session)
+    if turn_index < force_tag_min_turn():
+        return False
+    stats = _ensure_stats(session)
+    if stats.get("force_tag_last_turn") == turn_index:
+        return False
+    abs_max = force_tag_max_per_session()
+    if abs_max > 0 and int(stats.get("forced_offload_count", 0) or 0) >= abs_max:
+        return False
+    rnd = rng if rng is not None else random
+    return bool(rnd.random() < force_tag_prob())
+
+
+def append_forced_offload_span(
+    turn: TurnRecord,
+    *,
+    raw_output: str,
+    tokenizer: Any,
+    n: int | None = None,
+    rng: random.Random | None = None,
+) -> str | None:
+    """Truncate at a spliced OPEN+N+CLOSE; prefix stays trainable, tag is mask=0."""
+    if tokenizer is None:
+        return None
+    digit = sample_force_tag_n(rng) if n is None else min(9, max(0, int(n)))
+    new_raw = splice_offload_tag_inside_think(raw_output or "", digit, rng=rng)
+    if parse_valid_offload_directive(new_raw) is None:
+        return None
+    span = f"{OFFLOAD_OPEN}{digit}{OFFLOAD_CLOSE}"
+    try:
+        new_ids = list(tokenizer.encode(new_raw, add_special_tokens=False))
+        tag_ids = list(tokenizer.encode(span, add_special_tokens=False))
+    except Exception:
+        logger.exception("[coding_agent_offload] failed to encode forced offload tag")
+        return None
+    if not new_ids or not tag_ids:
+        return None
+    n_tag = len(tag_ids) if new_ids[-len(tag_ids) :] == tag_ids else 0
+    n_pre = len(new_ids) - n_tag
+    ids = turn.output_ids
+    ids.clear()
+    ids.extend(new_ids)
+    mask = turn.output_loss_mask
+    mask.clear()
+    mask.extend([1] * n_pre + [0] * n_tag)
+    lps = turn.output_log_probs
+    lps.clear()
+    lps.extend([0.0] * len(new_ids))
+    return new_raw
+
+
 def truncate_open_run_limit() -> int:
     return int(os.environ.get("OFFLOAD_TRUNCATE_OPEN_RUN", str(DEFAULT_OFFLOAD_TRUNCATE_OPEN_RUN)))
 
@@ -310,6 +548,12 @@ def resolved_train_config() -> dict[str, Any]:
         "OFFLOAD_SFT_MAX_SAMPLES": offload_sft.sft_max_samples(),
         "OFFLOAD_SFT_MAX_SEQ_LEN": offload_sft.sft_max_seq_len(),
         "OFFLOAD_SFT_TAG_PROB": offload_sft.sft_tag_prob(),
+        "OFFLOAD_FORCE_TAG_PROB": force_tag_prob(),
+        "OFFLOAD_FORCE_TAG_TRAJ_FRAC": force_tag_traj_frac(),
+        "OFFLOAD_FORCE_TAG_ON_FAIL_ONLY": True,
+        "OFFLOAD_FORCE_TAG_MIN_TURN": force_tag_min_turn(),
+        "OFFLOAD_FORCE_TAG_MAX": force_tag_max_per_session(),
+        "OFFLOAD_FORCE_TAG_N": force_tag_n_pin() if force_tag_n_pin() is not None else "random",
         "OFFLOAD_COMPACT_ORPHAN_OPEN_K": int(
             os.environ.get("OFFLOAD_COMPACT_ORPHAN_OPEN_K", str(DEFAULT_COMPACT_ORPHAN_OPEN_K))
         ),
@@ -546,10 +790,14 @@ def _ensure_stats(session: Session) -> dict[str, Any]:
                 "last_reasoning_effort": None,
                 "turn_costs": [],
                 "max_steps_reached": False,
+                "forced_offload_count": 0,
+                "allow_force_tag": False,
             }
         )
     stats.setdefault("turn_costs", [])
     stats.setdefault("max_steps_reached", False)
+    stats.setdefault("forced_offload_count", 0)
+    stats.setdefault("allow_force_tag", False)
     return stats
 
 
@@ -796,6 +1044,7 @@ def record_local_turn_tokens(session: Session, turn: TurnRecord, *, raw_output: 
         "valid_offload": valid_offload,
         "outside_think": outside,
         "repaired": False,
+        "forced_offload": False,
         "orphan_open_count": int(tag["orphan_open_count"]),
         "malformed_count": int(tag["malformed_count"]),
         "open_count": int(tag["open_count"]),
@@ -1464,7 +1713,33 @@ async def apply_offload_if_needed(
                 len(raw_output),
             )
 
+    forced = False
+    if (
+        tokenizer is not None
+        and parse_valid_offload_directive(raw_output) is None
+        and parse_offload_directive(raw_output) is None
+        and decide_force_offload(session, raw_output=raw_output)
+    ):
+        digit = sample_force_tag_n()
+        new_raw = append_forced_offload_span(
+            turn, raw_output=raw_output, tokenizer=tokenizer, n=digit
+        )
+        if new_raw is not None and parse_valid_offload_directive(new_raw) is not None:
+            raw_output = new_raw
+            forced = True
+            stats = _ensure_stats(session)
+            stats["forced_offload_count"] = int(stats.get("forced_offload_count", 0) or 0) + 1
+            stats["force_tag_last_turn"] = _session_turn_index(session)
+            logger.info(
+                "[coding_agent_offload] sid=%s forced offload tag N=%d turn=%d",
+                sid,
+                digit,
+                _session_turn_index(session),
+            )
+
     turn_entry = record_local_turn_tokens(session, turn, raw_output=raw_output)
+    if forced:
+        turn_entry["forced_offload"] = True
     parsed = parse_valid_offload_directive(raw_output)
     repaired = False
     if parsed is None:
@@ -2041,16 +2316,11 @@ def compact_should_remove_sample(sample: Any) -> tuple[bool, str | None]:
 
     md = getattr(sample, "metadata", None) or {}
     status = getattr(sample, "status", None)
-    abort_reason = str(md.get("abort_reason") or "")
 
     if status == getattr(_Sample.Status, "TRUNCATED", None) or str(status).endswith("TRUNCATED"):
         return True, "truncated"
-    if md.get("timeout") or "timeout" in abort_reason.lower():
-        return True, "timeout"
-    if status == getattr(_Sample.Status, "ABORTED", None) and "timeout" in abort_reason.lower():
-        return True, "timeout"
-    if md.get("max_steps_reached") or stats_flag_max_steps(md) or abort_reason == "max_turns":
-        return True, "max_steps"
+    # timeout / max_steps stay in the GRPO group: those are the hard prompts
+    # that should learn to offload. Tag-spam filters below still apply.
 
     stats = md.get("offload_stats") or {}
     tags = _aggregate_tag_counts(stats)
@@ -2086,7 +2356,7 @@ def stats_flag_max_steps(md: dict[str, Any]) -> bool:
 
 
 def compact_filter_offload_samples(args: Any, groups: list) -> None:
-    """Hard-remove truncated / timeout / max-steps / tag-spam trajectories."""
+    """Hard-remove truncated / tag-spam trajectories (not timeout or max_steps)."""
     del args
     for group in groups:
         for item in group:
@@ -2123,7 +2393,9 @@ def _session_has_valid_seek(metadata: dict[str, Any] | None) -> bool:
     turn_costs = list(md.get("turn_costs") or stats.get("turn_costs") or [])
     if turn_costs:
         return any(
-            bool(tc.get("valid_offload")) and not tc.get("repaired") and not tc.get("outside_think")
+            bool(tc.get("valid_offload"))
+            and not tc.get("repaired")
+            and not tc.get("outside_think")
             for tc in turn_costs
             if isinstance(tc, dict)
         )
@@ -2151,6 +2423,31 @@ def _session_segments(group_item: Any) -> list[Any]:
     if group_item is None or _is_sft_sample(group_item):
         return []
     return [group_item]
+
+
+def _help_seeking_sessions(group_item: Any) -> list[list[Any]]:
+    """Split one group slot into α sessions by ``session_id``.
+
+    Compact fan-out of a single episode shares a session_id (or has none, treated
+    as one session). First-pass + force-retry concatenated into the same list
+    have different session_ids and must get independent α.
+    """
+    segs = _session_segments(group_item)
+    if not segs:
+        return []
+    buckets: dict[str, list[Any]] = {}
+    order: list[str] = []
+    for sample in segs:
+        sid = getattr(sample, "session_id", None)
+        if not sid:
+            md = getattr(sample, "metadata", None) or {}
+            sid = md.get("session_id") if isinstance(md, dict) else None
+        key = str(sid) if sid else ""
+        if key not in buckets:
+            buckets[key] = []
+            order.append(key)
+        buckets[key].append(sample)
+    return [buckets[k] for k in order]
 
 
 def _write_session_turn_rewards(
@@ -2196,7 +2493,9 @@ def shape_group_help_seeking_rewards(args: Any, groups: list) -> None:
     no_seek_pen = no_seek_penalty()
 
     for group in groups:
-        sessions = [_session_segments(item) for item in group]
+        sessions: list[list[Any]] = []
+        for item in group:
+            sessions.extend(_help_seeking_sessions(item))
         sessions = [segs for segs in sessions if segs]
         if not sessions:
             continue

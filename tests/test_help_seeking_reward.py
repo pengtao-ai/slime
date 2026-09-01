@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import random
 from types import SimpleNamespace
 
 import pytest
 
 from examples.coding_agent_rl import offload
+from slime.agent.trajectory import TurnRecord
 
 NUM_GPUS = 0
 
@@ -162,6 +164,27 @@ def test_shape_group_fanout_segments(monkeypatch):
     offload.shape_group_help_seeking_rewards(None, [[[seg0, seg1], other]])
     assert seg0.reward == pytest.approx(0.1)
     assert seg1.reward == pytest.approx(0.1)
+    assert other.reward == pytest.approx(-0.1)
+
+
+def test_shape_group_splits_force_retry_by_session_id(monkeypatch):
+    """First-pass fail + force-retry in one fan-out list are independent α sessions."""
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
+    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
+    monkeypatch.setenv("OFFLOAD_NO_SEEK_PENALTY", "0.1")
+    first_fail = _sample(reward=0.0, solved=0.0, oc=0)
+    first_fail.session_id = "ep1"
+    first_fail.metadata["session_id"] = "ep1"
+    retry = _sample(reward=0.0, solved=0.0, oc=1)
+    retry.session_id = "ep1-force"
+    retry.metadata["session_id"] = "ep1-force"
+    other = _sample(reward=0.0, solved=0.0, oc=0)
+    other.session_id = "ep2"
+    other.metadata["session_id"] = "ep2"
+    offload.shape_group_help_seeking_rewards(None, [[[first_fail, retry], other]])
+    assert first_fail.reward == pytest.approx(-0.1)
+    assert retry.reward == pytest.approx(0.1)
     assert other.reward == pytest.approx(-0.1)
 
 
@@ -481,7 +504,7 @@ def test_compact_special_ratio_uses_unmatched_marks_only():
     assert reason == "special_token_ratio"
 
 
-def test_compact_removes_timeout_and_max_steps():
+def test_compact_keeps_timeout_and_max_steps():
     from slime.utils.types import Sample
 
     s1 = Sample(
@@ -490,7 +513,7 @@ def test_compact_removes_timeout_and_max_steps():
         response="",
         response_length=0,
         status=Sample.Status.ABORTED,
-        metadata={"abort_reason": "wall_clock_timeout", "timeout": True},
+        metadata={"abort_reason": "wall_clock_timeout", "timeout": True, "offload_stats": {}},
     )
     s2 = Sample(
         index=1,
@@ -500,8 +523,218 @@ def test_compact_removes_timeout_and_max_steps():
         status=Sample.Status.COMPLETED,
         metadata={"max_steps_reached": True, "offload_stats": {}},
     )
-    assert offload.compact_should_remove_sample(s1)[0]
-    assert offload.compact_should_remove_sample(s2)[0]
+    assert offload.compact_should_remove_sample(s1) == (False, None)
+    assert offload.compact_should_remove_sample(s2) == (False, None)
+
+
+def test_force_offload_eligible():
+    assert offload.force_offload_eligible("still thinking about the bug")
+    assert not offload.force_offload_eligible("")
+    assert not offload.force_offload_eligible(f"x {offload.OFFLOAD_OPEN}")
+    assert not offload.force_offload_eligible("done </think>\nbody")
+
+
+def test_decide_force_offload_off_by_default(monkeypatch):
+    monkeypatch.delenv("OFFLOAD_FORCE_TAG_PROB", raising=False)
+    session = SimpleNamespace(offload_stats={}, timing={"current_turn": 3})
+    assert not offload.decide_force_offload(session, raw_output="thinking")
+
+
+class _Always:
+    def random(self):
+        return 0.0
+
+
+class _Never:
+    def random(self):
+        return 1.0
+
+
+def test_decide_force_offload_skips_high_frac_and_uses_bernoulli(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_FORCE_TAG_PROB", "0.5")
+    monkeypatch.setenv("OFFLOAD_FORCE_TAG_TRAJ_FRAC", "0.3")
+    monkeypatch.setenv("OFFLOAD_FORCE_TAG_MIN_TURN", "0")
+    monkeypatch.setenv("OFFLOAD_FORCE_TAG_MAX", "0")
+    session = SimpleNamespace(
+        offload_stats={"turn_costs": [], "allow_force_tag": True},
+        timing={"current_turn": 0},
+    )
+    tagged = f"plan {offload.OFFLOAD_OPEN}3{offload.OFFLOAD_CLOSE}"
+    assert not offload.decide_force_offload(session, raw_output=tagged, rng=_Always())
+    # independent 50%: random() < 0.5
+    assert offload.decide_force_offload(session, raw_output="thinking", rng=_Always())
+    assert not offload.decide_force_offload(session, raw_output="thinking", rng=_Never())
+    # 1/5 = 20% < 30%: still eligible (not every-other-turn)
+    session.offload_stats["turn_costs"] = [
+        {"valid_offload": True},
+        {},
+        {},
+        {},
+        {},
+    ]
+    session.timing = {"current_turn": 5}
+    assert offload.session_offload_turn_frac(session) == pytest.approx(0.2)
+    assert offload.decide_force_offload(session, raw_output="thinking", rng=_Always())
+    # 2/5 = 40% ≥ 30%: already over cap, do not insert
+    session.offload_stats["turn_costs"] = [
+        {"valid_offload": True},
+        {"forced_offload": True},
+        {},
+        {},
+        {},
+    ]
+    assert offload.session_offload_turn_frac(session) == pytest.approx(0.4)
+    assert not offload.decide_force_offload(session, raw_output="thinking", rng=_Always())
+    # 3/10 = 30% reaches cap → skip
+    session.offload_stats["turn_costs"] = [
+        {"valid_offload": True},
+        {"forced_offload": True},
+        {"valid_offload": True},
+        {},
+        {},
+        {},
+        {},
+        {},
+        {},
+        {},
+    ]
+    assert offload.session_offload_turn_frac(session) == pytest.approx(0.3)
+    assert not offload.decide_force_offload(session, raw_output="thinking", rng=_Always())
+    session.offload_stats["turn_costs"] = []
+    session.offload_stats["force_tag_last_turn"] = 5
+    session.timing = {"current_turn": 5}
+    assert not offload.decide_force_offload(session, raw_output="thinking", rng=_Always())
+
+
+def test_decide_force_offload_only_on_failed_retry(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_FORCE_TAG_PROB", "0.5")
+    monkeypatch.setenv("OFFLOAD_FORCE_TAG_TRAJ_FRAC", "0.3")
+    monkeypatch.setenv("OFFLOAD_FORCE_TAG_MIN_TURN", "0")
+    monkeypatch.setenv("OFFLOAD_FORCE_TAG_MAX", "0")
+    session = SimpleNamespace(offload_stats={"turn_costs": []}, timing={"current_turn": 0})
+    # first (solo) pass: no insert even if the coin would land
+    assert not offload.session_allow_force_tag(session)
+    assert not offload.decide_force_offload(session, raw_output="thinking", rng=_Always())
+    # unsolved retry pass
+    session.offload_stats["allow_force_tag"] = True
+    assert offload.decide_force_offload(session, raw_output="thinking", rng=_Always())
+    # known solve still blocked
+    session.offload_stats["grading_solved"] = True
+    assert not offload.decide_force_offload(session, raw_output="thinking", rng=_Always())
+    assert not offload.should_retry_unsolved_with_force_tag(
+        evaluation=False, solved=1.0, metadata={}
+    )
+    assert offload.should_retry_unsolved_with_force_tag(
+        evaluation=False, solved=0.0, metadata={}
+    )
+    assert offload.should_retry_unsolved_with_force_tag(
+        evaluation=False,
+        solved=0.0,
+        metadata={},
+        offload_stats={"turn_costs": [{"valid_offload": True}, *([{}] * 9)]},
+    )
+    assert not offload.should_retry_unsolved_with_force_tag(
+        evaluation=False,
+        solved=0.0,
+        metadata={},
+        offload_stats={"turn_costs": [{"valid_offload": True}] * 3 + [{}] * 7},
+    )
+    assert not offload.should_retry_unsolved_with_force_tag(
+        evaluation=False, solved=0.0, metadata={"offload_force_retry": True}
+    )
+    assert not offload.should_retry_unsolved_with_force_tag(
+        evaluation=True, solved=0.0, metadata={}
+    )
+
+
+def test_append_forced_offload_span_masks_tag():
+    class _Tok:
+        def encode(self, text, add_special_tokens=False):
+            return [ord(c) for c in text]
+
+    turn = TurnRecord(
+        prompt_ids=[1],
+        output_ids=[10, 11, 12],
+        finish_reason="stop",
+        output_log_probs=[0.1, 0.1, 0.1],
+    )
+    raw = "still thinking"
+    out = offload.append_forced_offload_span(turn, raw_output=raw, tokenizer=_Tok(), n=5)
+    assert out is not None
+    assert offload.OFFLOAD_OPEN in out and offload.OFFLOAD_CLOSE in out
+    assert out.endswith("</think>") is False
+    close_idx = out.find("</think>")
+    think = out if close_idx < 0 else out[:close_idx]
+    assert think.count(f"{offload.OFFLOAD_OPEN}5{offload.OFFLOAD_CLOSE}") == 1
+    parsed = offload.parse_valid_offload_directive(out)
+    assert parsed is not None and parsed[0] == 5
+    span = f"{offload.OFFLOAD_OPEN}5{offload.OFFLOAD_CLOSE}"
+    assert out.endswith(span)
+    assert parsed[1] in "still thinking" or "still thinking".startswith(parsed[1])
+    assert 1 in turn.output_loss_mask
+    assert turn.output_loss_mask[-1] == 0
+    assert len(turn.output_log_probs) == len(turn.output_ids)
+    assert len(turn.output_loss_mask) == len(turn.output_ids)
+
+
+def test_compact_keeps_forced_offload():
+    from slime.utils.types import Sample
+
+    s = Sample(
+        index=0,
+        prompt="p",
+        response="",
+        response_length=10,
+        status=Sample.Status.COMPLETED,
+        metadata={
+            "turn_costs": [
+                {
+                    "valid_offload": True,
+                    "forced_offload": True,
+                    "orphan_open_count": 0,
+                    "open_count": 1,
+                    "close_count": 1,
+                }
+            ],
+            "offload_stats": {},
+        },
+    )
+    assert offload.compact_should_remove_sample(s) == (False, None)
+
+
+def test_force_tag_prob_is_independent_bernoulli(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_FORCE_TAG_PROB", "0.5")
+    assert offload.force_tag_prob() == pytest.approx(0.5)
+    monkeypatch.setenv("OFFLOAD_FORCE_TAG_PROB", "0.9")
+    assert offload.force_tag_prob() == pytest.approx(0.9)
+    monkeypatch.delenv("OFFLOAD_FORCE_TAG_TRAJ_FRAC", raising=False)
+    assert offload.force_tag_traj_frac() == pytest.approx(0.3)
+    monkeypatch.setenv("OFFLOAD_FORCE_TAG_TRAJ_FRAC", "0.3")
+    assert offload.force_tag_traj_frac() == pytest.approx(0.3)
+
+
+def test_sample_force_tag_n_uniform_or_pinned(monkeypatch):
+    monkeypatch.delenv("OFFLOAD_FORCE_TAG_N", raising=False)
+    seen = {offload.sample_force_tag_n(random.Random(i)) for i in range(40)}
+    assert seen <= set(range(10))
+    assert len(seen) >= 5
+    monkeypatch.setenv("OFFLOAD_FORCE_TAG_N", "7")
+    assert offload.sample_force_tag_n(random.Random(0)) == 7
+
+
+def test_splice_offload_tag_truncates_after_span():
+    rng = random.Random(0)
+    raw = "aaa</think>\ncall tool"
+    out = offload.splice_offload_tag_inside_think(raw, 3, rng=rng)
+    span = f"{offload.OFFLOAD_OPEN}3{offload.OFFLOAD_CLOSE}"
+    assert out.endswith(span)
+    assert "</think>" not in out
+    assert "call tool" not in out
+    assert offload.parse_valid_offload_directive(out) == (3, out[: -len(span)])
+    unclosed = offload.splice_offload_tag_inside_think("still thinking", 0, rng=random.Random(1))
+    assert "</think>" not in unclosed
+    assert unclosed.endswith(f"{offload.OFFLOAD_OPEN}0{offload.OFFLOAD_CLOSE}")
+    assert offload.parse_valid_offload_directive(unclosed)[0] == 0
 
 
 def test_compact_and_shape_group(monkeypatch):

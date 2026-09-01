@@ -2,12 +2,14 @@
 
 One long chat-template sequence per PASS episode: every assistant turn is
 supervised (``loss_mask=1`` on assistant spans; user/tool spans in the
-response tail stay 0). Offload turns use the GLM teacher continuation; other
-turns use the SLM rollout. On offload turns, ``reasoning_content`` is
-``slm_raw_output + teacher_think`` (same as ``compose_complete_assistant``);
-``<|llm_offload|>N<|/llm_offload|>`` is included with probability
-``OFFLOAD_SFT_TAG_PROB`` (default 0.3); otherwise the tag is stripped (GLM
-tail still supervised).
+response tail stay 0). Failed trajectories are not distilled. Offload turns
+use the GLM teacher continuation; other turns use the SLM rollout. On offload
+turns, ``reasoning_content`` is ``slm_raw_output + teacher_think`` (same as
+``compose_complete_assistant``); ``<|llm_offload|>N<|/llm_offload|>`` is
+included with probability ``OFFLOAD_SFT_TAG_PROB`` (default 0.3); otherwise
+the tag is stripped (GLM tail still supervised). Turns marked
+``forced_offload`` always keep the tag so teacher-force bootstrap actually
+trains the span.
 
 Assistant targets use separate ``reasoning_content`` + ``content`` fields (same
 as rollout history); do not embed ``<think>`` in ``content`` — the
@@ -360,6 +362,17 @@ def turn_eligible_for_sft(tc: dict[str, Any]) -> bool:
     return build_assistant_target(tc, include_offload_tag=False) is not None
 
 
+def episode_has_valid_offload(turn_costs: list[Any]) -> bool:
+    """True if any turn is a clean in-think offload (not repaired / outside-think)."""
+    return any(
+        isinstance(tc, dict)
+        and tc.get("valid_offload")
+        and not tc.get("repaired")
+        and not tc.get("outside_think")
+        for tc in turn_costs
+    )
+
+
 def _common_prefix_len(a: list[int], b: list[int]) -> int:
     n = min(len(a), len(b))
     i = 0
@@ -492,7 +505,10 @@ def build_multiturn_sft_messages(
     supervised_indices: set[int] = set()
     for i, tc in enumerate(eligible):
         hist = [_canonical_chat_message(m) for m in tc["sft_history_messages"]]
-        include_tag = bool(_offload_teacher_available(tc) and rnd.random() < tag_p)
+        include_tag = bool(
+            _offload_teacher_available(tc)
+            and (tc.get("forced_offload") or rnd.random() < tag_p)
+        )
         assistant = build_assistant_target(tc, include_offload_tag=include_tag)
         if assistant is None:
             return None
@@ -647,7 +663,10 @@ def build_sft_samples(
     tokenizer: Any,
     grading_solved: bool,
 ) -> list[Sample]:
-    """Emit one multiturn SFT ``Sample`` per solved episode (all assistant turns)."""
+    """Emit one multiturn SFT ``Sample`` per solved episode.
+
+    Failed trajectories are skipped. Solved rows (solo or with offload) are kept.
+    """
     if sft_lambda() <= 0.0:
         return []
     if not grading_solved or not grpo_samples or tokenizer is None:
@@ -667,7 +686,7 @@ def build_sft_samples(
     built = build_multiturn_sft_token_sequence(tokenizer, turn_costs)
     if built is None:
         logger.warning(
-            "[offload_sft] skip SFT for solved index=%s: multiturn build/tokenize failed (%d turns)",
+            "[offload_sft] skip SFT for index=%s: multiturn build/tokenize failed (%d turns)",
             int(getattr(base, "index", 0) or 0),
             len(turn_costs),
         )
@@ -698,7 +717,7 @@ def build_sft_samples(
             "sft_multiturn": True,
             "sft_assistant_turns": n_assistant,
             "instance_id": md.get("instance_id"),
-            "grading_solved": True,
+            "grading_solved": bool(grading_solved),
         },
         train_metadata={
             "objective": "sft",

@@ -912,6 +912,30 @@ def test_3_1_rewrite_merge_absorbs_short():
     print("PASS 3.1")
 
 
+def test_3_1b_rewrite_merge_keeps_offload_tag():
+    """3-token offload OPEN/CLOSE must fork, not be demoted to routing-only."""
+    mgr = TrajectoryManager()
+    sid = "3.1b"
+    s, u = sys_msg("S"), usr_msg("u")
+    a1_rw = asst_msg("tag ")
+    t1 = tool_msg("t")
+    append(
+        mgr,
+        sid,
+        [s, u],
+        "tag",
+        response_ids=[248077, 5, 248078],
+        finish_reason="tool_calls",
+    )
+    append(mgr, sid, [s, u, a1_rw, t1], "done")
+    assert len(_leaves(mgr, sid)) == 2, "offload tag rewrite must fork, not merge"
+    samples = get_traj(mgr, sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
+    assert len(samples) == 2
+    _check_invariants(samples)
+    _record("3.1b rewrite-merge keeps offload tag", mgr, sid, samples)
+    print("PASS 3.1b")
+
+
 def test_3_2_rewrite_merge_long_forks():
     mgr = TrajectoryManager(fork_threshold_tokens=1)  # r1 len 2 >= 1
     sid = "3.2"
@@ -1360,6 +1384,7 @@ _CASES = [
     test_2_11_routing_only_assistant_filtered,
     test_2_12_drop_clears_sid,
     test_3_1_rewrite_merge_absorbs_short,
+    test_3_1b_rewrite_merge_keeps_offload_tag,
     test_3_2_rewrite_merge_long_forks,
     test_3_3_rewrite_merge_threshold_zero_forks,
     test_3_4_rewrite_merge_ambiguous_forks,
