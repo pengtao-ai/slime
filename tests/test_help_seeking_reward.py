@@ -536,8 +536,10 @@ def test_force_offload_eligible():
 
 def test_decide_force_offload_off_by_default(monkeypatch):
     monkeypatch.delenv("OFFLOAD_FORCE_TAG_PROB", raising=False)
+    monkeypatch.delenv("OFFLOAD_ROUTE_PROB", raising=False)
     session = SimpleNamespace(offload_stats={}, timing={"current_turn": 3})
     assert not offload.decide_force_offload(session, raw_output="thinking")
+    assert not offload.decide_route_offload(session)
 
 
 class _Always:
@@ -556,14 +558,12 @@ def test_decide_force_offload_skips_high_frac_and_uses_bernoulli(monkeypatch):
     monkeypatch.setenv("OFFLOAD_FORCE_TAG_MIN_TURN", "0")
     monkeypatch.setenv("OFFLOAD_FORCE_TAG_MAX", "0")
     session = SimpleNamespace(
-        offload_stats={"turn_costs": [], "allow_force_tag": True},
+        offload_stats={"turn_costs": []},
         timing={"current_turn": 0},
     )
-    tagged = f"plan {offload.OFFLOAD_OPEN}3{offload.OFFLOAD_CLOSE}"
-    assert not offload.decide_force_offload(session, raw_output=tagged, rng=_Always())
     # independent 50%: random() < 0.5
-    assert offload.decide_force_offload(session, raw_output="thinking", rng=_Always())
-    assert not offload.decide_force_offload(session, raw_output="thinking", rng=_Never())
+    assert offload.decide_route_offload(session, rng=_Always())
+    assert not offload.decide_route_offload(session, rng=_Never())
     # 1/5 = 20% < 30%: still eligible (not every-other-turn)
     session.offload_stats["turn_costs"] = [
         {"valid_offload": True},
@@ -574,7 +574,7 @@ def test_decide_force_offload_skips_high_frac_and_uses_bernoulli(monkeypatch):
     ]
     session.timing = {"current_turn": 5}
     assert offload.session_offload_turn_frac(session) == pytest.approx(0.2)
-    assert offload.decide_force_offload(session, raw_output="thinking", rng=_Always())
+    assert offload.decide_route_offload(session, rng=_Always())
     # 2/5 = 40% ≥ 30%: already over cap, do not insert
     session.offload_stats["turn_costs"] = [
         {"valid_offload": True},
@@ -584,7 +584,7 @@ def test_decide_force_offload_skips_high_frac_and_uses_bernoulli(monkeypatch):
         {},
     ]
     assert offload.session_offload_turn_frac(session) == pytest.approx(0.4)
-    assert not offload.decide_force_offload(session, raw_output="thinking", rng=_Always())
+    assert not offload.decide_route_offload(session, rng=_Always())
     # 3/10 = 30% reaches cap → skip
     session.offload_stats["turn_costs"] = [
         {"valid_offload": True},
@@ -599,52 +599,71 @@ def test_decide_force_offload_skips_high_frac_and_uses_bernoulli(monkeypatch):
         {},
     ]
     assert offload.session_offload_turn_frac(session) == pytest.approx(0.3)
-    assert not offload.decide_force_offload(session, raw_output="thinking", rng=_Always())
+    assert not offload.decide_route_offload(session, rng=_Always())
     session.offload_stats["turn_costs"] = []
     session.offload_stats["force_tag_last_turn"] = 5
     session.timing = {"current_turn": 5}
-    assert not offload.decide_force_offload(session, raw_output="thinking", rng=_Always())
+    assert not offload.decide_route_offload(session, rng=_Always())
 
 
-def test_decide_force_offload_only_on_failed_retry(monkeypatch):
-    monkeypatch.setenv("OFFLOAD_FORCE_TAG_PROB", "0.5")
+def test_decide_route_offload_on_every_pass(monkeypatch):
+    """Route mode fires on the normal pass (no fail-retry gate)."""
+    monkeypatch.setenv("OFFLOAD_ROUTE_PROB", "0.5")
     monkeypatch.setenv("OFFLOAD_FORCE_TAG_TRAJ_FRAC", "0.3")
     monkeypatch.setenv("OFFLOAD_FORCE_TAG_MIN_TURN", "0")
     monkeypatch.setenv("OFFLOAD_FORCE_TAG_MAX", "0")
     session = SimpleNamespace(offload_stats={"turn_costs": []}, timing={"current_turn": 0})
-    # first (solo) pass: no insert even if the coin would land
-    assert not offload.session_allow_force_tag(session)
-    assert not offload.decide_force_offload(session, raw_output="thinking", rng=_Always())
-    # unsolved retry pass
-    session.offload_stats["allow_force_tag"] = True
+    assert offload.decide_route_offload(session, rng=_Always())
     assert offload.decide_force_offload(session, raw_output="thinking", rng=_Always())
-    # known solve still blocked
-    session.offload_stats["grading_solved"] = True
-    assert not offload.decide_force_offload(session, raw_output="thinking", rng=_Always())
+    assert not offload.decide_route_offload(session, rng=_Never())
     assert not offload.should_retry_unsolved_with_force_tag(
-        evaluation=False, solved=1.0, metadata={}
-    )
-    assert offload.should_retry_unsolved_with_force_tag(
         evaluation=False, solved=0.0, metadata={}
     )
-    assert offload.should_retry_unsolved_with_force_tag(
-        evaluation=False,
-        solved=0.0,
-        metadata={},
-        offload_stats={"turn_costs": [{"valid_offload": True}, *([{}] * 9)]},
-    )
-    assert not offload.should_retry_unsolved_with_force_tag(
-        evaluation=False,
-        solved=0.0,
-        metadata={},
-        offload_stats={"turn_costs": [{"valid_offload": True}] * 3 + [{}] * 7},
-    )
-    assert not offload.should_retry_unsolved_with_force_tag(
-        evaluation=False, solved=0.0, metadata={"offload_force_retry": True}
-    )
-    assert not offload.should_retry_unsolved_with_force_tag(
-        evaluation=True, solved=0.0, metadata={}
-    )
+    assert not offload.session_allow_force_tag(session)
+
+
+def test_build_route_offload_turn_trains_tag():
+    class _Tok:
+        def encode(self, text, add_special_tokens=False):
+            del add_special_tokens
+            return [101, 102, 103] if "llm_offload" in text else [1]
+
+    turn = offload.build_route_offload_turn([1, 2, 3], tokenizer=_Tok(), n=5)
+    assert turn is not None
+    assert turn.output_ids == [101, 102, 103]
+    assert turn.output_loss_mask == [1, 1, 1]
+    assert turn.output_log_probs == [0.0, 0.0, 0.0]
+    raw = f"{offload.OFFLOAD_OPEN}5{offload.OFFLOAD_CLOSE}"
+    assert offload.parse_valid_offload_directive(raw) == (5, "")
+
+
+def test_soft_route_sampling_overrides(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_ROUTE_OPEN_BIAS", "4.5")
+    monkeypatch.setenv("OFFLOAD_ROUTE_MAX_NEW_TOKENS", "32")
+    monkeypatch.setenv("OFFLOAD_OPEN_TOKEN_ID", "248077")
+    monkeypatch.setenv("OFFLOAD_CLOSE_TOKEN_ID", "248078")
+    overrides = offload.soft_route_sampling_overrides()
+    assert overrides["max_new_tokens"] == 32
+    assert overrides["stop_token_ids"] == [248078]
+    assert overrides["logit_bias"] == {"248077": 4.5}
+
+
+def test_mark_route_attempt_blocks_second_decide(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_ROUTE_PROB", "1.0")
+    monkeypatch.setenv("OFFLOAD_FORCE_TAG_TRAJ_FRAC", "1.0")
+    monkeypatch.setenv("OFFLOAD_FORCE_TAG_MIN_TURN", "0")
+    monkeypatch.setenv("OFFLOAD_FORCE_TAG_MAX", "0")
+    session = SimpleNamespace(offload_stats={"turn_costs": []}, timing={"current_turn": 2})
+    assert offload.decide_route_offload(session, rng=_Always())
+    offload.mark_route_attempt(session)
+    assert session.offload_stats["force_tag_last_turn"] == 2
+    assert int(session.offload_stats.get("forced_offload_count", 0) or 0) == 0
+    assert not offload.decide_route_offload(session, rng=_Always())
+    # Successful hit still increments count.
+    offload.mark_routed_offload(session, digit=3)
+    assert session.offload_stats["forced_offload_count"] == 1
+    assert session.offload_stats["route_offload_pending"] is True
+    assert offload.consume_route_offload_pending(session) is True
 
 
 def test_append_forced_offload_span_trains_tag():

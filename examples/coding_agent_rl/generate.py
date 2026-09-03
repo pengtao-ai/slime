@@ -3,14 +3,12 @@
     --custom-generate-function-path examples.coding_agent_rl.generate.generate
 
 generate() is a four-stage orchestrator: swe.prepare_workspace + harness.run
--> swe.git_diff -> swe.run_evaluation -> adapter.finish_session. If teacher-force
-is on and the first pass is unsolved, that traj still enters GRPO, then
-``generate()`` reruns once with force-tag insert unless first-pass offload
-turns are already ≥ ``OFFLOAD_FORCE_TAG_TRAJ_FRAC``. A solved retry emits
-**SFT only** (forced tags are off-policy for GRPO) and is concatenated onto
-the first-pass GRPO rows. An unsolved or aborted retry is dropped: it does not
-enter GRPO or SFT. First-pass failures still train. Natural solved trajs may
-still emit SFT alongside GRPO. The harness is chosen per sample via
+-> swe.git_diff -> swe.run_evaluation -> adapter.finish_session. When
+``OFFLOAD_ROUTE_PROB`` / ``OFFLOAD_FORCE_TAG_PROB`` > 0, each agent turn may
+Bernoulli-soft-explore: short SGLang generate with ``logit_bias`` on OPEN; only
+if the **model** samples a valid in-think ``OPEN+N+CLOSE`` (real logprobs) does
+that turn skip the full generate and call GLM. Miss → normal full generate.
+Optional online SFT still emits when ``OFFLOAD_SFT_LAMBDA`` > 0. Harness via
 ``metadata.agent`` (fallback: ``SWE_AGENT`` env);
 see ``agents_registry``. All agents except ``codex`` use the Anthropic (CC)
 adapter; ``codex`` uses the OpenAI adapter. Both protocols share one HTTP server.
@@ -43,7 +41,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from slime.agent.adapters import AnthropicAdapter, OpenAIAdapter
-from slime.agent.adapters.common import Reply, Session
+from slime.agent.adapters.common import Reply, Session, call_sglang_generate
 from slime.agent.aiohttp_threaded import FilteredAccessLogger, run_app_in_thread
 from slime.agent.chrome_trace import chrome_span, ensure_session_timing
 from slime.agent.harness.common import BaseHarness
@@ -113,6 +111,59 @@ class _OffloadMixin:
     def _preprocess_body(self, body: dict) -> None:
         super()._preprocess_body(body)
         offload.inject_offload_into_request_body(body)
+
+    async def _pre_generate_turn(
+        self,
+        prompt_ids: list[int],
+        session: Session,
+        body: dict,
+        *,
+        sid: str,
+    ) -> TurnRecord | None:
+        """Soft route: biased short generate; accept only if model emits valid tag."""
+        if not offload.offload_enabled():
+            return None
+        if not offload.decide_route_offload(session):
+            return None
+        offload.mark_route_attempt(session)
+        turn_index = int(((session.timing or {}).get("current_turn", 0) or 0))
+        try:
+            turn = await call_sglang_generate(
+                prompt_ids,
+                session,
+                body,
+                adapter=self,
+                session_id=sid,
+                sampling_overrides=offload.soft_route_sampling_overrides(),
+            )
+        except Exception:
+            logger.exception(
+                "[coding_agent_rl] sid=%s soft-route explore failed turn=%d; fall through",
+                sid,
+                turn_index,
+            )
+            return None
+        raw = ""
+        if turn.output_ids and self.tokenizer is not None:
+            raw = self.tokenizer.decode(turn.output_ids, skip_special_tokens=False)
+        parsed = offload.parse_valid_offload_directive(raw)
+        if parsed is None:
+            logger.info(
+                "[coding_agent_rl] sid=%s soft-route miss turn=%d (no valid in-think tag)",
+                sid,
+                turn_index,
+            )
+            return None
+        digit, _ = parsed
+        offload.mark_routed_offload(session, digit=digit)
+        logger.info(
+            "[coding_agent_rl] sid=%s soft-route hit N=%d turn=%d out_tok=%d",
+            sid,
+            digit,
+            turn_index,
+            len(turn.output_ids or []),
+        )
+        return turn
 
     async def _postprocess_reply(
         self,
@@ -434,13 +485,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     )
     ensure_session_timing(session_obj, tid=tid, events=trace_events)
     session_obj.offload_stats = dict(getattr(session_obj, "offload_stats", None) or {})
-    session_obj.offload_stats["allow_force_tag"] = bool(
-        (base_sample.metadata or {}).get("offload_force_retry")
-    )
 
     t0 = time.time()
     result_samples: list[Sample] | None = None
-    retry_force = False
     try:
         async with asyncio.timeout(CONFIG.rollout_guard_sec):
             async with boot_agent_sandbox(
@@ -545,32 +592,6 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             session_obj = state.session_store_get(session_id)
             if session_obj is not None and getattr(session_obj, "offload_stats", None):
                 offload_stats = dict(session_obj.offload_stats)
-            if offload.should_retry_unsolved_with_force_tag(
-                evaluation=evaluation,
-                solved=solved,
-                metadata=base_sample.metadata,
-                offload_stats=offload_stats,
-            ):
-                retry_force = True
-                logger.info(
-                    "[coding_agent_rl] %s: solo pass unsolved; keep GRPO traj and retry with force-tag insert",
-                    instance_id,
-                )
-            elif (
-                not evaluation
-                and float(solved) != 1.0
-                and not (base_sample.metadata or {}).get("offload_force_retry")
-                and offload.force_tag_prob() > 0.0
-            ):
-                frac = offload.offload_turn_frac(offload_stats)
-                cap = offload.force_tag_traj_frac()
-                if cap > 0.0 and frac >= cap:
-                    logger.info(
-                        "[coding_agent_rl] %s: unsolved but offload_frac=%.2f >= %.2f; skip force-tag retry",
-                        instance_id,
-                        frac,
-                        cap,
-                    )
             train_reward = solved
             turn_rewards: list[float] = []
             turn_costs: list[dict[str, Any]] = list(offload_stats.get("turn_costs") or [])
@@ -682,14 +703,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     state.adapter_url,
                     (diag or "<empty>")[:1500],
                 )
-                if retry_force:
-                    # Empty first pass is not a useful GRPO row; still retry.
-                    # Do not abort base_sample in place — the retry reuses it.
-                    result_samples = []
-                else:
-                    result_samples = _abort_result(base_sample, "adapter_session_empty", instance_id)
-                    _attach_timeline(result_samples, timeline)
-                    return result_samples
+                result_samples = _abort_result(base_sample, "adapter_session_empty", instance_id)
+                _attach_timeline(result_samples, timeline)
+                return result_samples
             else:
                 if offload.offload_enabled() and turn_rewards:
                     offload.attach_turn_advantage_metadata(
@@ -716,35 +732,14 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                             "turn_token_spans": s.metadata.get("turn_token_spans"),
                         }
 
-                is_force_retry = bool((base_sample.metadata or {}).get("offload_force_retry"))
-                # Failed teacher-force retry: do not train GRPO or SFT.
-                if is_force_retry and float(solved) != 1.0:
-                    logger.info(
-                        "[coding_agent_rl] %s: force-tag retry unsolved; drop GRPO/SFT n=%d",
-                        instance_id,
-                        len(samples),
-                    )
-                    result_samples = []
-                    return result_samples
-
-                # Online SFT: solved trajectories only (solo or offload). Failures stay GRPO-only.
-                # Force-tag retry success: SFT only (skip GRPO on spliced tags).
+                # Optional online SFT when OFFLOAD_SFT_LAMBDA>0 (solved only).
                 sft_samples: list[Sample] = []
-                if float(solved) == 1.0 and (offload.offload_enabled() or is_force_retry):
+                if float(solved) == 1.0 and offload.offload_enabled():
                     sft_samples = build_sft_samples(
                         grpo_samples=samples,
                         tokenizer=state.tokenizer,
                         grading_solved=True,
                     )
-                if is_force_retry:
-                    result_samples = list(sft_samples)
-                    logger.info(
-                        "[coding_agent_rl] %s: force-tag retry solved; SFT-only n=%d (no GRPO)",
-                        instance_id,
-                        len(result_samples),
-                    )
-                    return result_samples
-
                 if sft_samples:
                     samples = list(samples) + sft_samples
 
@@ -770,14 +765,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     len(trace_events),
                 )
                 result_samples = samples
-                if retry_force:
-                    logger.info(
-                        "[coding_agent_rl] %s: first-pass GRPO n=%d; running force-tag retry",
-                        instance_id,
-                        len(samples),
-                    )
-                else:
-                    return result_samples
+                return result_samples
 
     except asyncio.TimeoutError:
         _log_timeout_diagnostic(t0, instance_id)
@@ -808,27 +796,6 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
             await asyncio.sleep(10)
         if result_samples is not None:
             _attach_timeline(result_samples, timeline)
-
-    if retry_force:
-        first_pass = list(result_samples or [])
-        md = dict(base_sample.metadata or {})
-        md["offload_force_retry"] = True
-        base_sample.metadata = md
-        base_sample.session_id = f"{session_id}-force"
-        second_pass = await generate(args, base_sample, sampling_params, evaluation)
-        kept = _keep_force_retry_sft_samples(list(second_pass or []))
-        _stamp_compact_rollout_id(first_pass or [base_sample], kept)
-        if not kept:
-            logger.info(
-                "[coding_agent_rl] %s: force-tag retry produced no SFT; keep first-pass GRPO only",
-                instance_id,
-            )
-        out = first_pass + kept
-        if out:
-            return out
-        # Both passes empty (e.g. silent agent + failed retry): one aborted
-        # placeholder, not an empty compact list.
-        return _abort_result(base_sample, "force_tag_retry_empty", instance_id)
 
 
 def _log_timeout_diagnostic(t0: float, instance_id: str) -> None:
@@ -875,40 +842,6 @@ def _sample_is_solved(sample: Sample) -> bool:
         return float(md.get("solved") or 0) == 1.0
     except (TypeError, ValueError):
         return False
-
-
-def _keep_force_retry_sft_samples(samples: list[Sample]) -> list[Sample]:
-    """Force-tag retry contributes solved SFT rows only (never GRPO)."""
-    kept: list[Sample] = []
-    for sample in samples:
-        if getattr(sample, "status", None) == Sample.Status.ABORTED:
-            continue
-        if (sample.metadata or {}).get("abort_reason"):
-            continue
-        md = sample.metadata or {}
-        tmd = getattr(sample, "train_metadata", None) or {}
-        if md.get("objective") != "sft" and tmd.get("objective") != "sft":
-            continue
-        if _sample_is_solved(sample):
-            kept.append(sample)
-    return kept
-
-
-def _stamp_compact_rollout_id(src: list[Sample], dst: list[Sample]) -> None:
-    """Copy ``rollout_id`` from first-pass siblings onto retry samples missing it."""
-    rid = None
-    for sample in src:
-        if sample.rollout_id is not None:
-            rid = sample.rollout_id
-            break
-        if sample.index is not None:
-            rid = sample.index
-            break
-    if rid is None:
-        return
-    for sample in dst:
-        if sample.rollout_id is None:
-            sample.rollout_id = rid
 
 
 def _abort_result(sample: Sample, reason: str, instance_id: str) -> list[Sample]:

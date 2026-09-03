@@ -200,6 +200,23 @@ class BaseAdapter:
         """Pack parsed model output into a Reply."""
         raise NotImplementedError
 
+    async def _pre_generate_turn(
+        self,
+        prompt_ids: list[int],
+        session: Session,
+        body: dict,
+        *,
+        sid: str,
+    ) -> TurnRecord | None:
+        """Optional hook before the main SGLang ``/generate``.
+
+        Return a ``TurnRecord`` to skip the full local generate (e.g. coding-agent
+        soft-route explore that already sampled a valid ``OPEN+N+CLOSE``).
+        Default ``None`` → normal ``call_sglang_generate``.
+        """
+        del prompt_ids, session, body, sid
+        return None
+
     async def _postprocess_reply(
         self,
         reply: Reply,
@@ -383,8 +400,10 @@ class BaseAdapter:
                 translated, tools_schema = self._translate(body)
                 prompt_ids = _render_token_ids(translated, tok, tools=tools_schema, add_generation_prompt=True)
 
-                # 1) Always SLM first for this agent round.
-                turn = await call_sglang_generate(prompt_ids, s, body, adapter=self, session_id=sid)
+                # 1) Optional route override, else SLM /generate for this agent round.
+                turn = await self._pre_generate_turn(prompt_ids, s, body, sid=sid)
+                if turn is None:
+                    turn = await call_sglang_generate(prompt_ids, s, body, adapter=self, session_id=sid)
 
                 raw_output = tok.decode(turn.output_ids, skip_special_tokens=False) if turn.output_ids else ""
                 parsed = parse_model_output(
@@ -500,13 +519,18 @@ async def call_sglang_generate(
     *,
     adapter: BaseAdapter,
     session_id: str | None = None,
+    sampling_overrides: dict | None = None,
 ) -> TurnRecord:
     """POST one turn to sglang /generate and pack the reply into a TurnRecord.
 
     Module-level (not a method) so tests can monkeypatch it.
+    ``sampling_overrides`` merges into sampling_params after defaults (e.g. short
+    ``max_new_tokens``, ``logit_bias``, ``stop_token_ids`` for soft route explore).
     """
     logger = adapter.logger
     sp = _sampling_params(session, body, max_token_keys=adapter.max_token_keys, stop_keys=adapter.stop_keys)
+    if sampling_overrides:
+        sp.update(sampling_overrides)
 
     if session.max_context_tokens > 0:
         remaining_context = session.max_context_tokens - len(prompt_ids)

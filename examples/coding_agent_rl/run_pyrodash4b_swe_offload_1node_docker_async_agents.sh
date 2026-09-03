@@ -86,31 +86,25 @@ export ROLLOUT_STOP_TOKEN_IDS="${ROLLOUT_STOP_TOKEN_IDS:-248046 248044 ${OFFLOAD
 export SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS="${SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS:-160000}"
 # Embed GLM continuation into Sample.tokens with loss_mask=0 (default on).
 export SLIME_OFFLOAD_EMBED_IN_TRAJECTORY="${SLIME_OFFLOAD_EMBED_IN_TRAJECTORY:-1}"
-# Mixed L = L_GRPO + λ_sft L_SFT. Multiturn: one long seq / episode, all assistant turns.
-export OFFLOAD_SFT_LAMBDA="${OFFLOAD_SFT_LAMBDA:-0.6}"
+# Mixed L = L_GRPO + λ_sft L_SFT. Soft-route bootstrap uses GRPO only (λ=0).
+export OFFLOAD_SFT_LAMBDA="${OFFLOAD_SFT_LAMBDA:-0}"
 # Cap SFT assistant turns from the end. Default 0 = include every round in one multiturn row.
 export OFFLOAD_SFT_MAX_SAMPLES="${OFFLOAD_SFT_MAX_SAMPLES:-0}"
-# Bootstrap tag skill on inits that never emit <|llm_offload|> (e.g. SFT-0828):
-# first agent pass never inserts (keep solo solves clean). Only if that pass
-# fails AND first-pass offload turns are still < TRAJ_FRAC (0.3), retry with
-# PROB (0.5) insert. On retry, skip if this turn already has a tag or retry
-# offload turns already ≥ TRAJ_FRAC. After the tag, drop SLM text and
-# call GLM on the normal offload path. At most once per turn.
-# N uniform 0-9 inside think; force success → SFT (tag kept); GLM mask=0.
-# Solved first-pass: GRPO (+ optional SFT). Solved force retry: SFT only
-# (no GRPO on spliced tags). First-pass failures stay GRPO-only.
-# Unsolved / aborted retry is dropped (not GRPO, not SFT).
-export OFFLOAD_FORCE_TAG_PROB="${OFFLOAD_FORCE_TAG_PROB:-0.5}"
+# Soft-route offload (GRPO): with probability PROB, short SGLang generate with
+# logit_bias on OPEN (OPEN_BIAS) and stop on CLOSE (MAX_NEW_TOKENS). The model
+# must sample <|llm_offload|>N<|/llm_offload|> (real logprobs → GRPO); miss →
+# fall through to a normal full generate. Caps: TRAJ_FRAC / MIN_TURN / MAX.
+# No hard inject / no fail-retry. Natural emits still work when coin does not fire.
+export OFFLOAD_ROUTE_PROB="${OFFLOAD_ROUTE_PROB:-${OFFLOAD_FORCE_TAG_PROB:-0.5}}"
+export OFFLOAD_FORCE_TAG_PROB="${OFFLOAD_FORCE_TAG_PROB:-${OFFLOAD_ROUTE_PROB}}"
+export OFFLOAD_ROUTE_OPEN_BIAS="${OFFLOAD_ROUTE_OPEN_BIAS:-6.0}"
+export OFFLOAD_ROUTE_MAX_NEW_TOKENS="${OFFLOAD_ROUTE_MAX_NEW_TOKENS:-48}"
 export OFFLOAD_FORCE_TAG_TRAJ_FRAC="${OFFLOAD_FORCE_TAG_TRAJ_FRAC:-0.3}"
 export OFFLOAD_FORCE_TAG_MIN_TURN="${OFFLOAD_FORCE_TAG_MIN_TURN:-0}"
 export OFFLOAD_FORCE_TAG_MAX="${OFFLOAD_FORCE_TAG_MAX:-0}"
-# Leave OFFLOAD_FORCE_TAG_N unset for random 0-9; set it to pin a digit in debug.
-# Forced offload SFT must keep the tag (p=1). Natural offload turns also keep it
-# during bootstrap; lower toward 0.3 once the policy emits tags on its own.
+# Optional SFT (off by default). Keep tag_prob for offline builds.
 export OFFLOAD_SFT_TAG_PROB="${OFFLOAD_SFT_TAG_PROB:-0.9}"
-# Left-trim SFT history, keep the tail (GLM y). SFT response_length ≈ full seq so
-# a 177k row OOMs on [T,V] FP32 softmax even with CP=6; 148746 already trained.
-# 0 = no cap. GRPO packing is unchanged.
+# Left-trim SFT history, keep the tail (GLM y). Unused when λ=0.
 export OFFLOAD_SFT_MAX_SEQ_LEN="${OFFLOAD_SFT_MAX_SEQ_LEN:-145000}"
 # Leave MAX_TOKENS_PER_GPU unset so async launcher uses MAX_CONTEXT_LEN/CP
 # (GRPO-only default, ~26667 at CP=6). Override only if mixed train still OOMs.
@@ -123,9 +117,9 @@ fi
 
 # ---- PyroDash checkpoints (BF16 train + BF16 rollout) ----
 # SGLang loads padded HF vocab rows; Megatron torch_dist is padded to 248320.
-# SFT-0828 almost never emits offload tags: keep OFFLOAD_FORCE_TAG_PROB>0 so
-# teacher-force + SFT can bootstrap the span. Other inits that already seek
-# (093915/113854 iter_39) should set FORCE_TAG_PROB=0.
+# SFT-0902 / SFT-0828 rarely emit offload tags: keep OFFLOAD_ROUTE_PROB>0 and
+# OPEN_BIAS>0 so soft explore raises P(tag) with on-policy logprobs. Inits that
+# already seek can set OFFLOAD_ROUTE_PROB=0.
 export HF_CHECKPOINT="${HF_CHECKPOINT:-/workspace/models/pyromind/PyroDash-4B-SFT-0803}"
 export REF_MODEL_PATH="${REF_MODEL_PATH:-/workspace/models/pyromind/PyroDash-4B-SFT-0803_torch_dist}"
 # FP8 KV cache for longer agent decode contexts (rollout only; weights stay BF16).
@@ -217,10 +211,10 @@ echo "  OFFLOAD_UNIQUE_SOLVER_BONUS=${OFFLOAD_UNIQUE_SOLVER_BONUS}"
 echo "  OFFLOAD_NO_SEEK_PENALTY=${OFFLOAD_NO_SEEK_PENALTY:-0.1}"
 echo "  OFFLOAD_THINK_FORMAT_PENALTY=${OFFLOAD_THINK_FORMAT_PENALTY:-0.25}"
 echo "  OFFLOAD_MALFORMED_PENALTY=${OFFLOAD_MALFORMED_PENALTY:-0.25}"
-echo "  OFFLOAD_SFT_LAMBDA=${OFFLOAD_SFT_LAMBDA:-0.15}"
+echo "  OFFLOAD_SFT_LAMBDA=${OFFLOAD_SFT_LAMBDA:-0}"
 echo "  OFFLOAD_SFT_MAX_SAMPLES=${OFFLOAD_SFT_MAX_SAMPLES:-0}"
-echo "  OFFLOAD_SFT_TAG_PROB=${OFFLOAD_SFT_TAG_PROB:-1.0}"
-echo "  OFFLOAD_FORCE_TAG_PROB=${OFFLOAD_FORCE_TAG_PROB:-0.5} TRAJ_FRAC=${OFFLOAD_FORCE_TAG_TRAJ_FRAC:-0.3} MIN_TURN=${OFFLOAD_FORCE_TAG_MIN_TURN:-0} MAX=${OFFLOAD_FORCE_TAG_MAX:-0} N=${OFFLOAD_FORCE_TAG_N:-random}"
+echo "  OFFLOAD_SFT_TAG_PROB=${OFFLOAD_SFT_TAG_PROB:-0.9}"
+echo "  OFFLOAD_ROUTE_PROB=${OFFLOAD_ROUTE_PROB:-0.5} (FORCE_TAG_PROB=${OFFLOAD_FORCE_TAG_PROB:-0.5}) TRAJ_FRAC=${OFFLOAD_FORCE_TAG_TRAJ_FRAC:-0.3} MIN_TURN=${OFFLOAD_FORCE_TAG_MIN_TURN:-0} MAX=${OFFLOAD_FORCE_TAG_MAX:-0} N=${OFFLOAD_FORCE_TAG_N:-random}"
 echo "  OFFLOAD_SFT_MAX_SEQ_LEN=${OFFLOAD_SFT_MAX_SEQ_LEN:-145000}"
 echo "  MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-<async default MAX_CONTEXT_LEN/CP>}"
 echo "  OFFLOAD_COMPACT_ORPHAN_OPEN_K=${OFFLOAD_COMPACT_ORPHAN_OPEN_K}"

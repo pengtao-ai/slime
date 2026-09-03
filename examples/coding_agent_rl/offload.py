@@ -35,20 +35,13 @@ Train shaping (when ``SLIME_AGENT_OFFLOAD=1``):
     unrepaired spam (``OFFLOAD_COMPACT_ORPHAN_OPEN_K``, default 1).
   - Post-decode :func:`truncate_offload_open_spam` cuts runaway OPEN spam before
     GLM / agent flush (does not stop SGLang mid-generate).
-  - Optional teacher-force tag (``OFFLOAD_FORCE_TAG_PROB``, default off): first
-    agent pass never splices (keep solo solves clean). If that pass is unsolved
-    and p>0, ``generate()`` keeps the failed traj for GRPO and retries with
-    insert enabled, unless first-pass offload turns are already ≥
-    ``OFFLOAD_FORCE_TAG_TRAJ_FRAC`` (launcher 0.3). A solved retry emits
-    **SFT only** (forced tags stay out of GRPO); an unsolved or aborted retry
-    is discarded. On retry, skip if this turn already has a tag, or retry
-    offload turns are already ≥ the same frac. Else splice
-    ``OPEN+N+CLOSE`` inside think with independent probability (launcher 0.5),
-    **drop all SLM text after the tag**, then call GLM on the normal offload
-    path. Forced spans are distilled via SFT (``OFFLOAD_SFT_TAG_PROB`` / always
-    keep tag on ``forced_offload`` turns); only the GLM suffix is
-    ``loss_mask=0`` on any GRPO row that still embeds it. ``N`` uniform 0–9.
-    At most once per turn.
+  - Optional **soft route** offload (``OFFLOAD_ROUTE_PROB`` / legacy
+    ``OFFLOAD_FORCE_TAG_PROB``, default off): with probability ``p`` at turn
+    start, run a short SGLang generate with ``logit_bias`` on OPEN
+    (``OFFLOAD_ROUTE_OPEN_BIAS``, default 6) and stop on CLOSE. The **model**
+    must sample ``OPEN+N+CLOSE`` (real rollout logprobs → GRPO). On miss, fall
+    through to a normal full generate. Caps: ``OFFLOAD_FORCE_TAG_TRAJ_FRAC``,
+    min turn, max per session. No fail-retry / no hard tag inject / SFT optional.
   - Hard compact filter + group α:
     :func:`compact_and_shape_group_help_seeking_rewards`.
   - Turn-painted advantages:
@@ -241,23 +234,32 @@ def offload_close_token_id() -> int:
 
 
 def force_tag_prob() -> float:
-    """Independent per-turn splice probability on the unsolved retry pass.
+    """Per-turn Bernoulli probability for route-mode offload (0 = off).
 
-    Default 0: off. Launcher sets 0.5. The first (solo) pass never splices.
+    Reads ``OFFLOAD_ROUTE_PROB`` first, then legacy ``OFFLOAD_FORCE_TAG_PROB``.
     """
-    raw = (os.environ.get("OFFLOAD_FORCE_TAG_PROB") or "0").strip()
+    raw = (os.environ.get("OFFLOAD_ROUTE_PROB") or os.environ.get("OFFLOAD_FORCE_TAG_PROB") or "0").strip()
     try:
         return min(1.0, max(0.0, float(raw)))
     except ValueError:
         return 0.0
 
 
+def route_prob() -> float:
+    """Alias of :func:`force_tag_prob` (route-at-turn-start naming)."""
+    return force_tag_prob()
+
+
 def force_tag_traj_frac() -> float:
-    """Skip teacher-force when offload turns / completed turns ≥ this.
+    """Skip route when offload turns / completed turns ≥ this.
 
     Default 0.3. 0 disables the cap. Launcher sets 0.3.
     """
-    raw = (os.environ.get("OFFLOAD_FORCE_TAG_TRAJ_FRAC") or "0.3").strip()
+    raw = (
+        os.environ.get("OFFLOAD_ROUTE_TRAJ_FRAC")
+        or os.environ.get("OFFLOAD_FORCE_TAG_TRAJ_FRAC")
+        or "0.3"
+    ).strip()
     try:
         return min(1.0, max(0.0, float(raw)))
     except ValueError:
@@ -265,8 +267,12 @@ def force_tag_traj_frac() -> float:
 
 
 def force_tag_min_turn() -> int:
-    """Earliest 0-based agent turn that may be teacher-forced. Default 0."""
-    raw = (os.environ.get("OFFLOAD_FORCE_TAG_MIN_TURN") or "0").strip()
+    """Earliest 0-based agent turn that may be routed. Default 0."""
+    raw = (
+        os.environ.get("OFFLOAD_ROUTE_MIN_TURN")
+        or os.environ.get("OFFLOAD_FORCE_TAG_MIN_TURN")
+        or "0"
+    ).strip()
     try:
         return max(0, int(raw))
     except ValueError:
@@ -274,8 +280,12 @@ def force_tag_min_turn() -> int:
 
 
 def force_tag_max_per_session() -> int:
-    """Optional absolute cap on forced tags per episode. 0 = no extra cap."""
-    raw = (os.environ.get("OFFLOAD_FORCE_TAG_MAX") or "0").strip()
+    """Absolute cap on routed offloads per episode. 0 = unlimited."""
+    raw = (
+        os.environ.get("OFFLOAD_ROUTE_MAX")
+        or os.environ.get("OFFLOAD_FORCE_TAG_MAX")
+        or "0"
+    ).strip()
     try:
         return max(0, int(raw))
     except ValueError:
@@ -283,9 +293,9 @@ def force_tag_max_per_session() -> int:
 
 
 def force_tag_n_pin() -> int | None:
-    """Optional ``OFFLOAD_FORCE_TAG_N`` pin; ``None`` means sample 0–9."""
-    raw = (os.environ.get("OFFLOAD_FORCE_TAG_N") or "").strip()
-    if not raw:
+    """Optional ``OFFLOAD_ROUTE_N`` / ``OFFLOAD_FORCE_TAG_N`` pin; ``None`` → sample 0–9."""
+    raw = (os.environ.get("OFFLOAD_ROUTE_N") or os.environ.get("OFFLOAD_FORCE_TAG_N") or "").strip()
+    if not raw or raw.lower() in ("random", "rand", "any"):
         return None
     try:
         return min(9, max(0, int(raw)))
@@ -294,12 +304,12 @@ def force_tag_n_pin() -> int | None:
 
 
 def sample_force_tag_n(rng: random.Random | None = None) -> int:
-    """Digit N for a forced span: uniform ``{0…9}`` unless ``OFFLOAD_FORCE_TAG_N`` is set."""
+    """Digit N for a routed span: uniform ``{0…9}`` unless N is pinned."""
     pinned = force_tag_n_pin()
     if pinned is not None:
         return pinned
     rnd = rng if rng is not None else random
-    return rnd.randint(0, 9)
+    return int(rnd.randint(0, 9))
 
 
 def splice_offload_tag_inside_think(
@@ -310,10 +320,8 @@ def splice_offload_tag_inside_think(
 ) -> str:
     """Insert ``OPEN+N+CLOSE`` in think and drop everything after the tag.
 
-    Think is ``raw`` up to the first ``</think>`` (or the whole string if the
-    turn is still unclosed). The span is placed at a random offset; text after
-    it (rest of think and any visible tail) is discarded so GLM continues from
-    this prefix like a natural mid-think stop.
+    Legacy helper for tests / offline tooling. Live training uses
+    :func:`build_route_offload_turn` at turn start instead.
     """
     digit = min(9, max(0, int(n)))
     span = f"{OFFLOAD_OPEN}{digit}{OFFLOAD_CLOSE}"
@@ -326,7 +334,7 @@ def splice_offload_tag_inside_think(
 
 
 def force_offload_eligible(raw_output: str) -> bool:
-    """True if this SLM turn can take a spliced in-think tag."""
+    """True if a post-hoc splice could apply (legacy; unused by route mode)."""
     text = raw_output or ""
     if not text.strip():
         return False
@@ -343,7 +351,7 @@ def _session_turn_index(session: Session) -> int:
 
 
 def offload_turn_frac(stats: dict[str, Any] | None) -> float:
-    """Fraction of completed turns that already offloaded (natural or forced)."""
+    """Fraction of completed turns that already offloaded (natural or routed)."""
     turns = (stats or {}).get("turn_costs") or []
     n = 0
     n_off = 0
@@ -359,56 +367,21 @@ def offload_turn_frac(stats: dict[str, Any] | None) -> float:
 
 
 def session_offload_turn_frac(session: Session) -> float:
-    """Fraction of completed turns that already offloaded (natural or forced)."""
+    """Fraction of completed turns that already offloaded (natural or routed)."""
     return offload_turn_frac(_ensure_stats(session))
 
 
-def session_allow_force_tag(session: Session) -> bool:
-    """True only on the unsolved retry pass (``allow_force_tag``)."""
-    stats = _ensure_stats(session)
-    if stats.get("grading_solved") is True:
-        return False
-    return bool(stats.get("allow_force_tag"))
-
-
-def should_retry_unsolved_with_force_tag(
-    *,
-    evaluation: bool,
-    solved: float,
-    metadata: dict[str, Any] | None,
-    offload_stats: dict[str, Any] | None = None,
-) -> bool:
-    """First pass failed and teacher-force is on → keep that GRPO traj and rerun with insert.
-
-    Skip retry when the first pass already offloaded on ≥ ``OFFLOAD_FORCE_TAG_TRAJ_FRAC``
-    of completed turns (launcher 0.3): those episodes do not need a force-tag rerun.
-    """
-    if evaluation:
-        return False
-    if force_tag_prob() <= 0.0:
-        return False
-    if float(solved) == 1.0:
-        return False
-    if (metadata or {}).get("offload_force_retry"):
-        return False
-    cap = force_tag_traj_frac()
-    if cap > 0.0 and offload_turn_frac(offload_stats) >= cap:
-        return False
-    return True
-
-
-def decide_force_offload(
+def decide_route_offload(
     session: Session,
     *,
-    raw_output: str,
     rng: random.Random | None = None,
 ) -> bool:
-    """Skip unless this is a failed-episode retry under the 30% / Bernoulli caps."""
-    if force_tag_prob() <= 0.0:
-        return False
-    if not session_allow_force_tag(session):
-        return False
-    if not force_offload_eligible(raw_output):
+    """Bernoulli: attempt a **soft** explore generate this turn (bias OPEN, model samples).
+
+    Does not inject the tag. On miss, the adapter falls through to a normal
+    full generate. Caps: traj offload frac, min turn, once per turn index, max.
+    """
+    if route_prob() <= 0.0:
         return False
     cap = force_tag_traj_frac()
     if cap > 0.0 and session_offload_turn_frac(session) >= cap:
@@ -423,7 +396,120 @@ def decide_force_offload(
     if abs_max > 0 and int(stats.get("forced_offload_count", 0) or 0) >= abs_max:
         return False
     rnd = rng if rng is not None else random
-    return bool(rnd.random() < force_tag_prob())
+    return bool(rnd.random() < route_prob())
+
+
+def decide_force_offload(
+    session: Session,
+    *,
+    raw_output: str = "",
+    rng: random.Random | None = None,
+) -> bool:
+    """Deprecated alias of :func:`decide_route_offload` (ignores ``raw_output``)."""
+    del raw_output
+    return decide_route_offload(session, rng=rng)
+
+
+def route_open_bias() -> float:
+    """Logit bias added to OPEN during soft-route explore (0 = no bias)."""
+    raw = (os.environ.get("OFFLOAD_ROUTE_OPEN_BIAS") or "6.0").strip()
+    try:
+        return float(raw)
+    except ValueError:
+        return 6.0
+
+
+def route_max_new_tokens() -> int:
+    """Short decode budget for soft-route explore (stop on CLOSE)."""
+    raw = (os.environ.get("OFFLOAD_ROUTE_MAX_NEW_TOKENS") or "48").strip()
+    try:
+        return max(4, int(raw))
+    except ValueError:
+        return 48
+
+
+def soft_route_sampling_overrides() -> dict[str, Any]:
+    """SGLang sampling knobs for soft explore: bias OPEN, stop on CLOSE, short N."""
+    overrides: dict[str, Any] = {
+        "max_new_tokens": route_max_new_tokens(),
+        "stop_token_ids": [offload_close_token_id()],
+    }
+    bias = route_open_bias()
+    if bias != 0.0:
+        # SGLang expects string keys → int token ids.
+        overrides["logit_bias"] = {str(offload_open_token_id()): bias}
+    return overrides
+
+
+def build_route_offload_turn(
+    prompt_ids: list[int],
+    *,
+    tokenizer: Any,
+    n: int | None = None,
+    rng: random.Random | None = None,
+) -> TurnRecord | None:
+    """Legacy hard inject (tests only). Live path uses soft SGLang explore."""
+    if tokenizer is None:
+        return None
+    digit = sample_force_tag_n(rng) if n is None else min(9, max(0, int(n)))
+    span = f"{OFFLOAD_OPEN}{digit}{OFFLOAD_CLOSE}"
+    try:
+        tag_ids = list(tokenizer.encode(span, add_special_tokens=False))
+    except Exception:
+        logger.exception("[coding_agent_offload] failed to encode route offload tag")
+        return None
+    if not tag_ids:
+        return None
+    return TurnRecord(
+        prompt_ids=list(prompt_ids),
+        output_ids=tag_ids,
+        finish_reason="stop",
+        output_log_probs=[0.0] * len(tag_ids),
+        output_loss_mask=[1] * len(tag_ids),
+    )
+
+
+def mark_route_attempt(session: Session) -> None:
+    """Mark this turn index as soft-explored (hit or miss); blocks a second attempt."""
+    stats = _ensure_stats(session)
+    stats["force_tag_last_turn"] = _session_turn_index(session)
+
+
+def mark_routed_offload(session: Session, *, digit: int | None = None) -> None:
+    """Record that soft explore produced a valid offload span (counts toward caps)."""
+    stats = _ensure_stats(session)
+    stats["forced_offload_count"] = int(stats.get("forced_offload_count", 0) or 0) + 1
+    stats["force_tag_last_turn"] = _session_turn_index(session)
+    stats["route_offload_pending"] = True
+    if digit is not None:
+        stats["route_offload_digit"] = int(digit)
+
+
+def consume_route_offload_pending(session: Session) -> bool:
+    """True once if :func:`mark_routed_offload` armed this turn."""
+    stats = _ensure_stats(session)
+    if not stats.pop("route_offload_pending", False):
+        return False
+    stats.pop("route_offload_digit", None)
+    return True
+
+
+def should_retry_unsolved_with_force_tag(
+    *,
+    evaluation: bool,
+    solved: float,
+    metadata: dict[str, Any] | None,
+    offload_stats: dict[str, Any] | None = None,
+) -> bool:
+    """Always false: fail-retry insert was replaced by per-turn route mode."""
+    del evaluation, solved, metadata, offload_stats
+    return False
+
+
+def session_allow_force_tag(session: Session) -> bool:
+    """Legacy: route mode does not gate on ``allow_force_tag``."""
+    del session
+    return False
 
 
 def append_forced_offload_span(
@@ -434,12 +520,7 @@ def append_forced_offload_span(
     n: int | None = None,
     rng: random.Random | None = None,
 ) -> str | None:
-    """Truncate at a spliced OPEN+N+CLOSE; prefix and tag keep ``loss_mask=1``.
-
-    GLM continuation (if any) is appended later with ``loss_mask=0``. Force-retry
-    rows are distilled via SFT only (not GRPO); placeholder rollout logprobs (0)
-    remain on the discarded GRPO finish path.
-    """
+    """Legacy post-hoc splice (tests / tooling). Prefer :func:`build_route_offload_turn`."""
     if tokenizer is None:
         return None
     digit = sample_force_tag_n(rng) if n is None else min(9, max(0, int(n)))
@@ -462,7 +543,6 @@ def append_forced_offload_span(
     ids.extend(new_ids)
     mask = turn.output_loss_mask
     mask.clear()
-    # Keep tag marked trainable on the finish path (SFT uses turn history).
     mask.extend([1] * (n_pre + n_tag))
     lps = turn.output_log_probs
     lps.clear()
@@ -555,9 +635,12 @@ def resolved_train_config() -> dict[str, Any]:
         "OFFLOAD_SFT_MAX_SAMPLES": offload_sft.sft_max_samples(),
         "OFFLOAD_SFT_MAX_SEQ_LEN": offload_sft.sft_max_seq_len(),
         "OFFLOAD_SFT_TAG_PROB": offload_sft.sft_tag_prob(),
-        "OFFLOAD_FORCE_TAG_PROB": force_tag_prob(),
+        "OFFLOAD_ROUTE_PROB": route_prob(),
+        "OFFLOAD_ROUTE_OPEN_BIAS": route_open_bias(),
+        "OFFLOAD_ROUTE_MAX_NEW_TOKENS": route_max_new_tokens(),
+        "OFFLOAD_FORCE_TAG_PROB": force_tag_prob(),  # legacy alias
         "OFFLOAD_FORCE_TAG_TRAJ_FRAC": force_tag_traj_frac(),
-        "OFFLOAD_FORCE_TAG_ON_FAIL_ONLY": True,
+        "OFFLOAD_FORCE_TAG_ON_FAIL_ONLY": False,
         "OFFLOAD_FORCE_TAG_MIN_TURN": force_tag_min_turn(),
         "OFFLOAD_FORCE_TAG_MAX": force_tag_max_per_session(),
         "OFFLOAD_FORCE_TAG_N": force_tag_n_pin() if force_tag_n_pin() is not None else "random",
@@ -1720,29 +1803,13 @@ async def apply_offload_if_needed(
                 len(raw_output),
             )
 
-    forced = False
-    if (
-        tokenizer is not None
-        and parse_valid_offload_directive(raw_output) is None
-        and parse_offload_directive(raw_output) is None
-        and decide_force_offload(session, raw_output=raw_output)
-    ):
-        digit = sample_force_tag_n()
-        new_raw = append_forced_offload_span(
-            turn, raw_output=raw_output, tokenizer=tokenizer, n=digit
+    forced = consume_route_offload_pending(session)
+    if forced:
+        logger.info(
+            "[coding_agent_offload] sid=%s route-mode offload turn=%d",
+            sid,
+            _session_turn_index(session),
         )
-        if new_raw is not None and parse_valid_offload_directive(new_raw) is not None:
-            raw_output = new_raw
-            forced = True
-            stats = _ensure_stats(session)
-            stats["forced_offload_count"] = int(stats.get("forced_offload_count", 0) or 0) + 1
-            stats["force_tag_last_turn"] = _session_turn_index(session)
-            logger.info(
-                "[coding_agent_offload] sid=%s forced offload tag N=%d turn=%d",
-                sid,
-                digit,
-                _session_turn_index(session),
-            )
 
     turn_entry = record_local_turn_tokens(session, turn, raw_output=raw_output)
     if forced:
