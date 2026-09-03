@@ -264,8 +264,8 @@ def test_abort_result_sets_rollout_id_for_compact_concat():
     assert len(set(rids)) == 1
 
 
-def test_keep_solved_retry_samples_drops_failures_and_aborts():
-    solved = Sample(
+def test_keep_force_retry_sft_samples_drops_grpo_and_failures():
+    grpo_solved = Sample(
         index=1,
         rollout_id=1,
         status=Sample.Status.COMPLETED,
@@ -276,6 +276,7 @@ def test_keep_solved_retry_samples_drops_failures_and_aborts():
         rollout_id=1,
         status=Sample.Status.COMPLETED,
         metadata={"grading_solved": True, "solved": 1.0, "objective": "sft", "session_id": "s-force"},
+        train_metadata={"objective": "sft"},
     )
     failed = Sample(
         index=1,
@@ -288,8 +289,8 @@ def test_keep_solved_retry_samples_drops_failures_and_aborts():
         status=Sample.Status.ABORTED,
         metadata={"abort_reason": "exception:RuntimeError", "solved": 0.0},
     )
-    kept = gen._keep_solved_retry_samples([solved, failed, abort, sft])
-    assert kept == [solved, sft]
+    kept = gen._keep_force_retry_sft_samples([grpo_solved, failed, abort, sft])
+    assert kept == [sft]
 
 
 def test_generate_drops_unsolved_force_tag_retry():
@@ -329,14 +330,37 @@ def test_generate_drops_unsolved_force_tag_retry():
         asyncio.run(run_case(mp))
 
 
-def test_generate_keeps_solved_force_tag_retry():
-    """Retry that actually solves is concatenated onto first-pass GRPO."""
+def test_generate_keeps_solved_force_tag_retry_as_sft_only():
+    """Solved force-tag retry emits SFT only; first-pass GRPO stays, no force GRPO."""
 
     n_eval = {"n": 0}
 
     async def fail_then_pass(_md, *, diff_text, timeout_sec):
         n_eval["n"] += 1
         return swe.EvalResult(0.0 if n_eval["n"] == 1 else 1.0, True)
+
+    def fake_build_sft(*, grpo_samples, tokenizer, grading_solved):
+        base = grpo_samples[0]
+        return [
+            Sample(
+                index=base.index,
+                group_index=base.group_index,
+                rollout_id=base.rollout_id if base.rollout_id is not None else base.index,
+                status=Sample.Status.COMPLETED,
+                tokens=[1, 2],
+                loss_mask=[1],
+                response_length=1,
+                rollout_log_probs=[0.0],
+                reward=0.0,
+                metadata={
+                    "objective": "sft",
+                    "grading_solved": True,
+                    "solved": 1.0,
+                    "session_id": getattr(base, "session_id", None),
+                },
+                train_metadata={"objective": "sft"},
+            )
+        ]
 
     async def run_case(monkeypatch):
         tok = FakeTokenizer()
@@ -345,6 +369,8 @@ def test_generate_keeps_solved_force_tag_retry():
         _patch_sglang_turns(monkeypatch, tok, 4)
         monkeypatch.setattr(gen.asyncio, "sleep", _fast_sleep)
         monkeypatch.setattr(swe, "run_evaluation", fail_then_pass)
+        monkeypatch.setattr(gen, "build_sft_samples", fake_build_sft)
+
         async def nonempty_diff(_sb, _workdir):
             return "diff --git a/f.py b/f.py\n+fixed\n"
 
@@ -356,19 +382,24 @@ def test_generate_keeps_solved_force_tag_retry():
         samples = await gen.generate(_args(), sample, sampling_params={"max_new_tokens": 32})
 
         assert n_eval["n"] == 2
-        retry = [
+        sft = [
             s
             for s in samples
+            if (s.metadata or {}).get("objective") == "sft"
+            or (getattr(s, "train_metadata", None) or {}).get("objective") == "sft"
+        ]
+        grpo = [s for s in samples if s not in sft]
+        force_grpo = [
+            s
+            for s in grpo
             if str(s.session_id or "").endswith("-force")
             or str((s.metadata or {}).get("session_id") or "").endswith("-force")
+            or (s.metadata or {}).get("offload_force_retry")
         ]
-        first = [s for s in samples if s not in retry]
-        assert first, "unsolved first pass stays in GRPO"
-        assert retry, "solved retry should enter GRPO"
-        assert all(
-            float((s.metadata or {}).get("solved") or 0) == 1.0 or (s.metadata or {}).get("grading_solved")
-            for s in retry
-        )
+        assert grpo, "unsolved first pass stays in GRPO"
+        assert sft, "solved force retry should emit SFT"
+        assert not force_grpo, "forced tags must not enter GRPO"
+        assert all((s.metadata or {}).get("grading_solved") for s in sft)
         rids = [s.rollout_id for s in samples]
         assert None not in rids
         assert len(set(rids)) == 1

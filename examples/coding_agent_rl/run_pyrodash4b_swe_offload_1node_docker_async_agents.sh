@@ -64,7 +64,7 @@ export OFFLOAD_UNIQUE_SOLVER_BONUS="${OFFLOAD_UNIQUE_SOLVER_BONUS:-0.15}"
 export OFFLOAD_NO_SEEK_PENALTY="${OFFLOAD_NO_SEEK_PENALTY:-0.15}"
 # Compact: any open-without-close → remove_sample (loss_mask=0). Aligned with
 # malformed open-run threshold (see offload.DEFAULT_COMPACT_*).
-export OFFLOAD_COMPACT_ORPHAN_OPEN_K="${OFFLOAD_COMPACT_ORPHAN_OPEN_K:-1}"
+export OFFLOAD_COMPACT_ORPHAN_OPEN_K="${OFFLOAD_COMPACT_ORPHAN_OPEN_K:-2}"
 export OFFLOAD_COMPACT_SPECIAL_TOKEN_RUN="${OFFLOAD_COMPACT_SPECIAL_TOKEN_RUN:-8}"
 export OFFLOAD_COMPACT_OPEN_CLOSE_RATIO="${OFFLOAD_COMPACT_OPEN_CLOSE_RATIO:-3.0}"
 export OFFLOAD_COMPACT_SPECIAL_TOKEN_RATIO="${OFFLOAD_COMPACT_SPECIAL_TOKEN_RATIO:-0.2}"
@@ -87,7 +87,7 @@ export SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS="${SLIME_FORK_MERGE_MAX_RESPONSE_TOK
 # Embed GLM continuation into Sample.tokens with loss_mask=0 (default on).
 export SLIME_OFFLOAD_EMBED_IN_TRAJECTORY="${SLIME_OFFLOAD_EMBED_IN_TRAJECTORY:-1}"
 # Mixed L = L_GRPO + λ_sft L_SFT. Multiturn: one long seq / episode, all assistant turns.
-export OFFLOAD_SFT_LAMBDA="${OFFLOAD_SFT_LAMBDA:-0.16}"
+export OFFLOAD_SFT_LAMBDA="${OFFLOAD_SFT_LAMBDA:-0.6}"
 # Cap SFT assistant turns from the end. Default 0 = include every round in one multiturn row.
 export OFFLOAD_SFT_MAX_SAMPLES="${OFFLOAD_SFT_MAX_SAMPLES:-0}"
 # Bootstrap tag skill on inits that never emit <|llm_offload|> (e.g. SFT-0828):
@@ -96,9 +96,10 @@ export OFFLOAD_SFT_MAX_SAMPLES="${OFFLOAD_SFT_MAX_SAMPLES:-0}"
 # PROB (0.5) insert. On retry, skip if this turn already has a tag or retry
 # offload turns already ≥ TRAJ_FRAC. After the tag, drop SLM text and
 # call GLM on the normal offload path. At most once per turn.
-# N uniform 0-9 inside think; prefix trains, tag+GLM are mask=0.
-# Solved first-pass and solved retry emit SFT. First-pass failures stay
-# GRPO-only. Unsolved / aborted retry is dropped (not GRPO, not SFT).
+# N uniform 0-9 inside think; force success → SFT (tag kept); GLM mask=0.
+# Solved first-pass: GRPO (+ optional SFT). Solved force retry: SFT only
+# (no GRPO on spliced tags). First-pass failures stay GRPO-only.
+# Unsolved / aborted retry is dropped (not GRPO, not SFT).
 export OFFLOAD_FORCE_TAG_PROB="${OFFLOAD_FORCE_TAG_PROB:-0.5}"
 export OFFLOAD_FORCE_TAG_TRAJ_FRAC="${OFFLOAD_FORCE_TAG_TRAJ_FRAC:-0.3}"
 export OFFLOAD_FORCE_TAG_MIN_TURN="${OFFLOAD_FORCE_TAG_MIN_TURN:-0}"
@@ -106,7 +107,7 @@ export OFFLOAD_FORCE_TAG_MAX="${OFFLOAD_FORCE_TAG_MAX:-0}"
 # Leave OFFLOAD_FORCE_TAG_N unset for random 0-9; set it to pin a digit in debug.
 # Forced offload SFT must keep the tag (p=1). Natural offload turns also keep it
 # during bootstrap; lower toward 0.3 once the policy emits tags on its own.
-export OFFLOAD_SFT_TAG_PROB="${OFFLOAD_SFT_TAG_PROB:-0.6}"
+export OFFLOAD_SFT_TAG_PROB="${OFFLOAD_SFT_TAG_PROB:-0.9}"
 # Left-trim SFT history, keep the tail (GLM y). SFT response_length ≈ full seq so
 # a 177k row OOMs on [T,V] FP32 softmax even with CP=6; 148746 already trained.
 # 0 = no cap. GRPO packing is unchanged.

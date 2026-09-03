@@ -6,12 +6,12 @@ generate() is a four-stage orchestrator: swe.prepare_workspace + harness.run
 -> swe.git_diff -> swe.run_evaluation -> adapter.finish_session. If teacher-force
 is on and the first pass is unsolved, that traj still enters GRPO, then
 ``generate()`` reruns once with force-tag insert unless first-pass offload
-turns are already ≥ ``OFFLOAD_FORCE_TAG_TRAJ_FRAC``. A solved retry (GRPO + SFT)
-is concatenated onto the first pass, so the group can exceed
-``n_samples_per_prompt``. An unsolved or aborted retry is dropped: it does not
-enter GRPO or SFT. First-pass failures still train. SFT is solved-only. The
-harness is chosen per sample via ``metadata.agent``
-(fallback: ``SWE_AGENT`` env);
+turns are already ≥ ``OFFLOAD_FORCE_TAG_TRAJ_FRAC``. A solved retry emits
+**SFT only** (forced tags are off-policy for GRPO) and is concatenated onto
+the first-pass GRPO rows. An unsolved or aborted retry is dropped: it does not
+enter GRPO or SFT. First-pass failures still train. Natural solved trajs may
+still emit SFT alongside GRPO. The harness is chosen per sample via
+``metadata.agent`` (fallback: ``SWE_AGENT`` env);
 see ``agents_registry``. All agents except ``codex`` use the Anthropic (CC)
 adapter; ``codex`` uses the OpenAI adapter. Both protocols share one HTTP server.
 Sandbox-side work is split across three layers: the provider-agnostic sandbox
@@ -728,14 +728,25 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     return result_samples
 
                 # Online SFT: solved trajectories only (solo or offload). Failures stay GRPO-only.
-                if offload.offload_enabled() and solved == 1.0:
+                # Force-tag retry success: SFT only (skip GRPO on spliced tags).
+                sft_samples: list[Sample] = []
+                if float(solved) == 1.0 and (offload.offload_enabled() or is_force_retry):
                     sft_samples = build_sft_samples(
                         grpo_samples=samples,
                         tokenizer=state.tokenizer,
                         grading_solved=True,
                     )
-                    if sft_samples:
-                        samples = list(samples) + sft_samples
+                if is_force_retry:
+                    result_samples = list(sft_samples)
+                    logger.info(
+                        "[coding_agent_rl] %s: force-tag retry solved; SFT-only n=%d (no GRPO)",
+                        instance_id,
+                        len(result_samples),
+                    )
+                    return result_samples
+
+                if sft_samples:
+                    samples = list(samples) + sft_samples
 
                 if agent_exit_code != 0:
                     reason = "time budget exceeded" if agent_exit_code < 0 else f"CLI error (exit {agent_exit_code})"
@@ -805,11 +816,11 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
         base_sample.metadata = md
         base_sample.session_id = f"{session_id}-force"
         second_pass = await generate(args, base_sample, sampling_params, evaluation)
-        kept = _keep_solved_retry_samples(list(second_pass or []))
+        kept = _keep_force_retry_sft_samples(list(second_pass or []))
         _stamp_compact_rollout_id(first_pass or [base_sample], kept)
         if not kept:
             logger.info(
-                "[coding_agent_rl] %s: force-tag retry produced no solved traj; keep first-pass GRPO only",
+                "[coding_agent_rl] %s: force-tag retry produced no SFT; keep first-pass GRPO only",
                 instance_id,
             )
         out = first_pass + kept
@@ -866,13 +877,17 @@ def _sample_is_solved(sample: Sample) -> bool:
         return False
 
 
-def _keep_solved_retry_samples(samples: list[Sample]) -> list[Sample]:
-    """Retry trains only when the second pass graded solved (GRPO + SFT)."""
+def _keep_force_retry_sft_samples(samples: list[Sample]) -> list[Sample]:
+    """Force-tag retry contributes solved SFT rows only (never GRPO)."""
     kept: list[Sample] = []
     for sample in samples:
         if getattr(sample, "status", None) == Sample.Status.ABORTED:
             continue
         if (sample.metadata or {}).get("abort_reason"):
+            continue
+        md = sample.metadata or {}
+        tmd = getattr(sample, "train_metadata", None) or {}
+        if md.get("objective") != "sft" and tmd.get("objective") != "sft":
             continue
         if _sample_is_solved(sample):
             kept.append(sample)

@@ -647,7 +647,9 @@ def test_decide_force_offload_only_on_failed_retry(monkeypatch):
     )
 
 
-def test_append_forced_offload_span_masks_tag():
+def test_append_forced_offload_span_trains_tag():
+    """Forced OPEN+N+CLOSE must keep loss_mask=1 so GRPO can learn the span."""
+
     class _Tok:
         def encode(self, text, add_special_tokens=False):
             return [ord(c) for c in text]
@@ -671,8 +673,10 @@ def test_append_forced_offload_span_masks_tag():
     span = f"{offload.OFFLOAD_OPEN}5{offload.OFFLOAD_CLOSE}"
     assert out.endswith(span)
     assert parsed[1] in "still thinking" or "still thinking".startswith(parsed[1])
-    assert 1 in turn.output_loss_mask
-    assert turn.output_loss_mask[-1] == 0
+    assert turn.output_loss_mask
+    assert all(m == 1 for m in turn.output_loss_mask)
+    tag_ids = _Tok().encode(span, add_special_tokens=False)
+    assert turn.output_ids[-len(tag_ids) :] == tag_ids
     assert len(turn.output_log_probs) == len(turn.output_ids)
     assert len(turn.output_loss_mask) == len(turn.output_ids)
 

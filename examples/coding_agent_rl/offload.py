@@ -39,15 +39,16 @@ Train shaping (when ``SLIME_AGENT_OFFLOAD=1``):
     agent pass never splices (keep solo solves clean). If that pass is unsolved
     and p>0, ``generate()`` keeps the failed traj for GRPO and retries with
     insert enabled, unless first-pass offload turns are already ≥
-    ``OFFLOAD_FORCE_TAG_TRAJ_FRAC`` (launcher 0.3). A solved retry joins GRPO
-    (and SFT); an unsolved or aborted retry is discarded. Group size may exceed
-    ``n_samples_per_prompt`` when the retry solves. On retry, skip if this turn
-    already has a tag, or retry offload turns are already ≥ the same frac. Else
-    splice
+    ``OFFLOAD_FORCE_TAG_TRAJ_FRAC`` (launcher 0.3). A solved retry emits
+    **SFT only** (forced tags stay out of GRPO); an unsolved or aborted retry
+    is discarded. On retry, skip if this turn already has a tag, or retry
+    offload turns are already ≥ the same frac. Else splice
     ``OPEN+N+CLOSE`` inside think with independent probability (launcher 0.5),
     **drop all SLM text after the tag**, then call GLM on the normal offload
-    path. Prefix SLM tokens stay trainable; the spliced tag and GLM suffix are
-    ``loss_mask=0``. ``N`` uniform 0–9. At most once per turn.
+    path. Forced spans are distilled via SFT (``OFFLOAD_SFT_TAG_PROB`` / always
+    keep tag on ``forced_offload`` turns); only the GLM suffix is
+    ``loss_mask=0`` on any GRPO row that still embeds it. ``N`` uniform 0–9.
+    At most once per turn.
   - Hard compact filter + group α:
     :func:`compact_and_shape_group_help_seeking_rewards`.
   - Turn-painted advantages:
@@ -433,7 +434,12 @@ def append_forced_offload_span(
     n: int | None = None,
     rng: random.Random | None = None,
 ) -> str | None:
-    """Truncate at a spliced OPEN+N+CLOSE; prefix stays trainable, tag is mask=0."""
+    """Truncate at a spliced OPEN+N+CLOSE; prefix and tag keep ``loss_mask=1``.
+
+    GLM continuation (if any) is appended later with ``loss_mask=0``. Force-retry
+    rows are distilled via SFT only (not GRPO); placeholder rollout logprobs (0)
+    remain on the discarded GRPO finish path.
+    """
     if tokenizer is None:
         return None
     digit = sample_force_tag_n(rng) if n is None else min(9, max(0, int(n)))
@@ -456,7 +462,8 @@ def append_forced_offload_span(
     ids.extend(new_ids)
     mask = turn.output_loss_mask
     mask.clear()
-    mask.extend([1] * n_pre + [0] * n_tag)
+    # Keep tag marked trainable on the finish path (SFT uses turn history).
+    mask.extend([1] * (n_pre + n_tag))
     lps = turn.output_log_probs
     lps.clear()
     lps.extend([0.0] * len(new_ids))

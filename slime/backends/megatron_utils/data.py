@@ -16,6 +16,8 @@ from slime.utils.types import RolloutBatch
 
 from ...utils import logging_utils
 from .cp_utils import (
+    ESS_LOG_KEY,
+    compute_importance_sampling_ess_parts,
     gather_and_reduce_log_dict,
     get_sum_of_sample_mean,
     rollout_log_metric_contribution,
@@ -342,6 +344,21 @@ def log_rollout_data(
                 log_dict[key] = (val.float().mean().item(), 1)
             else:
                 raise ValueError(f"Unsupported type: {type(val)} for key: {key}")
+
+        train_log_probs = rollout_data.get("log_probs")
+        rollout_log_probs = rollout_data.get("rollout_log_probs")
+        if (
+            train_log_probs
+            and rollout_log_probs
+            and len(train_log_probs) == len(rollout_log_probs) == len(loss_masks)
+        ):
+            log_dict[ESS_LOG_KEY] = compute_importance_sampling_ess_parts(
+                train_log_probs,
+                rollout_log_probs,
+                loss_masks,
+                total_lengths,
+                response_lengths,
+            )
 
         reduced_log_dict = gather_log_data("rollout", args, rollout_id, log_dict)
         if args.ci_test and reduced_log_dict is not None:

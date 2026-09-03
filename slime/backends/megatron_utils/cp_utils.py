@@ -168,6 +168,58 @@ def reduce_train_step_metrics(
     return {key: value * cp_factor / num_samples_or_tokens for key, value in zip(keys, values[1:], strict=False)}
 
 
+ESS_LOG_KEY = "ess"
+
+
+def compute_importance_sampling_ess_parts(
+    log_probs: Sequence[torch.Tensor],
+    rollout_log_probs: Sequence[torch.Tensor],
+    loss_masks: Sequence[torch.Tensor],
+    total_lengths: Sequence[int],
+    response_lengths: Sequence[int],
+    *,
+    log_ratio_bound: float = 20.0,
+) -> tuple[float, float]:
+    """Return ``(sum_w, sum_w2)`` for masked token IS weights ``w_i=exp(log_ratio_i)``.
+
+    Standard ESS over the same tokens is ``sum_w ** 2 / sum_w2``.
+    """
+    sum_w = 0.0
+    sum_w2 = 0.0
+    cp_size = mpu.get_context_parallel_world_size()
+
+    for train_lp, rollout_lp, loss_mask, total_length, response_length in zip(
+        log_probs, rollout_log_probs, loss_masks, total_lengths, response_lengths, strict=False
+    ):
+        if train_lp.shape != rollout_lp.shape:
+            raise ValueError(
+                f"log_probs shape {train_lp.shape} != rollout_log_probs shape {rollout_lp.shape}"
+            )
+        log_ratio = (train_lp.float() - rollout_lp.float())
+        if cp_size == 1:
+            mask = loss_mask.float()
+        else:
+            prompt_length = total_length - response_length
+            _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(total_length, response_length)
+            mask_0 = loss_mask[tokens_offset[0][0] - prompt_length : tokens_offset[0][1] - prompt_length].float()
+            mask_1 = loss_mask[tokens_offset[1][0] - prompt_length : tokens_offset[1][1] - prompt_length].float()
+            mask = torch.cat([mask_0, mask_1], dim=0)
+
+        log_ratio = torch.clamp(log_ratio, min=-log_ratio_bound, max=log_ratio_bound)
+        w = torch.exp(log_ratio) * mask
+        sum_w += w.sum().item()
+        sum_w2 += (w * w).sum().item()
+
+    return sum_w, sum_w2
+
+
+def reduce_importance_sampling_ess(sum_w: float, sum_w2: float) -> float:
+    """ESS = (Σ w_i)² / Σ w_i² from aggregated weight sums."""
+    if sum_w2 <= 1e-12:
+        return float("nan")
+    return (sum_w * sum_w) / sum_w2
+
+
 def rollout_log_metric_contribution(
     per_rank_reducer_sum: float,
     *,
@@ -221,6 +273,11 @@ def gather_and_reduce_log_dict(
         for key in log_dict:
             values = [d[key] for d in gathered]
             first = values[0]
+            if key == ESS_LOG_KEY:
+                total_sum_w = sum(v[0] for v in values)
+                total_sum_w2 = sum(v[1] for v in values)
+                reduced[key] = reduce_importance_sampling_ess(total_sum_w, total_sum_w2)
+                continue
             if isinstance(first, tuple) and len(first) == 2:
                 total_sum = sum(v[0] for v in values)
                 total_count = sum(v[1] for v in values)
