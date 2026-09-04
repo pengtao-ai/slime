@@ -638,7 +638,8 @@ def test_build_route_offload_turn_trains_tag():
 
 
 def test_soft_route_sampling_overrides(monkeypatch):
-    monkeypatch.setenv("OFFLOAD_ROUTE_OPEN_BIAS", "4.5")
+    monkeypatch.setenv("OFFLOAD_ROUTE_STEP_BIAS", "4.5")
+    monkeypatch.delenv("OFFLOAD_ROUTE_OPEN_BIAS", raising=False)
     monkeypatch.setenv("OFFLOAD_ROUTE_MAX_NEW_TOKENS", "32")
     monkeypatch.setenv("OFFLOAD_OPEN_TOKEN_ID", "248077")
     monkeypatch.setenv("OFFLOAD_CLOSE_TOKEN_ID", "248078")
@@ -646,6 +647,29 @@ def test_soft_route_sampling_overrides(monkeypatch):
     assert overrides["max_new_tokens"] == 32
     assert overrides["stop_token_ids"] == [248078]
     assert overrides["logit_bias"] == {"248077": 4.5}
+
+
+def test_constrained_step_overrides(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_ROUTE_STEP_BIAS", "100")
+    monkeypatch.delenv("OFFLOAD_ROUTE_OPEN_BIAS", raising=False)
+    overrides = offload.constrained_step_overrides([248077, 15, 16])
+    assert overrides["max_new_tokens"] == 1
+    assert overrides["stop_token_ids"] == []
+    assert overrides["logit_bias"] == {"248077": 100.0, "15": 100.0, "16": 100.0}
+
+
+def test_digit_token_ids_and_inverse():
+    class _Tok:
+        def encode(self, text, add_special_tokens=False):
+            del add_special_tokens
+            if len(text) == 1 and text.isdigit():
+                return [1000 + int(text)]
+            return [1, 2]
+
+    ids = offload.digit_token_ids(_Tok())
+    assert ids == {d: 1000 + d for d in range(10)}
+    assert offload.digit_from_token_id(1007, ids) == 7
+    assert offload.digit_from_token_id(999, ids) is None
 
 
 def test_mark_route_attempt_blocks_second_decide(monkeypatch):

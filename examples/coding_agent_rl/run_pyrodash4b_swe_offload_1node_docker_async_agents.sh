@@ -90,15 +90,15 @@ export SLIME_OFFLOAD_EMBED_IN_TRAJECTORY="${SLIME_OFFLOAD_EMBED_IN_TRAJECTORY:-1
 export OFFLOAD_SFT_LAMBDA="${OFFLOAD_SFT_LAMBDA:-0}"
 # Cap SFT assistant turns from the end. Default 0 = include every round in one multiturn row.
 export OFFLOAD_SFT_MAX_SAMPLES="${OFFLOAD_SFT_MAX_SAMPLES:-0}"
-# Soft-route offload (GRPO): with probability PROB, short SGLang generate with
-# logit_bias on OPEN (OPEN_BIAS) and stop on CLOSE (MAX_NEW_TOKENS). The model
-# must sample <|llm_offload|>N<|/llm_offload|> (real logprobs → GRPO); miss →
-# fall through to a normal full generate. Caps: TRAJ_FRAC / MIN_TURN / MAX.
-# No hard inject / no fail-retry. Natural emits still work when coin does not fire.
+# Soft-route offload (GRPO): with probability PROB, 3-step constrained decode
+# (max_new_tokens=1 each) with STEP_BIAS on the allow-list only:
+#   OPEN → digit 0-9 (model samples N) → CLOSE.
+# Real stepwise logprobs → GRPO; any step miss → normal full generate.
+# Caps: TRAJ_FRAC / MIN_TURN / MAX. No hard inject / no fail-retry.
 export OFFLOAD_ROUTE_PROB="${OFFLOAD_ROUTE_PROB:-${OFFLOAD_FORCE_TAG_PROB:-0.5}}"
 export OFFLOAD_FORCE_TAG_PROB="${OFFLOAD_FORCE_TAG_PROB:-${OFFLOAD_ROUTE_PROB}}"
-export OFFLOAD_ROUTE_OPEN_BIAS="${OFFLOAD_ROUTE_OPEN_BIAS:-6.0}"
-export OFFLOAD_ROUTE_MAX_NEW_TOKENS="${OFFLOAD_ROUTE_MAX_NEW_TOKENS:-48}"
+export OFFLOAD_ROUTE_STEP_BIAS="${OFFLOAD_ROUTE_STEP_BIAS:-${OFFLOAD_ROUTE_OPEN_BIAS:-100}}"
+export OFFLOAD_ROUTE_OPEN_BIAS="${OFFLOAD_ROUTE_OPEN_BIAS:-${OFFLOAD_ROUTE_STEP_BIAS}}"
 export OFFLOAD_FORCE_TAG_TRAJ_FRAC="${OFFLOAD_FORCE_TAG_TRAJ_FRAC:-0.3}"
 export OFFLOAD_FORCE_TAG_MIN_TURN="${OFFLOAD_FORCE_TAG_MIN_TURN:-0}"
 export OFFLOAD_FORCE_TAG_MAX="${OFFLOAD_FORCE_TAG_MAX:-0}"
@@ -117,9 +117,9 @@ fi
 
 # ---- PyroDash checkpoints (BF16 train + BF16 rollout) ----
 # SGLang loads padded HF vocab rows; Megatron torch_dist is padded to 248320.
-# SFT-0902 / SFT-0828 rarely emit offload tags: keep OFFLOAD_ROUTE_PROB>0 and
-# OPEN_BIAS>0 so soft explore raises P(tag) with on-policy logprobs. Inits that
-# already seek can set OFFLOAD_ROUTE_PROB=0.
+# SFT-0902 / SFT-0828 rarely emit offload tags: keep OFFLOAD_ROUTE_PROB>0 so
+# constrained 3-step explore puts OPEN+N+CLOSE into GRPO. Inits that already
+# seek can set OFFLOAD_ROUTE_PROB=0.
 export HF_CHECKPOINT="${HF_CHECKPOINT:-/workspace/models/pyromind/PyroDash-4B-SFT-0803}"
 export REF_MODEL_PATH="${REF_MODEL_PATH:-/workspace/models/pyromind/PyroDash-4B-SFT-0803_torch_dist}"
 # FP8 KV cache for longer agent decode contexts (rollout only; weights stay BF16).

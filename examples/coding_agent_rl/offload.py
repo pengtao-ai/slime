@@ -35,12 +35,12 @@ Train shaping (when ``SLIME_AGENT_OFFLOAD=1``):
     unrepaired spam (``OFFLOAD_COMPACT_ORPHAN_OPEN_K``, default 1).
   - Post-decode :func:`truncate_offload_open_spam` cuts runaway OPEN spam before
     GLM / agent flush (does not stop SGLang mid-generate).
-  - Optional **soft route** offload (``OFFLOAD_ROUTE_PROB`` / legacy
+  - Optional **constrained soft route** (``OFFLOAD_ROUTE_PROB`` / legacy
     ``OFFLOAD_FORCE_TAG_PROB``, default off): with probability ``p`` at turn
-    start, run a short SGLang generate with ``logit_bias`` on OPEN
-    (``OFFLOAD_ROUTE_OPEN_BIAS``, default 6) and stop on CLOSE. The **model**
-    must sample ``OPEN+N+CLOSE`` (real rollout logprobs → GRPO). On miss, fall
-    through to a normal full generate. Caps: ``OFFLOAD_FORCE_TAG_TRAJ_FRAC``,
+    start, run **three** SGLang steps (``max_new_tokens=1``) with heavy
+    ``logit_bias`` on the allowed set only: OPEN → digit ``0-9`` (model
+    samples ``N``) → CLOSE. Real stepwise logprobs → GRPO. On any step miss,
+    fall through to a normal full generate. Caps: ``OFFLOAD_FORCE_TAG_TRAJ_FRAC``,
     min turn, max per session. No fail-retry / no hard tag inject / SFT optional.
   - Hard compact filter + group α:
     :func:`compact_and_shape_group_help_seeking_rewards`.
@@ -376,10 +376,11 @@ def decide_route_offload(
     *,
     rng: random.Random | None = None,
 ) -> bool:
-    """Bernoulli: attempt a **soft** explore generate this turn (bias OPEN, model samples).
+    """Bernoulli: attempt constrained OPEN→digit→CLOSE explore this turn.
 
-    Does not inject the tag. On miss, the adapter falls through to a normal
-    full generate. Caps: traj offload frac, min turn, once per turn index, max.
+    Does not hard-inject the tag. On any step miss, the adapter falls through
+    to a normal full generate. Caps: traj offload frac, min turn, once per
+    turn index, max.
     """
     if route_prob() <= 0.0:
         return False
@@ -410,17 +411,31 @@ def decide_force_offload(
     return decide_route_offload(session, rng=rng)
 
 
-def route_open_bias() -> float:
-    """Logit bias added to OPEN during soft-route explore (0 = no bias)."""
-    raw = (os.environ.get("OFFLOAD_ROUTE_OPEN_BIAS") or "6.0").strip()
+def route_step_bias() -> float:
+    """Logit bias on the allowed token set for each constrained soft-route step.
+
+    Default 100 so a single-token decode is dominated by the allow-list.
+    Falls back to ``OFFLOAD_ROUTE_OPEN_BIAS`` when ``OFFLOAD_ROUTE_STEP_BIAS``
+    is unset (legacy).
+    """
+    raw = (
+        os.environ.get("OFFLOAD_ROUTE_STEP_BIAS")
+        or os.environ.get("OFFLOAD_ROUTE_OPEN_BIAS")
+        or "100"
+    ).strip()
     try:
         return float(raw)
     except ValueError:
-        return 6.0
+        return 100.0
+
+
+def route_open_bias() -> float:
+    """Deprecated alias of :func:`route_step_bias` (OPEN-only soft explore)."""
+    return route_step_bias()
 
 
 def route_max_new_tokens() -> int:
-    """Short decode budget for soft-route explore (stop on CLOSE)."""
+    """Unused by constrained 3-step route; kept for config dump / legacy."""
     raw = (os.environ.get("OFFLOAD_ROUTE_MAX_NEW_TOKENS") or "48").strip()
     try:
         return max(4, int(raw))
@@ -428,15 +443,52 @@ def route_max_new_tokens() -> int:
         return 48
 
 
+def digit_token_ids(tokenizer: Any) -> dict[int, int]:
+    """Map digit ``0..9`` → single token id; skips digits that are not one token."""
+    out: dict[int, int] = {}
+    if tokenizer is None:
+        return out
+    for d in range(10):
+        try:
+            ids = list(tokenizer.encode(str(d), add_special_tokens=False))
+        except Exception:
+            continue
+        if len(ids) == 1:
+            out[d] = int(ids[0])
+    return out
+
+
+def digit_from_token_id(token_id: int, digit_ids: dict[int, int]) -> int | None:
+    """Inverse of :func:`digit_token_ids`; ``None`` if ``token_id`` is not a digit."""
+    for d, tid in digit_ids.items():
+        if int(tid) == int(token_id):
+            return int(d)
+    return None
+
+
+def constrained_step_overrides(allowed_token_ids: list[int]) -> dict[str, Any]:
+    """One-token decode with heavy bias on ``allowed_token_ids`` only."""
+    bias = route_step_bias()
+    allowed = [int(t) for t in allowed_token_ids]
+    overrides: dict[str, Any] = {
+        "max_new_tokens": 1,
+        # Avoid stopping before the single step completes.
+        "stop_token_ids": [],
+        "stop": [],
+    }
+    if bias != 0.0 and allowed:
+        overrides["logit_bias"] = {str(tid): bias for tid in allowed}
+    return overrides
+
+
 def soft_route_sampling_overrides() -> dict[str, Any]:
-    """SGLang sampling knobs for soft explore: bias OPEN, stop on CLOSE, short N."""
+    """Legacy free-form soft explore (OPEN bias + stop CLOSE). Prefer 3-step path."""
     overrides: dict[str, Any] = {
         "max_new_tokens": route_max_new_tokens(),
         "stop_token_ids": [offload_close_token_id()],
     }
-    bias = route_open_bias()
+    bias = route_step_bias()
     if bias != 0.0:
-        # SGLang expects string keys → int token ids.
         overrides["logit_bias"] = {str(offload_open_token_id()): bias}
     return overrides
 
@@ -448,7 +500,7 @@ def build_route_offload_turn(
     n: int | None = None,
     rng: random.Random | None = None,
 ) -> TurnRecord | None:
-    """Legacy hard inject (tests only). Live path uses soft SGLang explore."""
+    """Legacy hard inject (tests only). Live path uses constrained 3-step explore."""
     if tokenizer is None:
         return None
     digit = sample_force_tag_n(rng) if n is None else min(9, max(0, int(n)))
@@ -636,7 +688,8 @@ def resolved_train_config() -> dict[str, Any]:
         "OFFLOAD_SFT_MAX_SEQ_LEN": offload_sft.sft_max_seq_len(),
         "OFFLOAD_SFT_TAG_PROB": offload_sft.sft_tag_prob(),
         "OFFLOAD_ROUTE_PROB": route_prob(),
-        "OFFLOAD_ROUTE_OPEN_BIAS": route_open_bias(),
+        "OFFLOAD_ROUTE_STEP_BIAS": route_step_bias(),
+        "OFFLOAD_ROUTE_OPEN_BIAS": route_open_bias(),  # alias of step bias
         "OFFLOAD_ROUTE_MAX_NEW_TOKENS": route_max_new_tokens(),
         "OFFLOAD_FORCE_TAG_PROB": force_tag_prob(),  # legacy alias
         "OFFLOAD_FORCE_TAG_TRAJ_FRAC": force_tag_traj_frac(),

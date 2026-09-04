@@ -5,10 +5,10 @@
 generate() is a four-stage orchestrator: swe.prepare_workspace + harness.run
 -> swe.git_diff -> swe.run_evaluation -> adapter.finish_session. When
 ``OFFLOAD_ROUTE_PROB`` / ``OFFLOAD_FORCE_TAG_PROB`` > 0, each agent turn may
-Bernoulli-soft-explore: short SGLang generate with ``logit_bias`` on OPEN; only
-if the **model** samples a valid in-think ``OPEN+N+CLOSE`` (real logprobs) does
-that turn skip the full generate and call GLM. Miss → normal full generate.
-Optional online SFT still emits when ``OFFLOAD_SFT_LAMBDA`` > 0. Harness via
+Bernoulli-route a **3-step constrained** explore (OPEN → digit → CLOSE) with
+allow-list ``logit_bias``; ``N`` is model-sampled. Hit → GLM with real logprobs
+in GRPO; miss → normal full generate. Optional online SFT still emits when
+``OFFLOAD_SFT_LAMBDA`` > 0. Harness via
 ``metadata.agent`` (fallback: ``SWE_AGENT`` env);
 see ``agents_registry``. All agents except ``codex`` use the Anthropic (CC)
 adapter; ``codex`` uses the OpenAI adapter. Both protocols share one HTTP server.
@@ -120,50 +120,119 @@ class _OffloadMixin:
         *,
         sid: str,
     ) -> TurnRecord | None:
-        """Soft route: biased short generate; accept only if model emits valid tag."""
+        """Constrained soft route: OPEN → digit → CLOSE (one token each)."""
         if not offload.offload_enabled():
             return None
         if not offload.decide_route_offload(session):
             return None
         offload.mark_route_attempt(session)
         turn_index = int(((session.timing or {}).get("current_turn", 0) or 0))
-        try:
-            turn = await call_sglang_generate(
-                prompt_ids,
-                session,
-                body,
-                adapter=self,
-                session_id=sid,
-                sampling_overrides=offload.soft_route_sampling_overrides(),
-            )
-        except Exception:
-            logger.exception(
-                "[coding_agent_rl] sid=%s soft-route explore failed turn=%d; fall through",
+        tokenizer = self.tokenizer
+        if tokenizer is None:
+            logger.warning(
+                "[coding_agent_rl] sid=%s soft-route miss turn=%d (no tokenizer)",
                 sid,
                 turn_index,
             )
             return None
-        raw = ""
-        if turn.output_ids and self.tokenizer is not None:
-            raw = self.tokenizer.decode(turn.output_ids, skip_special_tokens=False)
-        parsed = offload.parse_valid_offload_directive(raw)
-        if parsed is None:
-            logger.info(
-                "[coding_agent_rl] sid=%s soft-route miss turn=%d (no valid in-think tag)",
+        digit_ids = offload.digit_token_ids(tokenizer)
+        if len(digit_ids) < 10:
+            logger.warning(
+                "[coding_agent_rl] sid=%s soft-route miss turn=%d (digit token map size=%d)",
                 sid,
                 turn_index,
+                len(digit_ids),
             )
             return None
-        digit, _ = parsed
+        open_id = offload.offload_open_token_id()
+        close_id = offload.offload_close_token_id()
+
+        async def _one(prefix: list[int], allowed: list[int]) -> TurnRecord | None:
+            try:
+                return await call_sglang_generate(
+                    prefix,
+                    session,
+                    body,
+                    adapter=self,
+                    session_id=sid,
+                    sampling_overrides=offload.constrained_step_overrides(allowed),
+                )
+            except Exception:
+                logger.exception(
+                    "[coding_agent_rl] sid=%s constrained soft-route step failed turn=%d",
+                    sid,
+                    turn_index,
+                )
+                return None
+
+        def _take_one(turn: TurnRecord | None, allowed: set[int], label: str) -> tuple[int, float] | None:
+            if turn is None or not turn.output_ids:
+                logger.info(
+                    "[coding_agent_rl] sid=%s soft-route miss turn=%d (%s empty)",
+                    sid,
+                    turn_index,
+                    label,
+                )
+                return None
+            tok = int(turn.output_ids[0])
+            if tok not in allowed:
+                logger.info(
+                    "[coding_agent_rl] sid=%s soft-route miss turn=%d (%s got id=%d)",
+                    sid,
+                    turn_index,
+                    label,
+                    tok,
+                )
+                return None
+            lp = 0.0
+            if turn.output_log_probs:
+                lp = float(turn.output_log_probs[0])
+            return tok, lp
+
+        prefix = list(prompt_ids)
+        out_ids: list[int] = []
+        out_lps: list[float] = []
+
+        step_open = await _one(prefix, [open_id])
+        taken = _take_one(step_open, {open_id}, "OPEN")
+        if taken is None:
+            return None
+        out_ids.append(taken[0])
+        out_lps.append(taken[1])
+        prefix = prefix + out_ids
+
+        step_digit = await _one(prefix, list(digit_ids.values()))
+        taken = _take_one(step_digit, set(digit_ids.values()), "digit")
+        if taken is None:
+            return None
+        digit = offload.digit_from_token_id(taken[0], digit_ids)
+        if digit is None:
+            return None
+        out_ids.append(taken[0])
+        out_lps.append(taken[1])
+        prefix = list(prompt_ids) + out_ids
+
+        step_close = await _one(prefix, [close_id])
+        taken = _take_one(step_close, {close_id}, "CLOSE")
+        if taken is None:
+            return None
+        out_ids.append(taken[0])
+        out_lps.append(taken[1])
+
         offload.mark_routed_offload(session, digit=digit)
         logger.info(
-            "[coding_agent_rl] sid=%s soft-route hit N=%d turn=%d out_tok=%d",
+            "[coding_agent_rl] sid=%s soft-route hit N=%d turn=%d (constrained 3-step)",
             sid,
             digit,
             turn_index,
-            len(turn.output_ids or []),
         )
-        return turn
+        return TurnRecord(
+            prompt_ids=list(prompt_ids),
+            output_ids=out_ids,
+            finish_reason="stop",
+            output_log_probs=out_lps,
+            output_loss_mask=[1, 1, 1],
+        )
 
     async def _postprocess_reply(
         self,

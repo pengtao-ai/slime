@@ -211,7 +211,7 @@ class BaseAdapter:
         """Optional hook before the main SGLang ``/generate``.
 
         Return a ``TurnRecord`` to skip the full local generate (e.g. coding-agent
-        soft-route explore that already sampled a valid ``OPEN+N+CLOSE``).
+        constrained soft-route that sampled ``OPEN+N+CLOSE`` in three steps).
         Default ``None`` → normal ``call_sglang_generate``.
         """
         del prompt_ids, session, body, sid
