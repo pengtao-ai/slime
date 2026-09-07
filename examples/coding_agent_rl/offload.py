@@ -52,9 +52,10 @@ Train shaping (when ``SLIME_AGENT_OFFLOAD=1``):
     ``OFFLOAD_ROUTE_ANNEAL_STEPS`` (train ``rollout_id``). Reward knobs can
     anneal on the same (or ``OFFLOAD_REWARD_ANNEAL_STEPS``) schedule: early
     high seek α / no-seek penalty; late higher efficiency λ / unique-solver.
-    After ``OFFLOAD_SEEK_NATURAL_ONLY_AFTER`` (launcher 20), seek α / no-seek
-    exemption count **natural** in-think offloads only (``valid && !forced``);
-    routed tags remain for GRPO tag exposure but no longer earn seek credit.
+    Seek α / no-seek can switch to **natural-only** (``valid && !forced``) via
+    ``OFFLOAD_SEEK_NATURAL_ONLY_AFTER`` (step floor) and/or
+    ``OFFLOAD_SEEK_NATURAL_ONLY_MIN_NAT_T`` (latch when rolling ``nat_t`` EMA
+    clears the bar). Routed tags stay for GRPO exposure after the switch.
   - Hard compact filter + group α:
     :func:`compact_and_shape_group_help_seeking_rewards`.
   - Turn-painted advantages:
@@ -259,6 +260,10 @@ def force_tag_prob() -> float:
 
 # Train-step index for route annealing (same process as fully-async / sync rollout).
 _route_anneal_step: int = 0
+# Rolling turn-level natural-offload fraction (nat_t) + one-way natural-only latch.
+_nat_t_ema: float = 0.0
+_natural_only_latched: bool = False
+_NAT_T_EMA_ALPHA = 0.25
 
 
 def set_route_anneal_step(step: int) -> None:
@@ -268,6 +273,8 @@ def set_route_anneal_step(step: int) -> None:
         _route_anneal_step = max(0, int(step))
     except (TypeError, ValueError):
         _route_anneal_step = 0
+    # Step floor may now be satisfied; try latch if nat_t already high enough.
+    _maybe_latch_natural_only()
 
 
 def route_anneal_step(session: Session | None = None) -> int:
@@ -827,10 +834,11 @@ def seek_only_when_all_wrong() -> bool:
 
 
 def seek_natural_only_after() -> int:
-    """Train step at/after which seek α / no-seek only credit **natural** offloads.
+    """Earliest train step for natural-only seek credit (optional floor).
 
-    ``0`` (default) = always credit routed+natural. Launcher uses ``25`` so early
-    soft-route bootstraps tags, then only ``valid && !forced`` earns seek credit.
+    ``0`` = no step floor. With ``OFFLOAD_SEEK_NATURAL_ONLY_MIN_NAT_T`` unset/0,
+    ``>0`` restores step-only switching (legacy). With a positive min ``nat_t``,
+    this is only a floor — latch still waits for rolling ``nat_t``.
     """
     raw = (os.environ.get("OFFLOAD_SEEK_NATURAL_ONLY_AFTER") or "0").strip()
     try:
@@ -839,8 +847,120 @@ def seek_natural_only_after() -> int:
         return 0
 
 
+def seek_natural_only_min_nat_t() -> float:
+    """Latch natural-only once rolling ``nat_t`` EMA reaches this fraction.
+
+    ``nat_t`` = natural (``valid && !forced``) turns / all turns in the batch.
+    ``0`` disables the latch; use ``OFFLOAD_SEEK_NATURAL_ONLY_AFTER`` alone for
+    step-only switching. Reads ``MIN_NAT_T``, else legacy ``MIN_NAT_S``.
+    """
+    raw = (
+        os.environ.get("OFFLOAD_SEEK_NATURAL_ONLY_MIN_NAT_T")
+        or os.environ.get("OFFLOAD_SEEK_NATURAL_ONLY_MIN_NAT_S")
+        or "0"
+    ).strip()
+    try:
+        return min(1.0, max(0.0, float(raw)))
+    except ValueError:
+        return 0.0
+
+
+def nat_t_ema() -> float:
+    """Current rolling natural-offload turn fraction (process-local)."""
+    return float(_nat_t_ema)
+
+
+def natural_only_latched() -> bool:
+    """True after nat_t (and optional step floor) triggered natural-only mode."""
+    return bool(_natural_only_latched)
+
+
+def reset_natural_only_state() -> None:
+    """Clear EMA / latch (tests or fresh recipe in-process)."""
+    global _nat_t_ema, _natural_only_latched
+    _nat_t_ema = 0.0
+    _natural_only_latched = False
+
+
+def _sample_turn_nat_counts(sample: Any) -> tuple[int, int]:
+    """Return ``(n_turns, n_natural_turns)`` for one GRPO sample."""
+    md = getattr(sample, "metadata", None) or {}
+    if not isinstance(md, dict):
+        return 0, 0
+    stats = md.get("offload_stats") or {}
+    turn_costs = list(md.get("turn_costs") or stats.get("turn_costs") or [])
+    if turn_costs:
+        n_turns = len(turn_costs)
+        n_nat = sum(
+            1
+            for tc in turn_costs
+            if isinstance(tc, dict) and tc.get("valid_offload") and not tc.get("forced_offload")
+        )
+        return n_turns, n_nat
+    # No turn ledger: treat as one synthetic turn if any offload happened.
+    oc = int(stats.get("offload_count", 0) or 0)
+    fc = int(stats.get("forced_offload_count", 0) or 0)
+    if oc < 1:
+        return 0, 0
+    return 1, 1 if max(0, oc - fc) >= 1 else 0
+
+
+def _maybe_latch_natural_only() -> None:
+    """One-way switch: natural-only after min nat_t (and optional step floor)."""
+    global _natural_only_latched
+    if _natural_only_latched:
+        return
+    min_nat = seek_natural_only_min_nat_t()
+    if min_nat <= 0:
+        return
+    after = seek_natural_only_after()
+    step = route_anneal_step()
+    if after > 0 and step < after:
+        return
+    if _nat_t_ema + 1e-12 < min_nat:
+        return
+    _natural_only_latched = True
+    logger.info(
+        "OFFLOAD seek natural-only latched: nat_t_ema=%.3f >= %.3f (step=%d, after=%d)",
+        _nat_t_ema,
+        min_nat,
+        step,
+        after,
+    )
+
+
+def observe_nat_t_from_groups(groups: list) -> float:
+    """Update rolling ``nat_t`` EMA from a rollout sample-filter batch; maybe latch.
+
+    Returns the batch ``nat_t`` (0 if empty). Safe no-op when ``groups`` is empty.
+    """
+    global _nat_t_ema
+    n_turns = 0
+    n_nat = 0
+    for group in groups or []:
+        for item in group:
+            for sample in _session_segments(item):
+                t, n = _sample_turn_nat_counts(sample)
+                n_turns += t
+                n_nat += n
+    if n_turns <= 0:
+        return float(_nat_t_ema)
+    frac = n_nat / float(n_turns)
+    _nat_t_ema = (1.0 - _NAT_T_EMA_ALPHA) * float(_nat_t_ema) + _NAT_T_EMA_ALPHA * frac
+    _maybe_latch_natural_only()
+    return frac
+
+
 def seek_counts_routed_credit(session: Session | None = None) -> bool:
-    """True when routed soft-route offloads still earn seek α / block no-seek."""
+    """True when routed soft-route offloads still earn seek α / block no-seek.
+
+    - If ``OFFLOAD_SEEK_NATURAL_ONLY_MIN_NAT_T>0``: credit routed until the
+      nat_t latch fires (optional ``AFTER`` step floor).
+    - Else if ``OFFLOAD_SEEK_NATURAL_ONLY_AFTER>0``: step-only gate (legacy).
+    - Else: always credit routed+natural.
+    """
+    if seek_natural_only_min_nat_t() > 0:
+        return not _natural_only_latched
     after = seek_natural_only_after()
     if after <= 0:
         return True
@@ -889,6 +1009,9 @@ def resolved_train_config() -> dict[str, Any]:
         # Withhold α only when a sibling solved with offload_count==0.
         "OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG": seek_only_when_all_wrong(),
         "OFFLOAD_SEEK_NATURAL_ONLY_AFTER": seek_natural_only_after(),
+        "OFFLOAD_SEEK_NATURAL_ONLY_MIN_NAT_T": seek_natural_only_min_nat_t(),
+        "OFFLOAD_SEEK_NAT_T_EMA": nat_t_ema(),
+        "OFFLOAD_SEEK_NATURAL_ONLY_LATCHED": natural_only_latched(),
         "OFFLOAD_SEEK_COUNTS_ROUTED": seek_counts_routed_credit(),
         "OFFLOAD_THINK_FORMAT_PENALTY": think_format_penalty(),
         "OFFLOAD_MALFORMED_PENALTY": malformed_penalty(),
@@ -2849,13 +2972,14 @@ def shape_group_help_seeking_rewards(args: Any, groups: list) -> None:
 
     - Skip α when a sibling **solo-solved** (solved, ``offload_count==0``).
     - Else grant α on credit-eligible in-think offload turns (see
-      :func:`turn_is_credit_seek` / ``OFFLOAD_SEEK_NATURAL_ONLY_AFTER``).
+      :func:`turn_is_credit_seek` / natural-only latch).
     - When **every** sibling failed and a traj never credit-sought help, set
       reward to ``−OFFLOAD_NO_SEEK_PENALTY`` (default 0.1) instead of 0.
 
     Mutates ``turn_rewards`` / ``sample.reward`` in place. tmax does not apply
     ``empty_scale`` on empty_patch.
     """
+    observe_nat_t_from_groups(groups)
     del args
     if reward_mode() != "help_seeking" or not seek_only_when_all_wrong():
         return

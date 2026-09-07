@@ -786,8 +786,11 @@ def test_seek_natural_only_after_switches_credit(monkeypatch):
     monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
     monkeypatch.setenv("OFFLOAD_NO_SEEK_PENALTY", "0.15")
     monkeypatch.setenv("OFFLOAD_SEEK_NATURAL_ONLY_AFTER", "25")
+    monkeypatch.delenv("OFFLOAD_SEEK_NATURAL_ONLY_MIN_NAT_T", raising=False)
+    monkeypatch.delenv("OFFLOAD_SEEK_NATURAL_ONLY_MIN_NAT_S", raising=False)
     monkeypatch.delenv("OFFLOAD_SEEK_ALPHA_END", raising=False)
     monkeypatch.delenv("OFFLOAD_NO_SEEK_PENALTY_END", raising=False)
+    offload.reset_natural_only_state()
 
     forced_tc = {
         "valid_offload": True,
@@ -858,6 +861,137 @@ def test_seek_natural_only_after_switches_credit(monkeypatch):
     offload.shape_group_help_seeking_rewards(None, [[a3, b3]])
     assert a3.reward == pytest.approx(0.1)
     assert b3.reward == pytest.approx(-0.15)
+
+
+def test_seek_natural_only_latches_on_nat_t(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
+    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
+    monkeypatch.setenv("OFFLOAD_NO_SEEK_PENALTY", "0.15")
+    monkeypatch.setenv("OFFLOAD_SEEK_NATURAL_ONLY_AFTER", "0")
+    monkeypatch.setenv("OFFLOAD_SEEK_NATURAL_ONLY_MIN_NAT_T", "0.10")
+    monkeypatch.delenv("OFFLOAD_SEEK_NATURAL_ONLY_MIN_NAT_S", raising=False)
+    monkeypatch.delenv("OFFLOAD_SEEK_ALPHA_END", raising=False)
+    monkeypatch.delenv("OFFLOAD_NO_SEEK_PENALTY_END", raising=False)
+    offload.reset_natural_only_state()
+    offload.set_route_anneal_step(50)
+
+    forced_tc = {
+        "valid_offload": True,
+        "forced_offload": True,
+        "repaired": False,
+        "outside_think": False,
+        "orphan_open_count": 0,
+        "malformed_count": 0,
+        "open_count": 1,
+        "close_count": 1,
+        "max_open_run": 0,
+        "special_mark_count": 2,
+        "small_prompt_tokens": 10,
+        "small_output_tokens": 5,
+        "glm_input_tokens": 0,
+        "glm_output_tokens": 0,
+    }
+    natural_tc = dict(forced_tc)
+    natural_tc["forced_offload"] = False
+    plain_tc = {
+        "valid_offload": False,
+        "forced_offload": False,
+        "repaired": False,
+        "outside_think": False,
+    }
+
+    def _forced_sample():
+        s = _sample(reward=0.0, solved=0.0, oc=1)
+        # 1 forced among 10 turns → nat_t=0
+        turns = [forced_tc] + [plain_tc] * 9
+        s.metadata["turn_costs"] = turns
+        s.metadata["turn_rewards"] = [0.0] * 10
+        s.metadata["offload_stats"] = {
+            "offload_count": 1,
+            "forced_offload_count": 1,
+            "offload_outside_think_count": 0,
+            "turn_costs": turns,
+        }
+        return s
+
+    def _natural_dense_sample():
+        s = _sample(reward=0.0, solved=0.0, oc=2)
+        # 2 natural among 10 turns → nat_t=0.20
+        turns = [natural_tc, natural_tc] + [plain_tc] * 8
+        s.metadata["turn_costs"] = turns
+        s.metadata["turn_rewards"] = [0.0] * 10
+        s.metadata["offload_stats"] = {
+            "offload_count": 2,
+            "forced_offload_count": 0,
+            "offload_outside_think_count": 0,
+            "turn_costs": turns,
+        }
+        return s
+
+    # All forced: nat_t=0 → keep routed credit.
+    a = _forced_sample()
+    b = _sample(reward=0.0, solved=0.0, oc=0)
+    b.metadata["turn_costs"] = [plain_tc]
+    b.metadata["turn_rewards"] = [0.0]
+    offload.shape_group_help_seeking_rewards(None, [[a, b]])
+    assert offload.seek_counts_routed_credit()
+    assert not offload.natural_only_latched()
+    # 1 credit turn / 10 → mean turn reward 0.01
+    assert a.reward == pytest.approx(0.01)
+
+    # Sustained nat_t (2/10 natural turns, sibling has no ledger) → EMA ≥ 10%.
+    for _ in range(12):
+        nat = _natural_dense_sample()
+        other = _sample(reward=0.0, solved=0.0, oc=0)
+        offload.shape_group_help_seeking_rewards(None, [[nat, other]])
+    assert offload.nat_t_ema() >= 0.10
+    assert offload.natural_only_latched()
+    assert not offload.seek_counts_routed_credit()
+
+    forced = _forced_sample()
+    other = _sample(reward=0.0, solved=0.0, oc=0)
+    offload.shape_group_help_seeking_rewards(None, [[forced, other]])
+    assert forced.reward == pytest.approx(-0.15)
+    assert other.reward == pytest.approx(-0.15)
+
+
+def test_seek_natural_only_min_nat_t_respects_step_floor(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_SEEK_NATURAL_ONLY_AFTER", "30")
+    monkeypatch.setenv("OFFLOAD_SEEK_NATURAL_ONLY_MIN_NAT_T", "0.10")
+    monkeypatch.delenv("OFFLOAD_SEEK_NATURAL_ONLY_MIN_NAT_S", raising=False)
+    offload.reset_natural_only_state()
+    offload.set_route_anneal_step(10)
+
+    natural_tc = {
+        "valid_offload": True,
+        "forced_offload": False,
+        "repaired": False,
+        "outside_think": False,
+    }
+    plain_tc = {"valid_offload": False, "forced_offload": False}
+    samples = []
+    for _ in range(4):
+        s = _sample(reward=0.0, solved=0.0, oc=2)
+        # 2/10 natural turns
+        turns = [natural_tc, natural_tc] + [plain_tc] * 8
+        s.metadata["turn_costs"] = turns
+        s.metadata["offload_stats"] = {
+            "offload_count": 2,
+            "forced_offload_count": 0,
+            "turn_costs": turns,
+        }
+        samples.append(s)
+    # Batch nat_t=0.20 but step < AFTER → no latch.
+    for _ in range(12):
+        offload.observe_nat_t_from_groups([samples])
+    assert offload.nat_t_ema() >= 0.10
+    assert not offload.natural_only_latched()
+    assert offload.seek_counts_routed_credit()
+
+    offload.set_route_anneal_step(30)
+    assert offload.natural_only_latched()
+    assert not offload.seek_counts_routed_credit()
 
 
 def test_mark_route_attempt_blocks_second_decide(monkeypatch):
