@@ -217,6 +217,21 @@ class BaseAdapter:
         del prompt_ids, session, body, sid
         return None
 
+    def _sampling_overrides_for_generate(
+        self,
+        session: Session,
+        body: dict,
+        *,
+        sid: str,
+    ) -> dict | None:
+        """Optional sampling_params overrides for the main ``/generate`` call.
+
+        Used when ``_pre_generate_turn`` returns ``None`` (e.g. suppress OPEN
+        after traj-frac cap). Default ``None``.
+        """
+        del session, body, sid
+        return None
+
     async def _postprocess_reply(
         self,
         reply: Reply,
@@ -403,7 +418,14 @@ class BaseAdapter:
                 # 1) Optional route override, else SLM /generate for this agent round.
                 turn = await self._pre_generate_turn(prompt_ids, s, body, sid=sid)
                 if turn is None:
-                    turn = await call_sglang_generate(prompt_ids, s, body, adapter=self, session_id=sid)
+                    turn = await call_sglang_generate(
+                        prompt_ids,
+                        s,
+                        body,
+                        adapter=self,
+                        session_id=sid,
+                        sampling_overrides=self._sampling_overrides_for_generate(s, body, sid=sid),
+                    )
 
                 raw_output = tok.decode(turn.output_ids, skip_special_tokens=False) if turn.output_ids else ""
                 parsed = parse_model_output(

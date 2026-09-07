@@ -28,9 +28,10 @@ without contributing to the policy loss (``SLIME_OFFLOAD_EMBED_IN_TRAJECTORY``).
 Train shaping (when ``SLIME_AGENT_OFFLOAD=1``):
   - Per-turn costs in ``offload_stats["turn_costs"]``; ``r_i`` via
     :func:`compute_turn_rewards` (baseline completion = ``metadata.completion_tokens / n``).
-  - Incomplete offload (orphan OPEN / missing digit) is
-    :func:`repair_incomplete_offload`'d then still calls GLM; turn is marked
-    ``repaired`` and gets flat ``−β`` (no help_seeking α).
+  - Incomplete offload (orphan OPEN / missing digit) is **not** auto-repaired
+    by default (``OFFLOAD_REPAIR_INCOMPLETE=0``): only a complete in-think span
+    calls GLM. Set the env to 1 to restore legacy
+    :func:`repair_incomplete_offload` (+ flat ``−β``, no help_seeking α).
   - Orphan / malformed / repaired → flat ``−β``; hard compact removes
     unrepaired spam (``OFFLOAD_COMPACT_ORPHAN_OPEN_K``, default 1).
   - Post-decode :func:`truncate_offload_open_spam` cuts runaway OPEN spam before
@@ -40,8 +41,20 @@ Train shaping (when ``SLIME_AGENT_OFFLOAD=1``):
     start, run **three** SGLang steps (``max_new_tokens=1``) with heavy
     ``logit_bias`` on the allowed set only: OPEN → digit ``0-9`` (model
     samples ``N``) → CLOSE. Real stepwise logprobs → GRPO. On any step miss,
-    fall through to a normal full generate. Caps: ``OFFLOAD_FORCE_TAG_TRAJ_FRAC``,
-    min turn, max per session. No fail-retry / no hard tag inject / SFT optional.
+    fall through to a normal full generate. Caps: traj offload frac, min turn, once
+    per turn index, max. No fail-retry / no hard tag inject / SFT optional.
+    ``OFFLOAD_FORCE_TAG_TRAJ_FRAC`` / ``OFFLOAD_ROUTE_TRAJ_FRAC`` **blocks further
+    soft-route** once the session is at the ceiling. By default
+    ``OFFLOAD_ROUTE_SUPPRESS_NATURAL=1`` also applies negative ``logit_bias`` on
+    OPEN/CLOSE during normal generate so **natural** offload cannot exceed the
+    same density cap. Soft-route Bernoulli can **anneal** via
+    ``OFFLOAD_ROUTE_PROB`` → ``OFFLOAD_ROUTE_PROB_END`` over
+    ``OFFLOAD_ROUTE_ANNEAL_STEPS`` (train ``rollout_id``). Reward knobs can
+    anneal on the same (or ``OFFLOAD_REWARD_ANNEAL_STEPS``) schedule: early
+    high seek α / no-seek penalty; late higher efficiency λ / unique-solver.
+    After ``OFFLOAD_SEEK_NATURAL_ONLY_AFTER`` (launcher 20), seek α / no-seek
+    exemption count **natural** in-think offloads only (``valid && !forced``);
+    routed tags remain for GRPO tag exposure but no longer earn seek credit.
   - Hard compact filter + group α:
     :func:`compact_and_shape_group_help_seeking_rewards`.
   - Turn-painted advantages:
@@ -206,7 +219,9 @@ def offload_enabled() -> bool:
 
 
 def efficiency_lambda() -> float:
-    return float(os.environ.get("OFFLOAD_EFFICIENCY_LAMBDA", "0.6"))
+    """Cost penalty weight on solved trajs (anneals start→end with curriculum)."""
+    start = float(os.environ.get("OFFLOAD_EFFICIENCY_LAMBDA", "0.6"))
+    return _anneal_float(start, "OFFLOAD_EFFICIENCY_LAMBDA_END")
 
 
 def think_format_penalty() -> float:
@@ -234,10 +249,7 @@ def offload_close_token_id() -> int:
 
 
 def force_tag_prob() -> float:
-    """Per-turn Bernoulli probability for route-mode offload (0 = off).
-
-    Reads ``OFFLOAD_ROUTE_PROB`` first, then legacy ``OFFLOAD_FORCE_TAG_PROB``.
-    """
+    """Base (start) per-turn Bernoulli for soft-route; see :func:`route_prob`."""
     raw = (os.environ.get("OFFLOAD_ROUTE_PROB") or os.environ.get("OFFLOAD_FORCE_TAG_PROB") or "0").strip()
     try:
         return min(1.0, max(0.0, float(raw)))
@@ -245,15 +257,116 @@ def force_tag_prob() -> float:
         return 0.0
 
 
-def route_prob() -> float:
-    """Alias of :func:`force_tag_prob` (route-at-turn-start naming)."""
-    return force_tag_prob()
+# Train-step index for route annealing (same process as fully-async / sync rollout).
+_route_anneal_step: int = 0
 
+
+def set_route_anneal_step(step: int) -> None:
+    """Update the global anneal step (call at the start of each train rollout)."""
+    global _route_anneal_step
+    try:
+        _route_anneal_step = max(0, int(step))
+    except (TypeError, ValueError):
+        _route_anneal_step = 0
+
+
+def route_anneal_step(session: Session | None = None) -> int:
+    """Effective anneal step: session stamp → env override → global."""
+    if session is not None:
+        stats = getattr(session, "offload_stats", None) or {}
+        if "route_anneal_step" in stats and stats["route_anneal_step"] is not None:
+            try:
+                return max(0, int(stats["route_anneal_step"]))
+            except (TypeError, ValueError):
+                pass
+    raw = (os.environ.get("OFFLOAD_ROUTE_ANNEAL_STEP") or "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return int(_route_anneal_step)
+
+
+def route_prob_end() -> float | None:
+    """Optional end probability for linear anneal (``OFFLOAD_ROUTE_PROB_END``)."""
+    raw = (os.environ.get("OFFLOAD_ROUTE_PROB_END") or "").strip()
+    if not raw:
+        return None
+    try:
+        return min(1.0, max(0.0, float(raw)))
+    except ValueError:
+        return None
+
+
+def route_anneal_steps() -> int:
+    """Rollouts over which to anneal start→end. Default 40. ``0`` disables."""
+    raw = (os.environ.get("OFFLOAD_ROUTE_ANNEAL_STEPS") or "40").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 40
+
+
+def reward_anneal_steps() -> int:
+    """Steps for reward curriculum; defaults to :func:`route_anneal_steps`."""
+    raw = (os.environ.get("OFFLOAD_REWARD_ANNEAL_STEPS") or "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return route_anneal_steps()
+
+
+def _env_float_or_none(name: str) -> float | None:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _anneal_float(start: float, end_env: str, *, steps: int | None = None) -> float:
+    """Linear interpolate ``start`` → ``end_env`` over anneal steps (clamped)."""
+    end = _env_float_or_none(end_env)
+    n = reward_anneal_steps() if steps is None else max(0, int(steps))
+    if end is None or n <= 0:
+        return float(start)
+    t = min(1.0, route_anneal_step() / float(n))
+    return float(start) + (float(end) - float(start)) * t
+
+
+def route_prob(session: Session | None = None) -> float:
+    """Effective soft-route Bernoulli for this turn (optionally annealed by step).
+
+    ``OFFLOAD_ROUTE_PROB`` is the **start** value. When ``OFFLOAD_ROUTE_PROB_END``
+    is set, linearly interpolate to that by ``OFFLOAD_ROUTE_ANNEAL_STEPS``
+    (using :func:`route_anneal_step`). Early high route bootstraps tags; late
+    low route leaves the density budget for natural seek.
+    """
+    p0 = force_tag_prob()
+    p1 = route_prob_end()
+    n = route_anneal_steps()
+    if p1 is None or n <= 0:
+        return p0
+    t = min(1.0, route_anneal_step(session) / float(n))
+    return min(1.0, max(0.0, p0 + (p1 - p0) * t))
+
+
+def stamp_route_anneal_step(session: Session, step: int | None = None) -> None:
+    """Freeze anneal step on the session for the whole episode."""
+    stats = _ensure_stats(session)
+    stats["route_anneal_step"] = int(route_anneal_step() if step is None else step)
 
 def force_tag_traj_frac() -> float:
-    """Skip route when offload turns / completed turns ≥ this.
+    """Cap total offload density: offload turns / turns ≥ this → stop soft-route.
 
-    Default 0.3. 0 disables the cap. Launcher sets 0.3.
+    Default 0.3. 0 disables. With :func:`suppress_natural_offload` (default on),
+    also discourages further **natural** OPEN/CLOSE so density stays near the cap.
+    Keep route prob low so natural can claim share *under* the same ceiling.
     """
     raw = (
         os.environ.get("OFFLOAD_ROUTE_TRAJ_FRAC")
@@ -264,6 +377,55 @@ def force_tag_traj_frac() -> float:
         return min(1.0, max(0.0, float(raw)))
     except ValueError:
         return 0.3
+
+
+def offload_traj_frac_reached(session: Session) -> bool:
+    """True when completed-turn offload frac already ≥ :func:`force_tag_traj_frac`."""
+    cap = force_tag_traj_frac()
+    if cap <= 0.0:
+        return False
+    return session_offload_turn_frac(session) >= cap
+
+
+def suppress_natural_offload() -> bool:
+    """If true, apply negative OPEN/CLOSE bias on normal generate after traj cap.
+
+    Default **true** so natural offload cannot run away past ``TRAJ_FRAC``.
+    Set ``OFFLOAD_ROUTE_SUPPRESS_NATURAL=0`` to only block soft-route (ablation).
+    """
+    raw = (os.environ.get("OFFLOAD_ROUTE_SUPPRESS_NATURAL") or "1").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def route_suppress_bias() -> float:
+    """Negative logit bias on OPEN/CLOSE when traj frac cap is reached.
+
+    Only used when :func:`suppress_natural_offload` is true. Magnitude defaults
+    to ``OFFLOAD_ROUTE_STEP_BIAS`` / ``OPEN_BIAS`` (100). Override with
+    ``OFFLOAD_ROUTE_SUPPRESS_BIAS`` (positive number → applied as −bias).
+    """
+    raw = (os.environ.get("OFFLOAD_ROUTE_SUPPRESS_BIAS") or "").strip()
+    if raw:
+        try:
+            return -abs(float(raw))
+        except ValueError:
+            pass
+    return -abs(route_step_bias())
+
+
+def suppress_offload_sampling_overrides() -> dict[str, Any]:
+    """Sampling knobs that suppress OPEN/CLOSE after traj-frac cap (opt-in)."""
+    if not suppress_natural_offload():
+        return {}
+    bias = route_suppress_bias()
+    if bias == 0.0:
+        return {}
+    return {
+        "logit_bias": {
+            str(offload_open_token_id()): bias,
+            str(offload_close_token_id()): bias,
+        }
+    }
 
 
 def force_tag_min_turn() -> int:
@@ -382,10 +544,9 @@ def decide_route_offload(
     to a normal full generate. Caps: traj offload frac, min turn, once per
     turn index, max.
     """
-    if route_prob() <= 0.0:
+    if route_prob(session) <= 0.0:
         return False
-    cap = force_tag_traj_frac()
-    if cap > 0.0 and session_offload_turn_frac(session) >= cap:
+    if offload_traj_frac_reached(session):
         return False
     turn_index = _session_turn_index(session)
     if turn_index < force_tag_min_turn():
@@ -397,7 +558,7 @@ def decide_route_offload(
     if abs_max > 0 and int(stats.get("forced_offload_count", 0) or 0) >= abs_max:
         return False
     rnd = rng if rng is not None else random
-    return bool(rnd.random() < route_prob())
+    return bool(rnd.random() < route_prob(session))
 
 
 def decide_force_offload(
@@ -619,7 +780,9 @@ def reward_mode() -> str:
 
 
 def seek_alpha() -> float:
-    return float(os.environ.get("OFFLOAD_SEEK_ALPHA", str(DEFAULT_OFFLOAD_SEEK_ALPHA)))
+    """Partial credit for unsolved in-think seek (anneals; high early → low late)."""
+    start = float(os.environ.get("OFFLOAD_SEEK_ALPHA", str(DEFAULT_OFFLOAD_SEEK_ALPHA)))
+    return max(0.0, _anneal_float(start, "OFFLOAD_SEEK_ALPHA_END"))
 
 
 def seek_empty_scale() -> float:
@@ -627,7 +790,9 @@ def seek_empty_scale() -> float:
 
 
 def unique_solver_bonus() -> float:
-    return float(os.environ.get("OFFLOAD_UNIQUE_SOLVER_BONUS", str(DEFAULT_OFFLOAD_UNIQUE_SOLVER_BONUS)))
+    """Bonus for being the sole solver in a group (anneals; low early → high late)."""
+    start = float(os.environ.get("OFFLOAD_UNIQUE_SOLVER_BONUS", str(DEFAULT_OFFLOAD_UNIQUE_SOLVER_BONUS)))
+    return max(0.0, _anneal_float(start, "OFFLOAD_UNIQUE_SOLVER_BONUS_END"))
 
 
 def no_seek_penalty() -> float:
@@ -635,13 +800,14 @@ def no_seek_penalty() -> float:
 
     When ``OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG`` group shaping runs and **every**
     sibling failed, trajs with no valid in-think offload get ``−this`` instead
-    of ``0``. Set env to ``0`` to disable.
+    of ``0``. Set env to ``0`` to disable. Anneals high early → lower late.
     """
     raw = (os.environ.get("OFFLOAD_NO_SEEK_PENALTY") or str(DEFAULT_OFFLOAD_NO_SEEK_PENALTY)).strip()
     try:
-        return max(0.0, float(raw))
+        start = max(0.0, float(raw))
     except ValueError:
-        return float(DEFAULT_OFFLOAD_NO_SEEK_PENALTY)
+        start = float(DEFAULT_OFFLOAD_NO_SEEK_PENALTY)
+    return max(0.0, _anneal_float(start, "OFFLOAD_NO_SEEK_PENALTY_END"))
 
 
 def seek_only_when_all_wrong() -> bool:
@@ -660,6 +826,40 @@ def seek_only_when_all_wrong() -> bool:
     )
 
 
+def seek_natural_only_after() -> int:
+    """Train step at/after which seek α / no-seek only credit **natural** offloads.
+
+    ``0`` (default) = always credit routed+natural. Launcher uses ``25`` so early
+    soft-route bootstraps tags, then only ``valid && !forced`` earns seek credit.
+    """
+    raw = (os.environ.get("OFFLOAD_SEEK_NATURAL_ONLY_AFTER") or "0").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def seek_counts_routed_credit(session: Session | None = None) -> bool:
+    """True when routed soft-route offloads still earn seek α / block no-seek."""
+    after = seek_natural_only_after()
+    if after <= 0:
+        return True
+    return route_anneal_step(session) < after
+
+
+def turn_is_credit_seek(tc: dict[str, Any] | None, *, allow_routed: bool | None = None) -> bool:
+    """Clean in-think offload eligible for α / for avoiding no-seek penalty."""
+    if not isinstance(tc, dict):
+        return False
+    if not tc.get("valid_offload") or tc.get("repaired") or tc.get("outside_think"):
+        return False
+    if allow_routed is None:
+        allow_routed = seek_counts_routed_credit()
+    if not allow_routed and tc.get("forced_offload"):
+        return False
+    return True
+
+
 def resolved_train_config() -> dict[str, Any]:
     """Effective offload / help_seeking / SFT / compact knobs (resolved defaults).
 
@@ -672,12 +872,24 @@ def resolved_train_config() -> dict[str, Any]:
         "SLIME_AGENT_OFFLOAD": offload_enabled(),
         "OFFLOAD_REWARD_MODE": reward_mode(),
         "OFFLOAD_EFFICIENCY_LAMBDA": efficiency_lambda(),
+        "OFFLOAD_EFFICIENCY_LAMBDA_START": float(os.environ.get("OFFLOAD_EFFICIENCY_LAMBDA", "0.6")),
+        "OFFLOAD_EFFICIENCY_LAMBDA_END": _env_float_or_none("OFFLOAD_EFFICIENCY_LAMBDA_END"),
         "OFFLOAD_SEEK_ALPHA": seek_alpha(),
+        "OFFLOAD_SEEK_ALPHA_START": float(os.environ.get("OFFLOAD_SEEK_ALPHA", str(DEFAULT_OFFLOAD_SEEK_ALPHA))),
+        "OFFLOAD_SEEK_ALPHA_END": _env_float_or_none("OFFLOAD_SEEK_ALPHA_END"),
         "OFFLOAD_SEEK_EMPTY_SCALE": seek_empty_scale(),
         "OFFLOAD_UNIQUE_SOLVER_BONUS": unique_solver_bonus(),
+        "OFFLOAD_UNIQUE_SOLVER_BONUS_START": float(
+            os.environ.get("OFFLOAD_UNIQUE_SOLVER_BONUS", str(DEFAULT_OFFLOAD_UNIQUE_SOLVER_BONUS))
+        ),
+        "OFFLOAD_UNIQUE_SOLVER_BONUS_END": _env_float_or_none("OFFLOAD_UNIQUE_SOLVER_BONUS_END"),
         "OFFLOAD_NO_SEEK_PENALTY": no_seek_penalty(),
+        "OFFLOAD_NO_SEEK_PENALTY_END": _env_float_or_none("OFFLOAD_NO_SEEK_PENALTY_END"),
+        "OFFLOAD_REWARD_ANNEAL_STEPS": reward_anneal_steps(),
         # Withhold α only when a sibling solved with offload_count==0.
         "OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG": seek_only_when_all_wrong(),
+        "OFFLOAD_SEEK_NATURAL_ONLY_AFTER": seek_natural_only_after(),
+        "OFFLOAD_SEEK_COUNTS_ROUTED": seek_counts_routed_credit(),
         "OFFLOAD_THINK_FORMAT_PENALTY": think_format_penalty(),
         "OFFLOAD_MALFORMED_PENALTY": malformed_penalty(),
         "OFFLOAD_MALFORMED_PENALTY_CAP": malformed_penalty_cap(),
@@ -687,8 +899,14 @@ def resolved_train_config() -> dict[str, Any]:
         "OFFLOAD_SFT_MAX_SAMPLES": offload_sft.sft_max_samples(),
         "OFFLOAD_SFT_MAX_SEQ_LEN": offload_sft.sft_max_seq_len(),
         "OFFLOAD_SFT_TAG_PROB": offload_sft.sft_tag_prob(),
-        "OFFLOAD_ROUTE_PROB": route_prob(),
+        "OFFLOAD_REPAIR_INCOMPLETE": repair_incomplete_enabled(),
+        "OFFLOAD_ROUTE_PROB": force_tag_prob(),
+        "OFFLOAD_ROUTE_PROB_END": route_prob_end(),
+        "OFFLOAD_ROUTE_ANNEAL_STEPS": route_anneal_steps(),
+        "OFFLOAD_ROUTE_PROB_EFFECTIVE": route_prob(),
         "OFFLOAD_ROUTE_STEP_BIAS": route_step_bias(),
+        "OFFLOAD_ROUTE_SUPPRESS_NATURAL": suppress_natural_offload(),
+        "OFFLOAD_ROUTE_SUPPRESS_BIAS": route_suppress_bias(),
         "OFFLOAD_ROUTE_OPEN_BIAS": route_open_bias(),  # alias of step bias
         "OFFLOAD_ROUTE_MAX_NEW_TOKENS": route_max_new_tokens(),
         "OFFLOAD_FORCE_TAG_PROB": force_tag_prob(),  # legacy alias
@@ -849,6 +1067,16 @@ def parse_valid_offload_directive(raw: str) -> tuple[int, str] | None:
     if parsed is None or not offload_span_inside_think(raw):
         return None
     return parsed
+
+
+def repair_incomplete_enabled() -> bool:
+    """Whether to synthesize CLOSE for orphan OPEN (legacy). Default off."""
+    return (os.environ.get("OFFLOAD_REPAIR_INCOMPLETE") or "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 def repair_incomplete_offload(raw: str) -> dict[str, Any] | None:
@@ -1870,7 +2098,7 @@ async def apply_offload_if_needed(
     parsed = parse_valid_offload_directive(raw_output)
     repaired = False
     if parsed is None:
-        repair = repair_incomplete_offload(raw_output)
+        repair = repair_incomplete_offload(raw_output) if repair_incomplete_enabled() else None
         if repair is not None:
             repaired_raw = str(repair["repaired_raw"])
             turn_entry["repaired"] = True
@@ -2213,8 +2441,21 @@ def help_seeking_reward(
     emp_scale = float(empty_scale if empty_scale is not None else seek_empty_scale())
 
     if float(solved) <= 0.0:
-        if not encourage_seek or oc < 1 or outside > 0:
+        if not encourage_seek or outside > 0:
             return 0.0
+        if seek_counts_routed_credit():
+            if oc < 1:
+                return 0.0
+        else:
+            # Natural-only: require at least one credit-eligible natural turn.
+            turns = list(st.get("turn_costs") or [])
+            if turns:
+                if not any(turn_is_credit_seek(tc, allow_routed=False) for tc in turns):
+                    return 0.0
+            else:
+                fc = int(st.get("forced_offload_count", 0) or 0)
+                if max(0, oc - fc) < 1:
+                    return 0.0
         credit = _apply_empty_scale(
             alpha_v, empty_patch=empty_patch, empty_scale=emp_scale, protocol=protocol
         )
@@ -2322,9 +2563,7 @@ def compute_turn_rewards(
                 continue
             if (
                 encourage_seek
-                and tc.get("valid_offload")
-                and not tc.get("repaired")
-                and not tc.get("outside_think")
+                and turn_is_credit_seek(tc)
             ):
                 turn_rewards.append(max(0.0, float(credit)))
             else:
@@ -2514,19 +2753,25 @@ def _session_outside_think_count(metadata: dict[str, Any] | None) -> int:
 
 
 def _session_has_valid_seek(metadata: dict[str, Any] | None) -> bool:
-    """True if the session did at least one clean in-think offload (eligible for α)."""
+    """True if the session did at least one credit-eligible in-think offload.
+
+    When :func:`seek_counts_routed_credit` is false, only natural
+    (``valid && !forced``) seeks count — routed soft-route does not earn α or
+    block ``NO_SEEK``.
+    """
     md = metadata or {}
     stats = md.get("offload_stats") or {}
     turn_costs = list(md.get("turn_costs") or stats.get("turn_costs") or [])
+    allow_routed = seek_counts_routed_credit()
     if turn_costs:
-        return any(
-            bool(tc.get("valid_offload"))
-            and not tc.get("repaired")
-            and not tc.get("outside_think")
-            for tc in turn_costs
-            if isinstance(tc, dict)
-        )
-    return _session_offload_count(md) >= 1 and _session_outside_think_count(md) < 1
+        return any(turn_is_credit_seek(tc, allow_routed=allow_routed) for tc in turn_costs)
+    oc = _session_offload_count(md)
+    if oc < 1 or _session_outside_think_count(md) >= 1:
+        return False
+    if allow_routed:
+        return True
+    fc = int(stats.get("forced_offload_count", 0) or 0)
+    return max(0, oc - fc) >= 1
 
 
 def _session_solo_solved(metadata: dict[str, Any] | None) -> bool:
@@ -2603,8 +2848,9 @@ def shape_group_help_seeking_rewards(args: Any, groups: list) -> None:
     """Group help-seeking shaping under ``OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG``.
 
     - Skip α when a sibling **solo-solved** (solved, ``offload_count==0``).
-    - Else grant α on clean in-think offload turns.
-    - When **every** sibling failed and a traj never validly sought help, set
+    - Else grant α on credit-eligible in-think offload turns (see
+      :func:`turn_is_credit_seek` / ``OFFLOAD_SEEK_NATURAL_ONLY_AFTER``).
+    - When **every** sibling failed and a traj never credit-sought help, set
       reward to ``−OFFLOAD_NO_SEEK_PENALTY`` (default 0.1) instead of 0.
 
     Mutates ``turn_rewards`` / ``sample.reward`` in place. tmax does not apply
@@ -2658,11 +2904,7 @@ def shape_group_help_seeking_rewards(args: Any, groups: list) -> None:
                         if turn_rewards[i] > mal_r:
                             turn_rewards[i] = float(mal_r)
                         continue
-                    if (
-                        tc.get("valid_offload")
-                        and not tc.get("repaired")
-                        and not tc.get("outside_think")
-                    ):
+                    if turn_is_credit_seek(tc):
                         if float(turn_rewards[i]) <= 0.0:
                             turn_rewards[i] = credit
                 mean_r = float(sum(turn_rewards) / max(len(turn_rewards), 1))

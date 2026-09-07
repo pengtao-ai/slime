@@ -389,6 +389,13 @@ async def generate_rollout_async(
     """
     assert args.rollout_global_dataset
 
+    try:
+        from examples.coding_agent_rl import offload as _offload
+
+        _offload.set_route_anneal_step(rollout_id)
+    except Exception:  # noqa: BLE001
+        pass
+
     state = GenerateState(args)
 
     # instantiate data filters

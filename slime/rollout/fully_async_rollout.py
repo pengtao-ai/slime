@@ -193,6 +193,12 @@ class AsyncRolloutWorker:
 
 async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> list[list[Sample]]:
     assert args.rollout_global_dataset
+    try:
+        from examples.coding_agent_rl import offload as _offload
+
+        _offload.set_route_anneal_step(rollout_id)
+    except Exception:  # noqa: BLE001
+        pass
     worker = _get_global_worker(args, data_buffer)
 
     target = args.rollout_batch_size

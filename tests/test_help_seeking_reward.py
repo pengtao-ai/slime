@@ -289,6 +289,13 @@ def test_repair_skips_already_valid():
     assert offload.repair_incomplete_offload(raw) is None
 
 
+def test_repair_incomplete_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("OFFLOAD_REPAIR_INCOMPLETE", raising=False)
+    assert not offload.repair_incomplete_enabled()
+    monkeypatch.setenv("OFFLOAD_REPAIR_INCOMPLETE", "1")
+    assert offload.repair_incomplete_enabled()
+
+
 def test_compute_turn_rewards_solved_solo_uses_cost_formula():
     turns = [_turn(valid=False, small_o=50), _turn(valid=True, small_o=50, glm_o=20)]
     stats = {"turn_costs": turns}
@@ -670,6 +677,187 @@ def test_digit_token_ids_and_inverse():
     assert ids == {d: 1000 + d for d in range(10)}
     assert offload.digit_from_token_id(1007, ids) == 7
     assert offload.digit_from_token_id(999, ids) is None
+
+
+def test_offload_traj_frac_reached_includes_natural(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_FORCE_TAG_TRAJ_FRAC", "0.3")
+    session = SimpleNamespace(
+        offload_stats={
+            "turn_costs": [
+                {"valid_offload": True},
+                {"valid_offload": True},
+                {"valid_offload": True},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+                {},
+            ]
+        },
+        timing={"current_turn": 10},
+    )
+    assert offload.session_offload_turn_frac(session) == pytest.approx(0.3)
+    assert offload.offload_traj_frac_reached(session)
+    # Under cap: natural / route still allowed.
+    session.offload_stats["turn_costs"] = [
+        {"valid_offload": True},
+        {"valid_offload": True},
+        {},
+        {},
+        {},
+        {},
+        {},
+        {},
+        {},
+        {},
+    ]
+    assert offload.session_offload_turn_frac(session) == pytest.approx(0.2)
+    assert not offload.offload_traj_frac_reached(session)
+    monkeypatch.setenv("OFFLOAD_FORCE_TAG_TRAJ_FRAC", "0")
+    session.offload_stats["turn_costs"] = [{"valid_offload": True}] * 10
+    assert not offload.offload_traj_frac_reached(session)
+
+
+def test_suppress_offload_sampling_overrides(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_OPEN_TOKEN_ID", "248077")
+    monkeypatch.setenv("OFFLOAD_CLOSE_TOKEN_ID", "248078")
+    monkeypatch.setenv("OFFLOAD_ROUTE_SUPPRESS_BIAS", "100")
+    # Default: density ceiling also suppresses natural OPEN/CLOSE.
+    monkeypatch.delenv("OFFLOAD_ROUTE_SUPPRESS_NATURAL", raising=False)
+    assert offload.suppress_natural_offload()
+    overrides = offload.suppress_offload_sampling_overrides()
+    assert overrides["logit_bias"] == {"248077": -100.0, "248078": -100.0}
+    assert offload.route_suppress_bias() == -100.0
+    # Ablation: cap only blocks soft-route.
+    monkeypatch.setenv("OFFLOAD_ROUTE_SUPPRESS_NATURAL", "0")
+    assert not offload.suppress_natural_offload()
+    assert offload.suppress_offload_sampling_overrides() == {}
+
+
+def test_route_prob_anneals_by_step(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_ROUTE_PROB", "0.30")
+    monkeypatch.setenv("OFFLOAD_ROUTE_PROB_END", "0.05")
+    monkeypatch.setenv("OFFLOAD_ROUTE_ANNEAL_STEPS", "100")
+    monkeypatch.delenv("OFFLOAD_ROUTE_ANNEAL_STEP", raising=False)
+    offload.set_route_anneal_step(0)
+    assert offload.route_prob() == pytest.approx(0.30)
+    offload.set_route_anneal_step(50)
+    assert offload.route_prob() == pytest.approx(0.175)
+    offload.set_route_anneal_step(100)
+    assert offload.route_prob() == pytest.approx(0.05)
+    offload.set_route_anneal_step(200)
+    assert offload.route_prob() == pytest.approx(0.05)
+    # Session stamp wins over global.
+    session = SimpleNamespace(offload_stats={"route_anneal_step": 0}, timing={"current_turn": 0})
+    assert offload.route_prob(session) == pytest.approx(0.30)
+    # No END → flat start prob.
+    monkeypatch.delenv("OFFLOAD_ROUTE_PROB_END", raising=False)
+    offload.set_route_anneal_step(50)
+    assert offload.route_prob() == pytest.approx(0.30)
+
+
+def test_reward_anneals_seek_early_solve_late(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_ANNEAL_STEPS", "40")
+    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.25")
+    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA_END", "0.10")
+    monkeypatch.setenv("OFFLOAD_EFFICIENCY_LAMBDA", "0.10")
+    monkeypatch.setenv("OFFLOAD_EFFICIENCY_LAMBDA_END", "0.22")
+    monkeypatch.setenv("OFFLOAD_UNIQUE_SOLVER_BONUS", "0.12")
+    monkeypatch.setenv("OFFLOAD_UNIQUE_SOLVER_BONUS_END", "0.30")
+    monkeypatch.setenv("OFFLOAD_NO_SEEK_PENALTY", "0.22")
+    monkeypatch.setenv("OFFLOAD_NO_SEEK_PENALTY_END", "0.10")
+    offload.set_route_anneal_step(0)
+    assert offload.seek_alpha() == pytest.approx(0.25)
+    assert offload.efficiency_lambda() == pytest.approx(0.10)
+    assert offload.unique_solver_bonus() == pytest.approx(0.12)
+    assert offload.no_seek_penalty() == pytest.approx(0.22)
+    offload.set_route_anneal_step(40)
+    assert offload.seek_alpha() == pytest.approx(0.10)
+    assert offload.efficiency_lambda() == pytest.approx(0.22)
+    assert offload.unique_solver_bonus() == pytest.approx(0.30)
+    assert offload.no_seek_penalty() == pytest.approx(0.10)
+
+
+def test_seek_natural_only_after_switches_credit(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
+    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
+    monkeypatch.setenv("OFFLOAD_NO_SEEK_PENALTY", "0.15")
+    monkeypatch.setenv("OFFLOAD_SEEK_NATURAL_ONLY_AFTER", "25")
+    monkeypatch.delenv("OFFLOAD_SEEK_ALPHA_END", raising=False)
+    monkeypatch.delenv("OFFLOAD_NO_SEEK_PENALTY_END", raising=False)
+
+    forced_tc = {
+        "valid_offload": True,
+        "forced_offload": True,
+        "repaired": False,
+        "outside_think": False,
+        "orphan_open_count": 0,
+        "malformed_count": 0,
+        "open_count": 1,
+        "close_count": 1,
+        "max_open_run": 0,
+        "special_mark_count": 2,
+        "small_prompt_tokens": 10,
+        "small_output_tokens": 5,
+        "glm_input_tokens": 0,
+        "glm_output_tokens": 0,
+    }
+    natural_tc = dict(forced_tc)
+    natural_tc["forced_offload"] = False
+
+    # Early: routed still credits.
+    offload.set_route_anneal_step(10)
+    assert offload.seek_counts_routed_credit()
+    assert offload.turn_is_credit_seek(forced_tc)
+    a = _sample(reward=0.0, solved=0.0, oc=1)
+    a.metadata["turn_costs"] = [forced_tc]
+    a.metadata["turn_rewards"] = [0.0]
+    a.metadata["offload_stats"] = {
+        "offload_count": 1,
+        "forced_offload_count": 1,
+        "offload_outside_think_count": 0,
+        "turn_costs": [forced_tc],
+    }
+    b = _sample(reward=0.0, solved=0.0, oc=0)
+    offload.shape_group_help_seeking_rewards(None, [[a, b]])
+    assert a.reward == pytest.approx(0.1)
+    assert b.reward == pytest.approx(-0.15)
+
+    # Late: only natural credits; forced-only → no_seek.
+    offload.set_route_anneal_step(25)
+    assert not offload.seek_counts_routed_credit()
+    assert not offload.turn_is_credit_seek(forced_tc)
+    assert offload.turn_is_credit_seek(natural_tc)
+    a2 = _sample(reward=0.0, solved=0.0, oc=1)
+    a2.metadata["turn_costs"] = [forced_tc]
+    a2.metadata["turn_rewards"] = [0.0]
+    a2.metadata["offload_stats"] = {
+        "offload_count": 1,
+        "forced_offload_count": 1,
+        "offload_outside_think_count": 0,
+        "turn_costs": [forced_tc],
+    }
+    b2 = _sample(reward=0.0, solved=0.0, oc=0)
+    offload.shape_group_help_seeking_rewards(None, [[a2, b2]])
+    assert a2.reward == pytest.approx(-0.15)
+    assert b2.reward == pytest.approx(-0.15)
+
+    a3 = _sample(reward=0.0, solved=0.0, oc=1)
+    a3.metadata["turn_costs"] = [natural_tc]
+    a3.metadata["turn_rewards"] = [0.0]
+    a3.metadata["offload_stats"] = {
+        "offload_count": 1,
+        "forced_offload_count": 0,
+        "offload_outside_think_count": 0,
+        "turn_costs": [natural_tc],
+    }
+    b3 = _sample(reward=0.0, solved=0.0, oc=0)
+    offload.shape_group_help_seeking_rewards(None, [[a3, b3]])
+    assert a3.reward == pytest.approx(0.1)
+    assert b3.reward == pytest.approx(-0.15)
 
 
 def test_mark_route_attempt_blocks_second_decide(monkeypatch):

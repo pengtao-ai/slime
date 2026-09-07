@@ -112,6 +112,37 @@ class _OffloadMixin:
         super()._preprocess_body(body)
         offload.inject_offload_into_request_body(body)
 
+    def _sampling_overrides_for_generate(
+        self,
+        session: Session,
+        body: dict,
+        *,
+        sid: str,
+    ) -> dict | None:
+        """When traj-frac cap is hit, optionally suppress OPEN/CLOSE on normal generate.
+
+        Default on (``OFFLOAD_ROUTE_SUPPRESS_NATURAL=1``): same density ceiling for
+        natural as for soft-route. Pair with a low ``OFFLOAD_ROUTE_PROB`` so route
+        does not monopolize the budget.
+        """
+        del body
+        if not offload.offload_enabled():
+            return None
+        if not offload.suppress_natural_offload():
+            return None
+        if not offload.offload_traj_frac_reached(session):
+            return None
+        overrides = offload.suppress_offload_sampling_overrides()
+        if overrides:
+            logger.info(
+                "[coding_agent_rl] sid=%s suppress offload tags turn=%d (traj frac=%.3f cap=%.3f)",
+                sid,
+                int(((session.timing or {}).get("current_turn", 0) or 0)),
+                offload.session_offload_turn_frac(session),
+                offload.force_tag_traj_frac(),
+            )
+        return overrides or None
+
     async def _pre_generate_turn(
         self,
         prompt_ids: list[int],
@@ -554,6 +585,7 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
     )
     ensure_session_timing(session_obj, tid=tid, events=trace_events)
     session_obj.offload_stats = dict(getattr(session_obj, "offload_stats", None) or {})
+    offload.stamp_route_anneal_step(session_obj)
 
     t0 = time.time()
     result_samples: list[Sample] | None = None
