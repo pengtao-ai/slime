@@ -110,7 +110,7 @@ PERF_ARGS=(
 
 ALGO_ARGS=(
    --advantage-estimator grpo
-   --custom-advantage-function-path examples.coding_agent_rl.offload_turn_advantage.compute_turn_advantages
+   --custom-advantage-function-path ${CUSTOM_ADVANTAGE_FUNCTION_PATH:-examples.coding_agent_rl.gigpo_advantage.compute_gigpo_advantages}
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
    --kl-coef 0.00

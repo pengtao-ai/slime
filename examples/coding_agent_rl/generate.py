@@ -666,6 +666,9 @@ async def generate(args, base_sample: Sample, sampling_params: dict[str, Any], e
                     s.train_metadata = {
                         "turn_rewards": s.metadata.get("turn_rewards"),
                         "turn_token_spans": s.metadata.get("turn_token_spans"),
+                        "turn_T": s.metadata.get("turn_T"),
+                        "group_index": s.metadata.get("group_index", getattr(s, "group_index", None)),
+                        "sample_index": s.metadata.get("sample_index", getattr(s, "index", None)),
                     }
             if agent_exit_code != 0:
                 reason = "time budget exceeded" if agent_exit_code < 0 else f"CLI error (exit {agent_exit_code})"

@@ -32,8 +32,8 @@ Train shaping (when ``SLIME_AGENT_OFFLOAD=1``):
     :func:`compact_and_shape_group_help_seeking_rewards`.
   - Soft seek budget (``OFFLOAD_SEEK_BUDGET`` / ``_TURN_K``): over-budget α decay
     and solved overage penalty.
-  - Turn-painted advantages:
-    ``examples.coding_agent_rl.offload_turn_advantage.compute_turn_advantages``.
+  - Turn-painted advantages (GiGPO ``A=A_E+w A_S``):
+    ``examples.coding_agent_rl.gigpo_advantage.compute_gigpo_advantages``.
   - tmax ``empty_patch`` does **not** multiply ``empty_scale``.
 
 Enable with ``SLIME_AGENT_OFFLOAD=1`` (see ``generate.py`` Offload* adapters).
@@ -54,6 +54,9 @@ import requests
 from slime.agent.adapters.common import Reply, Session, flatten_content, tool_call_dict
 from slime.agent.chrome_trace import chrome_span, session_trace_ctx
 from slime.agent.trajectory import TurnRecord
+
+# Local import kept lazy-free: gigpo_advantage does not import offload.
+from examples.coding_agent_rl.gigpo_advantage import stamp_turn_gigpo_key
 
 logger = logging.getLogger(__name__)
 
@@ -1153,6 +1156,7 @@ async def apply_offload_if_needed(
                 stats["offload_outside_think_count"],
             )
         turn_entry["response_token_len"] = len(turn.output_ids or [])
+        stamp_turn_gigpo_key(turn_entry, reply)
         return reply
 
     n, _prefix = parsed
@@ -1223,13 +1227,15 @@ async def apply_offload_if_needed(
         glm_think=think,
     )
     turn_entry["response_token_len"] = len(turn.output_ids or [])
-    return amend_reply_with_offload(
+    reply = amend_reply_with_offload(
         reply,
         raw_output=raw_output,
         glm_content=content,
         glm_think=think,
         glm_tool_calls=glm_tool_calls,
     )
+    stamp_turn_gigpo_key(turn_entry, reply)
+    return reply
 
 
 def actual_cost(stats: dict[str, Any]) -> float:
@@ -1583,11 +1589,17 @@ def attach_turn_advantage_metadata(
     turn_rewards: list[float],
     turn_costs: list[dict[str, Any]],
 ) -> None:
-    """Write turn_rewards / spans into sample.metadata and train_metadata."""
+    """Write turn_rewards / spans / GiGPO T# keys into sample.metadata and train_metadata."""
+    turn_T = [str(tc.get("gigpo_T") or "其他 · 无 tool") for tc in turn_costs]
     for sample in samples:
         md = dict(getattr(sample, "metadata", None) or {})
         md["turn_rewards"] = list(turn_rewards)
         md["turn_costs"] = list(turn_costs)
+        md["turn_T"] = list(turn_T)
+        if getattr(sample, "group_index", None) is not None:
+            md["group_index"] = sample.group_index
+        if getattr(sample, "index", None) is not None:
+            md["sample_index"] = sample.index
         spans = build_turn_token_spans(
             int(getattr(sample, "response_length", 0) or 0),
             getattr(sample, "loss_mask", None),
@@ -1601,6 +1613,11 @@ def attach_turn_advantage_metadata(
         sample.metadata = md
         train_md = dict(getattr(sample, "train_metadata", None) or {})
         train_md["turn_rewards"] = list(turn_rewards)
+        train_md["turn_T"] = list(turn_T)
+        if getattr(sample, "group_index", None) is not None:
+            train_md["group_index"] = sample.group_index
+        if getattr(sample, "index", None) is not None:
+            train_md["sample_index"] = sample.index
         if spans is not None:
             train_md["turn_token_spans"] = spans
         else:
@@ -1790,6 +1807,12 @@ def shape_group_help_seeking_rewards(args: Any, groups: list) -> None:
                         sample.metadata = smd
                         tmd = dict(getattr(sample, "train_metadata", None) or {})
                         tmd["turn_rewards"] = list(turn_rewards)
+                        if md.get("turn_T") is not None:
+                            tmd["turn_T"] = list(md["turn_T"])
+                        if getattr(sample, "group_index", None) is not None:
+                            tmd["group_index"] = sample.group_index
+                        if getattr(sample, "index", None) is not None:
+                            tmd["sample_index"] = sample.index
                         if "turn_token_spans" in smd:
                             tmd["turn_token_spans"] = smd["turn_token_spans"]
                         sample.train_metadata = tmd

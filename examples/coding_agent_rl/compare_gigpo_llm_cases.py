@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """GiGPO vs LLM-judge on selected groups from a phase2 offload run.
 
-True GiGPO (matches phase2 HTML narrative):
-  A = A_E + w * (A_S + A_I)
+True GiGPO (matches docker / training narrative):
+  A = A_E + w * A_S
   A_E = R - mean(R|siblings)
   G_t = R * γ^{n-1-t}
   T#  = intent · tool   → A_S = G_t - mean(G|same T#)   (per-step, discounted)
-  S#  = cumulative git-diff segment → A_I = G_t - mean(G|same S# within traj)
 
 LLM judge: reuse llm_turn_credit_assign.judge_trajectory (needs DASHSCOPE_*).
 
@@ -34,22 +33,15 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT.parent.parent))  # repo root for examples.*
 
 import llm_turn_credit_assign as judge  # noqa: E402
+from examples.coding_agent_rl.gigpo_advantage import (  # noqa: E402
+    classify_message_tools,
+)
 
 GAMMA = 0.95
 W = 1.0
-
-INTENT_FROM_TAG = {
-    "edit": "实现/修改",
-    "test": "运行测试/验证",
-    "read": "阅读代码",
-    "search": "探索/定位",
-    "probe": "探索/定位",
-    "git": "探索/定位",
-    "env": "环境准备",
-    "other": "其他",
-}
 
 
 def unique_trajs_by_index(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -63,77 +55,18 @@ def unique_trajs_by_index(samples: list[dict[str, Any]]) -> list[dict[str, Any]]
     return [by[i] for i in sorted(by)]
 
 
-def _tool_brief(tc: dict[str, Any]) -> str:
-    am = tc.get("sft_assistant_message") if isinstance(tc.get("sft_assistant_message"), dict) else {}
-    calls = (am or {}).get("tool_calls") or []
-    if not calls:
-        content = str((am or {}).get("content") or "")
-        return content[:120]
-    parts = []
-    for c in calls[:3]:
-        if not isinstance(c, dict):
-            continue
-        fn = c.get("function") if isinstance(c.get("function"), dict) else c
-        name = (fn or {}).get("name") or "?"
-        args = str((fn or {}).get("arguments") or "")[:100]
-        parts.append(f"{name}({args})")
-    return "; ".join(parts)
-
-
-def _tool_family(blob: str) -> str:
-    low = (blob or "").lower()
-    if not blob.strip():
-        return "无 tool"
-    if re.search(r"\b(pytest|unittest|tox|runtests)\b", low):
-        return "Bash:pytest"
-    if re.search(r"\b(grep|rg)\b", low) or "xargs grep" in low:
-        return "Bash:grep"
-    if re.search(r"\bfind\b", low):
-        return "Bash:find"
-    if re.search(r"\bgit\b", low):
-        return "Bash:git"
-    if re.search(r"\b(pip|apt|conda)\b", low):
-        return "Bash:env"
-    if re.search(r"str_replace|search_replace|apply_patch|edit_file|write_file|Write\b|Edit\b", low):
-        return "Edit"
-    if re.search(r"\bread\b|sed\s+-n|\bcat\b|\bnl\b", low):
-        if re.search(r"cat\s*>|<<", low):
-            return "Write/Edit"
-        return "Bash:read"
-    if re.search(r"\bpython(?:3)?\b", low):
-        return "Bash:python"
-    if re.search(r"\b(ls|pwd|mkdir)\b", low):
-        return "Bash:fs"
-    return "Bash:other"
-
-
-def _intent_from_blob(blob: str, tool: str) -> str:
-    low = (blob or "").lower()
-    if tool == "Bash:pytest" or re.search(r"\b(pytest|unittest)\b", low):
-        return "运行测试/验证"
-    if tool in ("Edit", "Write/Edit") or "str_replace" in low or "write_file" in low:
-        if re.search(r"test_|tests/|/tmp/.*test", low):
-            return "编写/调整测试"
-        return "实现/修改"
-    if tool == "Bash:env":
-        return "环境准备"
-    if tool in ("Bash:grep", "Bash:find", "Bash:git", "Bash:fs"):
-        return "探索/定位"
-    if tool == "Bash:read":
-        return "阅读代码"
-    if tool == "Bash:python":
-        if re.search(r"pytest|unittest", low):
-            return "运行测试/验证"
-        return "探索/定位"
-    return "其他"
-
-
 def group_key_from_turn(tc: dict[str, Any]) -> tuple[str, str, str]:
-    blob = _tool_brief(tc)
-    tool = _tool_family(blob)
-    intent = _intent_from_blob(blob, tool)
-    return f"{intent} · {tool}", intent, tool
-
+    if tc.get("gigpo_T"):
+        key = str(tc["gigpo_T"])
+        # "intent · family"
+        if " · " in key:
+            intent, tool = key.split(" · ", 1)
+            return key, intent, tool
+        return key, "其他", key
+    am = tc.get("sft_assistant_message") if isinstance(tc.get("sft_assistant_message"), dict) else {}
+    if am:
+        return classify_message_tools(am)
+    return "其他 · 无 tool", "其他", "无 tool"
 
 def git_diff_key(md: dict[str, Any], turn_i: int) -> str:
     diffs = md.get("turn_git_diffs") or []
@@ -199,19 +132,12 @@ def compute_gigpo_group(
             by_T[tr["T"]].append(tr["G"])
     T_bar = {k: statistics.mean(v) for k, v in by_T.items()}
 
-    # A_I: within traj, same S#
     for t in trajs:
-        by_S: dict[str, list[float]] = defaultdict(list)
-        for tr in t["turns"]:
-            by_S[tr["S"]].append(tr["G"])
-        S_bar = {k: statistics.mean(v) for k, v in by_S.items()}
         ae = t["A_E"]
         for tr in t["turns"]:
             a_s = tr["G"] - T_bar[tr["T"]]
-            a_i = tr["G"] - S_bar[tr["S"]]
             tr["A_S"] = a_s
-            tr["A_I"] = a_i
-            tr["A"] = ae + w * (a_s + a_i)
+            tr["A"] = ae + w * a_s
             tr["A_E"] = ae
 
     # legend
@@ -354,7 +280,7 @@ def run_cases(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "title": "GiGPO vs LLM judge · phase2_sft03",
         "run_dir": str(args.run_dir),
-        "formula_gigpo": "A=A_E+w(A_S+A_I); A_S=G_t−mean(G|T#); A_I=G_t−mean(G|S#); G_t=R·γ^{n−1−t}",
+        "formula_gigpo": "A=A_E+w*A_S; A_S=G_t−mean(G|T#); G_t=R·γ^{n−1−t}",
         "formula_llm": "A_t=A_E+(r_i−mean r); r_i from LLM process judge",
         "gamma": args.gamma,
         "w": args.w,
@@ -374,7 +300,6 @@ def analyze_case(gigpo: dict[str, Any]) -> dict[str, Any]:
         return statistics.mean(map(abs, xs)) if xs else 0.0
 
     a_s = [tr["A_S"] for tr in all_turns]
-    a_i = [tr["A_I"] for tr in all_turns]
     a = [tr["A"] for tr in all_turns]
     zero_as = sum(1 for x in a_s if abs(x) < 1e-9) / len(a_s)
 
@@ -417,14 +342,13 @@ def analyze_case(gigpo: dict[str, Any]) -> dict[str, Any]:
     bad_a = [statistics.mean(tr["A"] for tr in t["turns"]) for t in trajs if (not t["solved"]) and t["turns"]]
 
     headline = (
-        f"|A_S|μ={mean_abs(a_s):.3f} zero={zero_as:.0%} |A_I|μ={mean_abs(a_i):.3f} "
+        f"|A_S|μ={mean_abs(a_s):.3f} zero={zero_as:.0%} "
         f"A_S early={statistics.mean(early) if early else 0:+.3f} late={statistics.mean(late) if late else 0:+.3f} "
         f"sameT σμ={statistics.mean(within_var) if within_var else 0:.3f}"
     )
     return {
         "headline": headline,
         "abs_A_S": mean_abs(a_s),
-        "abs_A_I": mean_abs(a_i),
         "abs_A": mean_abs(a),
         "A_S_zero_rate": zero_as,
         "A_S_early": statistics.mean(early) if early else None,
@@ -529,7 +453,7 @@ function gigpoChart(turns, legend, scaleA){
     // color by T#, but tint intensity via height; border-left hint via bg mix
     const style=`background:linear-gradient(${a>=0?'180deg':'0deg'}, ${col}, ${fill})`;
     const bar=`<i style="height:${pct}%;${style}"></i>`;
-    return `<div class="col ${dim} ${hl}" data-t="${esc(tr.T)}" title="t${tr.turn} ${tr.T} A=${fmt(a)} A_S=${fmt(tr.A_S)} A_I=${fmt(tr.A_I)}">
+    return `<div class="col ${dim} ${hl}" data-t="${esc(tr.T)}" title="t${tr.turn} ${tr.T} A=${fmt(a)} A_S=${fmt(tr.A_S)}">
       <div class="up">${a>=0?bar:''}</div>
       <div class="dn">${a<0?bar:''}</div>
     </div>`;
@@ -588,7 +512,7 @@ function render(){
         <div class="row mono" style="margin-top:3px">
           <span class="${cls(tr.A)}">GiGPO A ${fmt(tr.A)}</span>${bar(tr.A,scale)}
         </div>
-        <div class="row mono" style="color:#9aa3b2">A_E=${fmt(tr.A_E)} A_S=${fmt(tr.A_S)} A_I=${fmt(tr.A_I)} G=${fmt(tr.G,4)}</div>
+        <div class="row mono" style="color:#9aa3b2">A_E=${fmt(tr.A_E)} A_S=${fmt(tr.A_S)} G=${fmt(tr.G,4)}</div>
         <div class="row mono" style="margin-top:2px">
           <span class="${cls(L.advantage)}" style="color:#e3b341">LLM A_t ${fmt(L.advantage)}</span>
           <span style="color:#9aa3b2">r=${L.score!=null?Number(L.score).toFixed(3):'—'} r−r̄=${fmt(L.residual)}</span>
@@ -654,7 +578,7 @@ def write_analysis_md(report: dict[str, Any], path: Path) -> None:
         "1. **同组有折扣**：`sameT σ` > 0 说明同 T# 内逐步 A_S 不同（越靠后通常越高），不是组级广播。",
         "2. **A_S early→late**：若 early 低、late 高，存在位置偏置；LLM 残差不应系统性随位置单调。",
         "3. **混合成败组**：GiGPO 主要靠 A_E + 同意图桶相对 G；LLM 能在失败长轨内标空转/有害步。",
-        "4. **全对/全错**：A_E≈0 时 GiGPO 只剩 A_S/A_I；全错时 G=0 居多，A_S 信息弱。",
+        "4. **全对/全错**：A_E≈0 时 GiGPO 只剩 A_S；全错时 G=0 居多，A_S 信息弱。",
         "",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
