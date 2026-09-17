@@ -24,7 +24,7 @@ Slime port of phase2 math offload GRPO:
 
 ```bash
 # 1) torch_dist
-bash examples/coding_agent_rl/convert_pyrodash4b_to_torch_dist.sh
+bash examples/coding_agent_rl/scripts/convert_pyrodash4b_to_torch_dist.sh
 
 # 2) dataset
 python examples/llm_offload/convert_offload_dataset.py \

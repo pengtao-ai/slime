@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
-from examples.coding_agent_rl.log_rollout_timeline import build_chrome_trace, log_rollout_timeline
+from examples.coding_agent_rl.scripts.log_rollout_timeline import build_chrome_trace, log_rollout_timeline
 from slime.agent.chrome_trace import chrome_span, now_us, span_begin, span_end
 
 

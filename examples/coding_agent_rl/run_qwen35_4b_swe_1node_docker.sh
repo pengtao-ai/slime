@@ -11,7 +11,7 @@
 #   CUDA_VISIBLE_DEVICES=0 python -m sglang.launch_server \
 #     --model-path /workspace/models/Qwen/Qwen3.5-4B \
 #     --served-model-name qwen --host 127.0.0.1 --port 30000
-#   python examples/coding_agent_rl/smoke_claude_code_docker.py
+#   python examples/coding_agent_rl/smoke/smoke_claude_code_docker.py
 #
 # Run full training from a long-lived shell / tmux:
 #   bash examples/coding_agent_rl/run_qwen35_4b_swe_1node_docker.sh

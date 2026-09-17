@@ -17,7 +17,7 @@ and produces the md dict consumed below.
 
 Chrome Trace timestamps (ph=B/E) are recorded on each sample under
 ``metadata["timeline"]`` and exported per rollout by
-``examples.coding_agent_rl.log_rollout_timeline``.
+``examples.coding_agent_rl.scripts.log_rollout_timeline``.
 """
 
 from __future__ import annotations

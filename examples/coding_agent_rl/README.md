@@ -2,7 +2,19 @@
 
 This directory provides an example of running end-to-end **SWE (Software-Engineering) coding-agent RL** with slime: a real coding agent (claude-code CLI) drives `Read/Edit/Grep/Bash/Agent` tools inside a fresh sandbox per sample, the model produces a `git diff`, and the diff is graded against the dataset's test harness in a second clean sandbox (no test-cheating).
 
-**Qwen3.5-4B + public e2b.dev (1 node):** see [README_qwen35_4b_public_e2b.md](./README_qwen35_4b_public_e2b.md) for the local diff summary and runbook (template build, Cloudflare tunnel, smoke data).
+**Qwen3.5-4B + public e2b.dev (1 node):** see [docs/README_qwen35_4b_public_e2b.md](./docs/README_qwen35_4b_public_e2b.md) for the local diff summary and runbook (template build, Cloudflare tunnel, smoke data).
+
+## Directory map
+
+| Path | Contents |
+|------|----------|
+| *(root)* | Train hot path: `generate.py`, `offload.py`, `swe.py`, `agents_registry.py`, GiGPO helpers, main `run_*.sh` launchers |
+| `docs/` | Extra READMEs and design notes |
+| `smoke/` | Smoke tests (`smoke_*.py`) and offload smoke launcher |
+| `analysis/` | Trajectory compare / render / score helpers |
+| `infer/` | Offline inference + replay / SFT-from-traj tools |
+| `scripts/` | Dataset convert, bake helpers, tunnels, timeline logger, regrade |
+| `data/` `docker_build/` `sft/` `tarballs/` | Unchanged large assets |
 
 Two example files, the shared harness package, and one shared adapter implement the loop:
 
@@ -62,7 +74,7 @@ Wire it up with `--input-key prompt --label-key label --metadata-key metadata`.
 Multi-agent smoke (5 agents × 2 rows each):
 
 ```bash
-python examples/coding_agent_rl/build_agents_smoke_jsonl.py
+python examples/coding_agent_rl/scripts/build_agents_smoke_jsonl.py
 # -> data/scaleswe_agents_smoke.jsonl
 # -> data/tmax_agents_smoke.jsonl
 ```
@@ -80,9 +92,9 @@ Host tarballs / wheels (set the ones you need for the agents in the jsonl):
 
 ```bash
 # Convert each source (tmax pulls HF task-data for test_sh):
-python examples/coding_agent_rl/convert_scaleswe_to_slime.py \
+python examples/coding_agent_rl/scripts/convert_scaleswe_to_slime.py \
   --src /path/to/scaleswe.jsonl --dst data/scaleswe.jsonl
-python examples/coding_agent_rl/convert_tmax_to_slime.py \
+python examples/coding_agent_rl/scripts/convert_tmax_to_slime.py \
   --dst data/tmax.jsonl --limit 200
 
 # Offline mix; SWE_TRAIN_PROTOCOL is only a fallback when protocol is missing:
@@ -108,14 +120,14 @@ Offload is implemented **on this black-box agent path**, not as post-hoc math cu
 
 ```bash
 # CPU plumbing smoke (mock GLM, 2 adapter turns; no GPU/Docker)
-python examples/coding_agent_rl/smoke_offload_adapter.py
+python examples/coding_agent_rl/smoke/smoke_offload_adapter.py
 
 # 1-sample docker train smoke
 export DASHSCOPE_API_KEY=...
 export DASHSCOPE_BASE_URL=http://host:8000/v1
-bash examples/coding_agent_rl/run_pyrodash4b_swe_offload_smoke.sh
+bash examples/coding_agent_rl/smoke/run_pyrodash4b_swe_offload_smoke.sh
 
-# full async docker train (after convert_pyrodash4b_to_torch_dist.sh)
+# full async docker train (after scripts/convert_pyrodash4b_to_torch_dist.sh)
 bash examples/coding_agent_rl/run_pyrodash4b_swe_offload_1node_docker_async.sh
 ```
 
@@ -284,9 +296,9 @@ async with make_sandbox(image) as sb:
 Local Docker smoke (no E2B)::
 
 ```bash
-python examples/coding_agent_rl/smoke_docker_sandbox.py
+python examples/coding_agent_rl/smoke/smoke_docker_sandbox.py
 # ScaleSWE image (must be pulled locally first):
-python examples/coding_agent_rl/smoke_docker_sandbox.py \
+python examples/coding_agent_rl/smoke/smoke_docker_sandbox.py \
   --image aweaiteam/scaleswe:arviz-devs_preliz_pr249 \
   --workdir /workspace/preliz --pull
 ```

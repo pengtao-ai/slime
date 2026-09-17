@@ -33,7 +33,7 @@ fi
 # ---- local vLLM (0902) ----
 export DASHSCOPE_BASE_URL="${DASHSCOPE_BASE_URL:-http://10.244.0.61:8066/v1}"
 export DASHSCOPE_API_KEY="${DASHSCOPE_API_KEY:-EMPTY}"
-export DASHSCOPE_MODEL="${DASHSCOPE_MODEL:-/workspace/models/pyromind/PyroDash-4B-SFT-0902}"
+export DASHSCOPE_MODEL="${DASHSCOPE_MODEL:-/workspace/models/pyromind/PyroDash-4B-SFT-0916}"
 export INFER_REASONING_EFFORT="${INFER_REASONING_EFFORT:-}"
 
 # Entropy sampling (match annotate_reward1_entropy defaults)

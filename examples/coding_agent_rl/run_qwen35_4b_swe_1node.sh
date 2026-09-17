@@ -160,7 +160,7 @@ export E2B_API_KEY="${E2B_API_KEY:-e2b_0000000000000000000000000000000000000000}
 # Metadata key your gateway routes images by; `image` is the neutral default.
 export SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY="${SLIME_AGENT_SANDBOX_IMAGE_METADATA_KEY:-image}"
 # Public e2b.dev: set to 1 and put an E2B *template* name in metadata.image
-# (see examples/coding_agent_rl/smoke_public_e2b.py). Internal gateways leave this unset.
+# (see examples/coding_agent_rl/smoke/smoke_public_e2b.py). Internal gateways leave this unset.
 # SLIME_AGENT_E2B_USE_TEMPLATE is also read above to pick rollout fan-out defaults.
 export SLIME_AGENT_E2B_USE_TEMPLATE="${SLIME_AGENT_E2B_USE_TEMPLATE:-0}"
 export SLIME_AGENT_NODE_TARBALL="${SLIME_AGENT_NODE_TARBALL:-${SCRIPT_DIR}/tarballs/node-v22.20.0-linux-x64.tar.xz}"
@@ -169,7 +169,7 @@ export SLIME_AGENT_CC_TARBALL="${SLIME_AGENT_CC_TARBALL:-${SCRIPT_DIR}/tarballs/
 # ADAPTER_PUBLIC_HOST must be routable from inside the sandbox (not 127.0.0.1).
 # Docker/docker-rt on k8s: prefer the pod IP (see run_qwen35_4b_swe_1node_docker.sh).
 # For public e2b.dev use a reverse proxy instead, e.g.:
-#   bash examples/coding_agent_rl/start_adapter_tunnel.sh
+#   bash examples/coding_agent_rl/scripts/start_adapter_tunnel.sh
 #   export ADAPTER_PUBLIC_URL=https://....trycloudflare.com
 export ADAPTER_PUBLIC_HOST="${ADAPTER_PUBLIC_HOST:-${MASTER_ADDR:-${MLP_WORKER_0_HOST:-127.0.0.1}}}"
 export ADAPTER_PUBLIC_URL="${ADAPTER_PUBLIC_URL:-}"

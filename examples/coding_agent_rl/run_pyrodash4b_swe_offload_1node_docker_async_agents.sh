@@ -11,7 +11,7 @@
 # otherwise unsolved→0 / solved→(1-λ*cost_ratio). Empty patches never count as solved.
 #
 # Prerequisites:
-#   bash examples/coding_agent_rl/convert_pyrodash4b_to_torch_dist.sh
+#   bash examples/coding_agent_rl/scripts/convert_pyrodash4b_to_torch_dist.sh
 #   DASHSCOPE_API_KEY / DASHSCOPE_BASE_URL pointing at OpenAI-compatible deepseek
 #   docker sandboxes + pod IP (same as run_qwen35_4b_swe_1node_docker_async.sh)
 #

@@ -151,7 +151,7 @@ CKPT_ARGS=(
 
 ROLLOUT_ARGS=(
    --custom-generate-function-path examples.coding_agent_rl.generate.generate
-   --custom-rollout-log-function-path examples.coding_agent_rl.log_rollout_timeline.log_rollout_timeline
+   --custom-rollout-log-function-path examples.coding_agent_rl.scripts.log_rollout_timeline.log_rollout_timeline
    --prompt-data "${PROMPT_DATA}"
    --input-key prompt
    --label-key label

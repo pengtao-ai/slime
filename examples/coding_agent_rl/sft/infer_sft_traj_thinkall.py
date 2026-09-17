@@ -9,8 +9,7 @@ Pipeline
 1. Start vLLM for 0902 (see ``launch_vllm_pyrodash4b_sft0902.sh``).
 2. Point ``DASHSCOPE_*`` at that OpenAI-compatible ``/v1`` endpoint.
 3. Run on ``mixed_reward1_agents_baked.jsonl`` (tmax + scaleswe).
-4. Each turn hits vLLM with ``logprobs`` and records entropy of the **first
-   sentence** of thinking (through the first ``.`` or ``。``) on
+4. Each turn hits vLLM with ``logprobs`` and records thinking entropy on
    ``openai_response.entropy`` / ``req_*.json``.
 
 Example::
@@ -64,7 +63,7 @@ logger = logging.getLogger("infer_sft")
 DEFAULT_JSONL = (
     _EXAMPLE_DIR / "data" / "release" / "mixed_reward1_agents_baked.jsonl"
 )
-DEFAULT_MODEL = "/workspace/models/pyromind/PyroDash-4B-SFT-0916"
+DEFAULT_MODEL = "/workspace/models/pyromind/PyroDash-4B-SFT-0902"
 DEFAULT_VLLM_URL = "http://127.0.0.1:8066/v1"
 DEFAULT_PROMPT = (
     "Read PROBLEM_STATEMENT.md in the current directory and resolve the task. "
@@ -80,8 +79,9 @@ def _resolve_protocol(sample: Sample) -> str:
 
 
 def _entropy_from_vllm_data(data: dict[str, Any], *, scope: str) -> dict[str, Any]:
-    """Entropy payload (no per-token dump — keeps req_*.json small)."""
+    """Thinking entropy payload (no per-token dump — keeps req_*.json small)."""
     payload = ent._compute_entropy_from_response(data, scope=scope)
+    # Drop bulky per-token list if annotate helpers ever add it via to_dict.
     payload.pop("tokens", None)
     return payload
 
@@ -475,14 +475,12 @@ def _turn_entropies(traj_turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for t in traj_turns:
         ent_obj = (t.get("openai_response") or {}).get("entropy")
-        ok = isinstance(ent_obj, dict)
         rows.append(
             {
                 "turn_index": t.get("turn_index"),
-                "avg_entropy": ent_obj.get("avg_entropy") if ok else None,
-                "n_used": ent_obj.get("n_used") if ok else None,
-                "unavailable": ent_obj.get("unavailable") if ok else None,
-                "first_sentence": ent_obj.get("first_sentence") if ok else None,
+                "avg_entropy": (ent_obj or {}).get("avg_entropy") if isinstance(ent_obj, dict) else None,
+                "n_used": (ent_obj or {}).get("n_used") if isinstance(ent_obj, dict) else None,
+                "unavailable": (ent_obj or {}).get("unavailable") if isinstance(ent_obj, dict) else None,
             }
         )
     return rows
@@ -848,8 +846,6 @@ def main() -> None:
         "--entropy-scope",
         default=os.environ.get("ENTROPY_SCOPE", "thinking"),
         choices=("thinking", "all"),
-        help="thinking=avg entropy of first think sentence (through first '.' or '。'); "
-        "all=full generation turn",
     )
     p.add_argument("--llm-timeout", type=float, default=float(os.environ.get("LLM_TIMEOUT", "600")))
     p.add_argument("--prompt", default=os.environ.get("SWE_CC_PROMPT", DEFAULT_PROMPT))

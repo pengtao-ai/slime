@@ -129,7 +129,7 @@ def test_run_evaluation_rejects_tmax():
 
 
 def test_convert_tmax_strip_vanillux():
-    from examples.coding_agent_rl.convert_tmax_to_slime import _strip_vanillux_harness
+    from examples.coding_agent_rl.scripts.convert_tmax_to_slime import _strip_vanillux_harness
 
     raw = (
         "Please solve this task:\n\n"

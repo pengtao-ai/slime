@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-MODEL="${MODEL:-/workspace/models/pyromind/PyroDash-4B-SFT-0902}"
+MODEL="${MODEL:-/workspace/models/pyromind/PyroDash-4B-SFT-0916}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-${MODEL}}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8066}"

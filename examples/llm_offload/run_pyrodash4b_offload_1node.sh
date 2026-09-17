@@ -6,7 +6,7 @@
 #
 # Prerequisites:
 #   1. HF + torch_dist for PyroDash-4B
-#        bash examples/coding_agent_rl/convert_pyrodash4b_to_torch_dist.sh
+#        bash examples/coding_agent_rl/scripts/convert_pyrodash4b_to_torch_dist.sh
 #   2. Convert dataset once:
 #        python examples/llm_offload/convert_offload_dataset.py \
 #          --src /path/to/glm52_hint_8b_answers.jsonl \
@@ -92,7 +92,7 @@ if [[ ! -f "${PROMPT_DATA}" ]]; then
 fi
 if [[ ! -d "${REF_MODEL_PATH}" ]]; then
   echo "ERROR: torch_dist missing: ${REF_MODEL_PATH}" >&2
-  echo "Run: bash examples/coding_agent_rl/convert_pyrodash4b_to_torch_dist.sh" >&2
+  echo "Run: bash examples/coding_agent_rl/scripts/convert_pyrodash4b_to_torch_dist.sh" >&2
   exit 1
 fi
 

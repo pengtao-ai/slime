@@ -9,8 +9,6 @@ Pipeline
 4. For **each** assistant message, POST the prefix (messages before it) to
    vLLM with ``logprobs`` / ``top_logprobs=20`` (same scoring as
    ``sft/entropy.py``), then write ``entropy`` onto that assistant.
-   Default thinking scope averages only the **first sentence** of think
-   text (through the first ``.`` or ``。``).
 5. Write a **new** annotated JSON under ``--out-dir`` (never modifies the
    original ``runs/.../requests/req_*.json``). Same schema; each assistant /
    final ``response`` gains ``entropy`` + ``vllm_response``.
@@ -195,48 +193,6 @@ def _split_entries_at_stop(entries: list[Any], stop: str) -> tuple[list[Any], li
     return [], list(entries)
 
 
-_SENTENCE_STOPS = (".", "。")
-
-
-def _first_sentence_prefix(text: str, *, stops: tuple[str, ...] = _SENTENCE_STOPS) -> str:
-    """Prefix through the earliest sentence stop (inclusive); whole text if none."""
-    if not text:
-        return ""
-    best: tuple[int, str] | None = None
-    for stop in stops:
-        idx = text.find(stop)
-        if idx < 0:
-            continue
-        if best is None or idx < best[0]:
-            best = (idx, stop)
-    if best is None:
-        return text
-    idx, stop = best
-    return text[: idx + len(stop)]
-
-
-def _split_entries_at_sentence_stop(entries: list[Any]) -> list[Any]:
-    """Token prefix through the earliest ``.`` / ``。`` in the stream."""
-    best: list[Any] | None = None
-    for stop in _SENTENCE_STOPS:
-        head, _ = _split_entries_at_stop(entries, stop)
-        if not head:
-            continue
-        if best is None or len(head) < len(best):
-            best = head
-    return best or []
-
-
-def _thinking_entries(logprobs: Any) -> list[Any]:
-    if not isinstance(logprobs, dict):
-        return []
-    for key in ("reasoning", "reasoning_content"):
-        items = logprobs.get(key)
-        if isinstance(items, list) and items:
-            return list(items)
-    return []
-
-
 def _remap_logprobs_for_thinking(logprobs: Any, *, reasoning: str) -> Any:
     """Relabel content-bucket logprobs that belong to the thinking segment.
 
@@ -267,43 +223,20 @@ def _remap_logprobs_for_thinking(logprobs: Any, *, reasoning: str) -> Any:
 
 
 def _compute_entropy_from_response(data: dict[str, Any], *, scope: str) -> dict[str, Any]:
-    """Compute entropy; ``thinking`` = first think sentence (``.`` / ``。``)."""
-    if scope != "thinking":
-        logprobs = extract_choice_logprobs(data)
-        primary = average_turn_entropy(logprobs, scope=scope)
-        payload = _entropy_payload(primary)
-        payload["scope_requested"] = scope
-        return payload
-
-    reasoning = _message_reasoning_text(data)
-    first_sent = _first_sentence_prefix(reasoning)
-    logprobs = _remap_logprobs_for_thinking(
-        extract_choice_logprobs(data), reasoning=reasoning
-    )
-    think_entries = _thinking_entries(logprobs)
-
-    first_entries: list[Any] = []
-    if think_entries and first_sent:
-        first_entries, _ = _split_entries_by_prefix(think_entries, first_sent)
-    if not first_entries and think_entries:
-        first_entries = _split_entries_at_sentence_stop(think_entries)
-    if not first_entries:
-        first_entries = think_entries
-
-    primary = average_turn_entropy({"reasoning": first_entries}, scope="thinking")
-    if primary.unavailable:
+    logprobs = extract_choice_logprobs(data)
+    if scope == "thinking":
+        logprobs = _remap_logprobs_for_thinking(
+            logprobs, reasoning=_message_reasoning_text(data)
+        )
+    primary = average_turn_entropy(logprobs, scope=scope)
+    if primary.unavailable and scope == "thinking":
         fallback = average_turn_entropy(logprobs, scope="all")
         payload = _entropy_payload(fallback)
-        payload["scope"] = "thinking_first_sentence"
         payload["scope_requested"] = "thinking"
         payload["scope_fallback"] = "all"
-        payload["first_sentence"] = first_sent or None
         return payload
-
     payload = _entropy_payload(primary)
-    payload["scope"] = "thinking_first_sentence"
-    payload["scope_requested"] = "thinking"
-    payload["first_sentence"] = first_sent or None
+    payload["scope_requested"] = scope
     return payload
 
 
@@ -639,8 +572,6 @@ def main() -> None:
         "--entropy-scope",
         default=os.environ.get("ENTROPY_SCOPE", "thinking"),
         choices=("thinking", "all"),
-        help="thinking=avg entropy of first think sentence (through first '.' or '。'); "
-        "all=full generation turn",
     )
     p.add_argument("--max-tokens", type=int, default=int(os.environ.get("MAX_TOKENS", "8192")))
     p.add_argument("--temperature", type=float, default=float(os.environ.get("TEMPERATURE", "0.6")))
