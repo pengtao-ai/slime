@@ -57,8 +57,8 @@ export OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG=1
 export OFFLOAD_SEEK_ALPHA=0.1
 export OFFLOAD_SEEK_EMPTY_SCALE=0.5
 export OFFLOAD_UNIQUE_SOLVER_BONUS=0.15
-# Soft seek budget: budget=max(1, n_turns//K); over-budget α*=decay^excess, solved -= pen*excess.
-export OFFLOAD_SEEK_BUDGET_TURN_K="${OFFLOAD_SEEK_BUDGET_TURN_K:-4}"
+# Soft seek budget: budget=max(1, n_turns//2); over-budget α*=decay^excess, solved -= pen*excess.
+export OFFLOAD_SEEK_BUDGET_TURN_K="${OFFLOAD_SEEK_BUDGET_TURN_K:-2}"
 export OFFLOAD_SEEK_BUDGET_DECAY="${OFFLOAD_SEEK_BUDGET_DECAY:-0.5}"
 export OFFLOAD_SEEK_OVERAGE_PENALTY="${OFFLOAD_SEEK_OVERAGE_PENALTY:-0.05}"
 # Optional fixed cap (min with turn budget when both set): OFFLOAD_SEEK_BUDGET=4

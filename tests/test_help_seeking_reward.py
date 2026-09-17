@@ -187,18 +187,25 @@ def _turn(*, valid=False, outside=False, orphan=0, mal=0, small_o=10, glm_o=0, o
     }
 
 
-def test_compute_turn_rewards_solved_uses_completion_budget():
+def test_compute_turn_rewards_solved_uses_total_cost():
     turns = [_turn(valid=True, small_o=100, glm_o=0), _turn(valid=False, small_o=100, glm_o=0)]
-    stats = {"turn_costs": turns, "offload_count": 1, "offload_outside_think_count": 0}
-    # completion_tokens=200, n=2 → budget 100 completion tokens/turn @ COST_GLM_OUTPUT
+    stats = {
+        "turn_costs": turns,
+        "offload_count": 1,
+        "offload_outside_think_count": 0,
+        "small_output_tokens": 200,
+    }
+    # Total traj cost once (not per-turn); lam=0 isolates cost term off.
     out = offload.compute_turn_rewards(
         1.0,
         stats,
         completion_tokens=200,
         metadata={"completion_tokens": 200},
-        lam=0.0,  # isolate cost term off
+        lam=0.0,
     )
     assert len(out["turn_rewards"]) == 2
+    assert out["turn_rewards"][0] == pytest.approx(1.0)
+    assert out["turn_rewards"][1] == pytest.approx(1.0)
     assert out["reward"] == pytest.approx(1.0)
 
 
@@ -359,8 +366,10 @@ def test_compute_turn_rewards_soft_budget_solved_overage(monkeypatch):
     turns = [_turn(valid=True, small_o=0, glm_o=0), _turn(valid=True, small_o=0, glm_o=0)]
     stats = {"turn_costs": turns, "offload_count": 2, "offload_outside_think_count": 0}
     out = offload.compute_turn_rewards(1.0, stats, lam=0.0)
-    assert out["turn_rewards"][0] == pytest.approx(1.0)
+    # Traj-level overage once on offload_count, then broadcast.
+    assert out["turn_rewards"][0] == pytest.approx(0.9)
     assert out["turn_rewards"][1] == pytest.approx(0.9)
+    assert out["reward"] == pytest.approx(0.9)
 
 
 def test_help_seeking_scalar_soft_budget(monkeypatch):

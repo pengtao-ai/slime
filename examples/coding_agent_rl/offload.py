@@ -26,8 +26,8 @@ with ``output_loss_mask=0`` so rollout dumps contain the full assistant turn
 without contributing to the policy loss (``SLIME_OFFLOAD_EMBED_IN_TRAJECTORY``).
 
 Train shaping (when ``SLIME_AGENT_OFFLOAD=1``):
-  - Per-turn costs in ``offload_stats["turn_costs"]``; ``r_i`` via
-    :func:`compute_turn_rewards` (baseline completion = ``metadata.completion_tokens / n``).
+  - Trajectory total cost via :func:`compute_turn_rewards` (``actual_cost`` /
+    full GLM baseline from ``metadata.usage`` / ``completion_tokens``).
   - Hard compact filter + group α:
     :func:`compact_and_shape_group_help_seeking_rewards`.
   - Soft seek budget (``OFFLOAD_SEEK_BUDGET`` / ``_TURN_K``): over-budget α decay
@@ -67,10 +67,12 @@ DEFAULT_DASHSCOPE_BASE_URL = os.environ.get("DASHSCOPE_BASE_URL", "http://208.64
 DEFAULT_DASHSCOPE_MODEL = os.environ.get("DASHSCOPE_MODEL", "deepseek-v4-flash-0731")
 DEFAULT_OFFLOAD_MAX_TOKENS = int(os.environ.get("OFFLOAD_MAX_TOKENS", "8192"))
 
-COST_SMALL_PROMPT = float(os.environ.get("OFFLOAD_COST_SMALL_PROMPT", "0.017"))
-COST_SMALL_OUTPUT = float(os.environ.get("OFFLOAD_COST_SMALL_OUTPUT", "0.026"))
-COST_GLM_INPUT = float(os.environ.get("OFFLOAD_COST_GLM_INPUT", "0.315"))
-COST_GLM_OUTPUT = float(os.environ.get("OFFLOAD_COST_GLM_OUTPUT", "1.0"))
+# USD / MTok relative weights (scale cancels in cost_ratio):
+# Qwen3.5-4B 0.016/0.23 + DeepSeek-V4-Flash 0.44/1.32
+COST_SMALL_PROMPT = float(os.environ.get("OFFLOAD_COST_SMALL_PROMPT", "0.016"))
+COST_SMALL_OUTPUT = float(os.environ.get("OFFLOAD_COST_SMALL_OUTPUT", "0.23"))
+COST_GLM_INPUT = float(os.environ.get("OFFLOAD_COST_GLM_INPUT", "0.44"))
+COST_GLM_OUTPUT = float(os.environ.get("OFFLOAD_COST_GLM_OUTPUT", "1.32"))
 
 # Fallback baseline when dataset metadata has no ``usage`` (GLM-only tokens).
 _DEFAULT_BASELINE_PROMPT_TOKENS = int(os.environ.get("OFFLOAD_BASELINE_PROMPT_TOKENS", "1093525"))
@@ -1389,7 +1391,7 @@ def help_seeking_reward(
     - solved: ``1 - λ * cost_ratio`` (− format / soft overage), then
       optional ``unique_bonus`` when this traj is the sole solver in its group
 
-    Prefer :func:`compute_turn_rewards` for per-turn shaping used in training.
+    Prefer :func:`compute_turn_rewards` for training (total cost + turn ledger for α).
     """
     st = stats or {}
     oc = int(st.get("offload_count", 0) or 0)
@@ -1441,7 +1443,9 @@ def compute_turn_rewards(
 ) -> dict[str, Any]:
     """Per-turn rewards ``r_i`` and scalar ``mean(r_i)``.
 
-    Solved: ``r_i = max(0, 1 - λ * c_i/b_i - format - malformed - overage)``.
+    Solved: one trajectory ``cost_ratio = actual_cost / GLM_baseline`` →
+    ``r = 1 - λ * cost_ratio`` (− format once, − seek overage on ``offload_count``);
+    broadcast to turns (malformed still ``-β`` per turn).
     Unsolved help_seeking: α' on valid in-think turns (unless deferred; soft
     budget decays α past the seek budget), ``-β`` on malformed/orphan spam, else 0.
     """
@@ -1455,6 +1459,12 @@ def compute_turn_rewards(
     emp_scale = float(empty_scale if empty_scale is not None else seek_empty_scale())
     proto = protocol if protocol is not None else (metadata or {}).get("protocol")
     budget = resolve_seek_budget(n if n > 0 else max(int(st.get("offload_count", 0) or 0), 1))
+    eff_usage = {
+        "prompt_tokens": resolve_baseline_prompt_tokens(usage, metadata=metadata),
+        "completion_tokens": resolve_baseline_completion_tokens(
+            usage, completion_tokens=completion_tokens, metadata=metadata
+        ),
+    }
 
     if n == 0:
         # Fallback to legacy scalar when no turn ledger (compat).
@@ -1462,7 +1472,7 @@ def compute_turn_rewards(
             r = help_seeking_reward(
                 solved,
                 st,
-                usage=usage,
+                usage=eff_usage,
                 lam=lam_v,
                 format_penalty=fmt_pen,
                 alpha=alpha_v,
@@ -1472,29 +1482,24 @@ def compute_turn_rewards(
                 protocol=proto,
             )
         else:
-            r = cost_aware_reward(solved, st, usage=usage, lam=lam_v, format_penalty=fmt_pen)
+            r = cost_aware_reward(solved, st, usage=eff_usage, lam=lam_v, format_penalty=fmt_pen)
         return {"reward": float(r), "turn_rewards": [], "turn_costs": turns}
 
-    b_i = per_turn_baseline_cost(
-        n_turns=n, usage=usage, completion_tokens=completion_tokens, metadata=metadata
-    )
     turn_rewards: list[float] = []
     seek_ordinal = 0
 
     if float(solved) > 0.0:
+        # Total traj cost once (not per-turn c_i/b_i).
+        r_base = cost_aware_reward(
+            solved, st, usage=eff_usage, lam=lam_v, format_penalty=fmt_pen
+        )
+        oc = int(st.get("offload_count", 0) or 0)
+        r_base = max(0.0, float(r_base) - seek_budget_overage_penalty_value(oc, budget))
         for tc in turns:
-            if _is_valid_in_think_offload(tc):
-                seek_ordinal += 1
-            c_i = turn_actual_cost(tc)
-            ratio = (c_i / b_i) if b_i > 0 else 0.0
-            r_i = 1.0 - lam_v * ratio
-            if tc.get("outside_think"):
-                r_i -= fmt_pen
+            r_i = r_base
             mal = int(tc.get("malformed_count", 0) or 0) + int(tc.get("orphan_open_count", 0) or 0)
             if mal > 0:
                 r_i -= mal_pen
-            if _is_valid_in_think_offload(tc):
-                r_i -= seek_budget_overage_penalty_value(seek_ordinal, budget)
             turn_rewards.append(max(0.0, float(r_i)))
     elif reward_mode() != "help_seeking":
         # cost_aware: unsolved → all zeros (still record malformed as -β for advantage).
