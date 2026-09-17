@@ -265,6 +265,7 @@ def call_chat(
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
+        "chat_template_kwargs": {"thinking": False},
     }
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
@@ -439,6 +440,30 @@ def judge_trajectory(
     }
 
 
+def paint_turn_advantages(traj: dict[str, Any], *, a_s: float) -> None:
+    """Write per-turn residual and A_t = A_s + (r_i - mean r)."""
+    items = list(traj.get("llm_turn_rewards") or [])
+    scores = [float(x.get("score") or 0.0) for x in items]
+    mean_r = (sum(scores) / len(scores)) if scores else 0.0
+    traj["a_s"] = float(a_s)
+    traj["mean_r"] = float(mean_r)
+    for item, score in zip(items, scores):
+        residual = float(score) - mean_r
+        item["residual"] = residual
+        item["a_s"] = float(a_s)
+        item["advantage"] = float(a_s) + residual
+
+
+def paint_group_advantages(group: dict[str, Any]) -> None:
+    """A_s = outcome - group mean (no std). Same prompt, 8 trajs."""
+    trajs = list(group.get("trajectories") or [])
+    rewards = [float(t.get("outcome_reward") or 0.0) for t in trajs]
+    mean = (sum(rewards) / len(rewards)) if rewards else 0.0
+    group["outcome_mean"] = float(mean)
+    for traj, reward in zip(trajs, rewards):
+        paint_turn_advantages(traj, a_s=float(reward) - mean)
+
+
 def render_html(report: dict[str, Any]) -> str:
     title = html.escape(str(report.get("title") or "LLM Turn Credit Assignment"))
     payload = json.dumps(report, ensure_ascii=False)
@@ -499,6 +524,9 @@ body {{ margin:0; font-family:var(--sans); color:var(--ink); background:
 .score {{ font-family:var(--mono); font-weight:500; min-width:4.2rem; }}
 .score.pos {{ color:var(--good); }}
 .score.neg {{ color:var(--bad); }}
+.adv {{ font-family:var(--mono); font-size:.78rem; color:var(--muted); }}
+.adv b {{ font-weight:500; }}
+.cmp-toggle {{ margin:.4rem 0 .2rem; }}
 .reason {{ margin:.35rem 0; font-size:.88rem; }}
 .details {{ font-family:var(--mono); font-size:.72rem; color:var(--muted); white-space:pre-wrap;
   background:#f1f5f8; border:1px solid var(--line); padding:.45rem; max-height:9rem; overflow:auto; }}
@@ -528,20 +556,28 @@ sideMeta.innerHTML = [
   'rollout: ' + report.rollout_id,
   'normalize: ' + report.normalize,
   'judge: ' + report.model,
+  'A_t = A_s + (r_i − r̄)',
 ].map(x => '<div>'+esc(x)+'</div>').join('');
 
 let activeGroup = 0;
 let activeTraj = 0;
+let cmpMode = 'advantage';
 
 function esc(s) {{
   return String(s ?? '').replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
 }}
 function scoreClass(x) {{ return Number(x) >= 0 ? 'pos' : 'neg'; }}
-function barHtml(score) {{
-  const s = Math.max(-1, Math.min(1, Number(score) || 0));
-  const pct = Math.abs(s) * 50;
+function barHtml(score, scale) {{
+  const lim = Math.max(1, Number(scale) || 1);
+  const s = Math.max(-lim, Math.min(lim, Number(score) || 0));
+  const pct = (Math.abs(s) / lim) * 50;
   if (s >= 0) return `<div class="bar-wrap"><div class="bar pos" style="width:${{pct}}%"></div></div>`;
   return `<div class="bar-wrap"><div class="bar neg" style="width:${{pct}}%"></div></div>`;
+}}
+function fmt(x) {{
+  const n = Number(x);
+  if (!Number.isFinite(n)) return '—';
+  return (n>=0?'+':'') + n.toFixed(3);
 }}
 
 function render() {{
@@ -567,7 +603,7 @@ function render() {{
 
   const tabs = trajs.map((tr, i) =>
     `<button class="tab ${{i===activeTraj?'active':''}} ${{tr.solved?'ok':'fail'}}" data-i="${{i}}">
-      #${{i}} ${{tr.solved?'✓':'✗'}} r=${{Number(tr.outcome_reward).toFixed(3)}} T=${{tr.n_turns}} off=${{tr.offload_count??0}}
+      #${{i}} ${{tr.solved?'✓':'✗'}} A_s=${{fmt(tr.a_s)}} T=${{tr.n_turns}} off=${{tr.offload_count??0}}
     </button>`
   ).join('');
 
@@ -577,11 +613,13 @@ function render() {{
     cmpRows += `<tr><td>T${{i}}</td>` + trajs.map(tr => {{
       const cell = (tr.llm_turn_rewards||[])[i];
       if (!cell) return '<td></td>';
-      const sc = Number(cell.score);
-      return `<td class="${{scoreClass(sc)}}" title="${{esc(cell.reason||'')}}">${{sc.toFixed(3)}}${{cell.context&&cell.context.valid_offload?' ★':''}}</td>`;
+      const val = cmpMode==='advantage' ? Number(cell.advantage) : Number(cell.score);
+      const title = `r=${{Number(cell.score).toFixed(3)}} Δ=${{fmt(cell.residual)}} A_t=${{fmt(cell.advantage)}} ${{cell.reason||''}}`;
+      return `<td class="${{scoreClass(val)}}" title="${{esc(title)}}">${{fmt(val)}}${{cell.context&&cell.context.valid_offload?' ★':''}}</td>`;
     }}).join('') + '</tr>';
   }}
   const cmpHead = '<tr><th>turn</th>' + trajs.map((_,i)=>`<th>#${{i}}</th>`).join('') + '</tr>';
+  const advScale = Math.max(1, ...((t.llm_turn_rewards||[]).map(x => Math.abs(Number(x.advantage)||0))));
 
   const turnsHtml = (t.llm_turn_rewards||[]).map(tr => {{
     const c = tr.context || {{}};
@@ -600,10 +638,11 @@ function render() {{
     return `<div class="turn">
       <div class="turn-head">
         <span class="badge">T${{tr.turn}}</span>
-        <span class="score ${{scoreClass(tr.score)}}">${{Number(tr.score).toFixed(3)}}</span>
-        ${{barHtml(tr.score)}}
+        <span class="score ${{scoreClass(tr.advantage)}}">A_t ${{fmt(tr.advantage)}}</span>
+        ${{barHtml(tr.advantage, advScale)}}
         ${{badges}}
       </div>
+      <div class="adv">r_i=${{Number(tr.score).toFixed(3)}} · r_i−r̄=${{fmt(tr.residual)}} · A_s=${{fmt(tr.a_s)}}</div>
       <div class="reason">${{esc(tr.reason||'')}}</div>
       ${{detail ? `<pre class="details">${{esc(detail)}}</pre>` : ''}}
     </div>`;
@@ -616,6 +655,8 @@ function render() {{
         <div class="stat"><span>traj</span><b>#${{activeTraj}} / ${{trajs.length}}</b></div>
         <div class="stat"><span>solved</span><b>${{t.solved}}</b></div>
         <div class="stat"><span>outcome r</span><b>${{Number(t.outcome_reward).toFixed(4)}}</b></div>
+        <div class="stat"><span>A_s</span><b>${{fmt(t.a_s)}}</b></div>
+        <div class="stat"><span>mean r</span><b>${{Number(t.mean_r||0).toFixed(3)}}</b></div>
         <div class="stat"><span>turns</span><b>${{t.n_turns}}</b></div>
         <div class="stat"><span>offload</span><b>${{t.offload_count??0}}</b></div>
       </div>
@@ -624,18 +665,25 @@ function render() {{
       <details><summary>problem</summary><pre class="problem">${{esc(t.problem||'')}}</pre></details>
     </div>
     <div class="card">
-      <strong>8 轨迹逐步分数对照</strong>
+      <strong>8 轨迹逐步对照</strong>
+      <div class="cmp-toggle">
+        <button class="tab ${{cmpMode==='advantage'?'active':''}}" data-cmp="advantage">显示 A_t</button>
+        <button class="tab ${{cmpMode==='score'?'active':''}}" data-cmp="score">显示 r_i</button>
+      </div>
       <div style="max-height:16rem;overflow:auto;margin-top:.5rem">
         <table class="compare"><thead>${{cmpHead}}</thead><tbody>${{cmpRows}}</tbody></table>
       </div>
     </div>
     <div class="card">
-      <strong>轨迹 #${{activeTraj}} · session ${{esc((t.session_id||'').slice(0,8))}}</strong>
+      <strong>轨迹 #${{activeTraj}} · session ${{esc((t.session_id||'').slice(0,8))}} · A_t = A_s + (r_i − r̄)</strong>
       ${{turnsHtml}}
     </div>`;
 
-  main.querySelectorAll('.tab').forEach(btn => btn.onclick = () => {{
+  main.querySelectorAll('.tabs .tab').forEach(btn => btn.onclick = () => {{
     activeTraj = Number(btn.dataset.i); render();
+  }});
+  main.querySelectorAll('.cmp-toggle .tab').forEach(btn => btn.onclick = () => {{
+    cmpMode = btn.dataset.cmp; render();
   }});
 }}
 render();
@@ -797,6 +845,8 @@ def main(argv: list[str] | None = None) -> int:
     scored_groups = [
         score_group(gi, groups[gi], args=args) for gi in selected
     ]
+    for group in scored_groups:
+        paint_group_advantages(group)
 
     report = {
         "title": f"LLM Turn Credit · {run_dir.name} · rollout {args.rollout_id}",
