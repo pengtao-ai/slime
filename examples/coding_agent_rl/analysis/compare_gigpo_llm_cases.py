@@ -37,13 +37,51 @@ _REPO_ROOT = _EXAMPLE_DIR.parents[1]
 sys.path.insert(0, str(_EXAMPLE_DIR))
 sys.path.insert(0, str(_REPO_ROOT))
 
-import llm_turn_credit_assign as judge  # noqa: E402
 from examples.coding_agent_rl.gigpo_advantage import (  # noqa: E402
+    _tool_brief_from_message,
     classify_message_tools,
 )
 
 GAMMA = 0.95
 W = 1.0
+
+_judge = None
+
+
+def _get_judge():
+    """Lazy import — HTML re-render only needs analyze/render, not the offline judge."""
+    global _judge
+    if _judge is None:
+        try:
+            import llm_turn_credit_assign as judge  # noqa: E402
+        except ImportError as e:
+            raise SystemExit(
+                "llm_turn_credit_assign.py is required for LLM judging "
+                f"(place it under examples/coding_agent_rl/). Import error: {e}"
+            ) from e
+        _judge = judge
+    return _judge
+
+
+def load_rollout(run_dir: Path | str, rollout_id: int) -> dict[str, Any]:
+    """Load ``rollout_{id}.pt`` without depending on llm_turn_credit_assign."""
+    import torch
+
+    path = Path(run_dir) / "rollout_dumps" / f"rollout_{int(rollout_id)}.pt"
+    if not path.exists():
+        raise FileNotFoundError(path)
+    dump = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(dump, dict) or "samples" not in dump:
+        raise ValueError(f"unexpected rollout dump: {path}")
+    return dump
+
+
+def _tool_brief(tc: dict[str, Any]) -> str:
+    am = tc.get("sft_assistant_message") if isinstance(tc.get("sft_assistant_message"), dict) else None
+    if am:
+        return _tool_brief_from_message(am)
+    blob = tc.get("tool_calls") or tc.get("cmd") or ""
+    return str(blob)[:220]
 
 
 def unique_trajs_by_index(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -58,26 +96,17 @@ def unique_trajs_by_index(samples: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 
 def group_key_from_turn(tc: dict[str, Any]) -> tuple[str, str, str]:
+    """T# via current ``gigpo_advantage`` mapping (prefer live message over stamped key)."""
+    am = tc.get("sft_assistant_message") if isinstance(tc.get("sft_assistant_message"), dict) else {}
+    if am:
+        return classify_message_tools(am)
     if tc.get("gigpo_T"):
         key = str(tc["gigpo_T"])
-        # "intent · family"
         if " · " in key:
             intent, tool = key.split(" · ", 1)
             return key, intent, tool
         return key, "其他", key
-    am = tc.get("sft_assistant_message") if isinstance(tc.get("sft_assistant_message"), dict) else {}
-    if am:
-        return classify_message_tools(am)
     return "其他 · 无 tool", "其他", "无 tool"
-
-def git_diff_key(md: dict[str, Any], turn_i: int) -> str:
-    diffs = md.get("turn_git_diffs") or []
-    if turn_i < len(diffs) and isinstance(diffs[turn_i], dict):
-        g = diffs[turn_i].get("git_diff") or ""
-        # normalize whitespace for segment id
-        g = re.sub(r"\s+", " ", g).strip()
-        return g[:240] if g else "<empty>"
-    return "<empty>"
 
 
 def compute_gigpo_group(
@@ -104,7 +133,6 @@ def compute_gigpo_group(
                     "T": gkey,
                     "intent": intent,
                     "tool": tool,
-                    "S": git_diff_key(md, i),
                     "G": G,
                     "cmd": _tool_brief(tc)[:220],
                     "offload": bool(tc.get("valid_offload")),
@@ -178,7 +206,7 @@ def judge_one(
     args: argparse.Namespace,
     a_e: float,
 ) -> dict[str, Any]:
-    out = judge.judge_trajectory(
+    out = _get_judge().judge_trajectory(
         sample,
         base_url=args.base_url,
         api_key=args.api_key,
@@ -197,71 +225,103 @@ def judge_one(
 
 def run_cases(args: argparse.Namespace) -> dict[str, Any]:
     pick = json.loads(Path(args.pick).read_text())
+    reuse_llm: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    if getattr(args, "reuse_llm_json", None):
+        old = json.loads(Path(args.reuse_llm_json).read_text())
+        for c in old.get("cases") or []:
+            key = (int(c["rollout"]), int(c["group"]))
+            reuse_llm[key] = [
+                (t.get("llm") or {}) for t in ((c.get("gigpo") or {}).get("trajectories") or [])
+            ]
+        print(f"reuse LLM from {args.reuse_llm_json} ({len(reuse_llm)} cases)", flush=True)
+
     cases_out = []
     for spec in pick:
         rid, gi = int(spec["rollout"]), int(spec["group"])
         print(f"\n=== load r{rid} g{gi} {spec.get('inst')} ===", flush=True)
-        dump = judge.load_rollout(args.run_dir, rid)
+        dump = load_rollout(args.run_dir, rid)
         samples = [s for s in dump["samples"] if int(s.get("group_index", 0)) == gi]
         trajs = unique_trajs_by_index(samples)
-        print(f"  unique trajs={len(trajs)} solved={sum(1 for s in trajs if float((s.get('metadata') or {}).get('solved') or 0)>0.5)}", flush=True)
+        print(
+            f"  unique trajs={len(trajs)} solved="
+            f"{sum(1 for s in trajs if float((s.get('metadata') or {}).get('solved') or 0) > 0.5)}",
+            flush=True,
+        )
 
         gigpo = compute_gigpo_group(trajs, gamma=args.gamma, w=args.w)
-
-        # LLM judge in parallel
         llm_trajs: list[dict[str, Any] | None] = [None] * len(trajs)
-
-        def _one(i_s: tuple[int, dict[str, Any]]) -> tuple[int, dict[str, Any]]:
-            i, sample = i_s
-            a_e = gigpo["trajectories"][i]["A_E"]
-            t0 = time.time()
-            try:
-                out = judge_one(sample, args=args, a_e=a_e)
-            except Exception as exc:  # noqa: BLE001
-                md = sample.get("metadata") or {}
-                turns = judge.compact_turns(sample, text_limit=args.text_limit)
-                solved = float(md.get("solved") or 0) > 0.5
-                outcome = float(sample.get("reward") or 0)
-                fb = judge.heuristic_scores(turns, solved=solved, outcome_reward=outcome)
-                scored = judge.normalize_scores(list(fb["turns"]), n_turns=len(turns), outcome_reward=outcome, mode=args.normalize)
-                for t, c in zip(scored, turns):
-                    t["context"] = c
-                out = {
-                    "instance_id": md.get("instance_id"),
-                    "agent": md.get("agent"),
-                    "solved": solved,
-                    "outcome_reward": outcome,
-                    "n_turns": len(turns),
-                    "judge_mode": "error_fallback",
-                    "judge_summary": f"judge failed: {exc}",
-                    "llm_turn_rewards": scored,
-                    "error": str(exc),
-                    "A_E_outcome": a_e,
+        reused = reuse_llm.get((rid, gi))
+        if reused is not None:
+            for i, gt in enumerate(gigpo["trajectories"]):
+                prev = reused[i] if i < len(reused) else {}
+                turns = list(prev.get("turns") or [])
+                for it in turns:
+                    if "residual" in it:
+                        it["a_s"] = gt["A_E"]
+                        it["advantage"] = gt["A_E"] + float(it.get("residual") or 0)
+                llm_trajs[i] = {
+                    "judge_mode": prev.get("judge_mode") or "reused",
+                    "judge_summary": prev.get("summary"),
+                    "mean_r": prev.get("mean_r"),
+                    "llm_turn_rewards": turns,
+                    "A_E_outcome": gt["A_E"],
                 }
-                paint_llm_advantages(out)
-            out["latency_s"] = round(time.time() - t0, 2)
-            out["traj_index"] = i
-            return i, out
+                print(f"  [llm] traj#{i} reused turns={len(turns)}", flush=True)
+        else:
 
-        workers = max(1, int(args.concurrency))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = [pool.submit(_one, (i, s)) for i, s in enumerate(trajs)]
-            for fut in concurrent.futures.as_completed(futs):
-                i, out = fut.result()
-                llm_trajs[i] = out
-                err = f" ERR={out.get('error')}" if out.get("error") else ""
-                print(
-                    f"  [llm] traj#{i} solved={out.get('solved')} turns={out.get('n_turns')} "
-                    f"mode={out.get('judge_mode')} {out.get('latency_s')}s{err}",
-                    flush=True,
-                )
+            def _one(i_s: tuple[int, dict[str, Any]]) -> tuple[int, dict[str, Any]]:
+                i, sample = i_s
+                a_e = gigpo["trajectories"][i]["A_E"]
+                t0 = time.time()
+                try:
+                    out = judge_one(sample, args=args, a_e=a_e)
+                except Exception as exc:  # noqa: BLE001
+                    md = sample.get("metadata") or {}
+                    j = _get_judge()
+                    turns = j.compact_turns(sample, text_limit=args.text_limit)
+                    solved = float(md.get("solved") or 0) > 0.5
+                    outcome = float(sample.get("reward") or 0)
+                    fb = j.heuristic_scores(turns, solved=solved, outcome_reward=outcome)
+                    scored = j.normalize_scores(
+                        list(fb["turns"]), n_turns=len(turns), outcome_reward=outcome, mode=args.normalize
+                    )
+                    for t, c in zip(scored, turns):
+                        t["context"] = c
+                    out = {
+                        "instance_id": md.get("instance_id"),
+                        "agent": md.get("agent"),
+                        "solved": solved,
+                        "outcome_reward": outcome,
+                        "n_turns": len(turns),
+                        "judge_mode": "error_fallback",
+                        "judge_summary": f"judge failed: {exc}",
+                        "llm_turn_rewards": scored,
+                        "error": str(exc),
+                        "A_E_outcome": a_e,
+                    }
+                    paint_llm_advantages(out)
+                out["latency_s"] = round(time.time() - t0, 2)
+                out["traj_index"] = i
+                return i, out
 
-        # align llm cmds onto gigpo turns for HTML
+            workers = max(1, int(args.concurrency))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = [pool.submit(_one, (i, s)) for i, s in enumerate(trajs)]
+                for fut in concurrent.futures.as_completed(futs):
+                    i, out = fut.result()
+                    llm_trajs[i] = out
+                    err = f" ERR={out.get('error')}" if out.get("error") else ""
+                    print(
+                        f"  [llm] traj#{i} solved={out.get('solved')} turns={out.get('n_turns')} "
+                        f"mode={out.get('judge_mode')} {out.get('latency_s')}s{err}",
+                        flush=True,
+                    )
+
         for i, gt in enumerate(gigpo["trajectories"]):
             lt = llm_trajs[i] or {}
             gt["llm"] = {
                 "judge_mode": lt.get("judge_mode"),
-                "summary": lt.get("judge_summary"),
+                "summary": lt.get("judge_summary") or lt.get("summary"),
                 "mean_r": lt.get("mean_r"),
                 "turns": lt.get("llm_turn_rewards") or [],
             }
@@ -272,24 +332,35 @@ def run_cases(args: argparse.Namespace) -> dict[str, Any]:
                 "rollout": rid,
                 "group": gi,
                 "inst": spec.get("inst"),
-                "note": f"{gigpo['n_solved']}/{gigpo['n_traj']} solved · agents={Counter(t['agent'] for t in gigpo['trajectories'])}",
+                "note": (
+                    f"{gigpo['n_solved']}/{gigpo['n_traj']} solved · "
+                    f"agents={Counter(t['agent'] for t in gigpo['trajectories'])}"
+                ),
                 "gigpo": gigpo,
                 "analysis": analysis,
             }
         )
         print(f"  analysis: {analysis.get('headline')}", flush=True)
 
+    llm_formula = (
+        "A_t=A_E+(r_i−mean r); r_i from prior judge (reused)"
+        if getattr(args, "reuse_llm_json", None)
+        else "A_t=A_E+(r_i−mean r); r_i from LLM process judge"
+    )
     return {
         "title": "GiGPO vs LLM judge · phase2_sft03",
         "run_dir": str(args.run_dir),
-        "formula_gigpo": "A=A_E+w*A_S; A_S=G_t−mean(G|T#); G_t=R·γ^{n−1−t}",
-        "formula_llm": "A_t=A_E+(r_i−mean r); r_i from LLM process judge",
+        "formula_gigpo": (
+            "A=A_E+w*A_S; A_S=G_t−mean(G|T#); G_t=R·γ^{n−1−t}; T#=gigpo_advantage mapping"
+        ),
+        "formula_llm": llm_formula,
         "gamma": args.gamma,
         "w": args.w,
-        "heuristic": bool(args.heuristic),
-        "model": args.model,
+        "heuristic": bool(args.heuristic) or bool(getattr(args, "reuse_llm_json", None)),
+        "model": "reused" if getattr(args, "reuse_llm_json", None) else args.model,
         "cases": cases_out,
     }
+
 
 
 def analyze_case(gigpo: dict[str, Any]) -> dict[str, Any]:
@@ -594,9 +665,15 @@ def main() -> None:
     p.add_argument("--gamma", type=float, default=GAMMA)
     p.add_argument("--w", type=float, default=W)
     p.add_argument("--heuristic", action="store_true")
-    p.add_argument("--base-url", default=os.environ.get("DASHSCOPE_BASE_URL", judge.DEFAULT_BASE_URL))
-    p.add_argument("--api-key", default=judge.DEFAULT_API_KEY)
-    p.add_argument("--model", default=os.environ.get("DASHSCOPE_MODEL", judge.DEFAULT_MODEL))
+    p.add_argument(
+        "--reuse-llm-json",
+        type=Path,
+        default=None,
+        help="Reuse LLM traj scores from a prior compare.json (skip judge / no llm_turn_credit_assign)",
+    )
+    p.add_argument("--base-url", default=os.environ.get("DASHSCOPE_BASE_URL", ""))
+    p.add_argument("--api-key", default=os.environ.get("DASHSCOPE_API_KEY", "") or os.environ.get("OPENAI_API_KEY", ""))
+    p.add_argument("--model", default=os.environ.get("DASHSCOPE_MODEL", ""))
     p.add_argument("--normalize", default="mean_to_outcome", choices=("raw", "sum_to_outcome", "mean_to_outcome"))
     p.add_argument("--concurrency", type=int, default=4)
     p.add_argument("--max-tokens", type=int, default=4096)
@@ -605,9 +682,17 @@ def main() -> None:
     p.add_argument("--text-limit", type=int, default=420)
     args = p.parse_args()
 
-    if not args.heuristic and not args.api_key:
-        print("WARN: no DASHSCOPE_API_KEY — falling back to --heuristic for LLM side", flush=True)
-        args.heuristic = True
+    if not args.reuse_llm_json:
+        judge = _get_judge()
+        if not args.base_url:
+            args.base_url = getattr(judge, "DEFAULT_BASE_URL", "") or os.environ.get("DASHSCOPE_BASE_URL", "")
+        if not args.api_key:
+            args.api_key = getattr(judge, "DEFAULT_API_KEY", "") or ""
+        if not args.model:
+            args.model = getattr(judge, "DEFAULT_MODEL", "") or os.environ.get("DASHSCOPE_MODEL", "")
+        if not args.heuristic and not args.api_key:
+            print("WARN: no DASHSCOPE_API_KEY — falling back to --heuristic for LLM side", flush=True)
+            args.heuristic = True
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     report = run_cases(args)

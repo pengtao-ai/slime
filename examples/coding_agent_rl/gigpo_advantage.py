@@ -71,16 +71,20 @@ _READ_NAMES = frozenset({"read"})
 _SEARCH_NAMES = frozenset({"grep", "glob", "explore", "find"})  # dedicated tools, not bash find
 _SHELL_NAMES = frozenset({"bash", "shell", "run_terminal_cmd", "execute", "run"})
 _FS_NAMES = frozenset({"ls"})  # pi dedicated ls tool
-_META_PREFIXES = ("task", "cron")
+_META_PREFIXES = ("task", "cron", "mcp__")
 _META_NAMES = frozenset(
     {
         "exit",
         "exitworktree",
         "enterworktree",
         "exitplanmode",
+        "enterplanmode",
+        "askuserquestion",
+        "slashcommand",
         "agent",
         "skill",
         "todowrite",
+        "todoread",
         "webfetch",
         "websearch",
         "question",
@@ -92,6 +96,8 @@ _META_NAMES = frozenset(
         "schedulewakeup",
         "workflow",
         "task",
+        "notebookread",
+        "toolsearch",
     }
 )
 
@@ -346,13 +352,16 @@ def classify_tool_call(name: str, args: str = "") -> str:
         return _shell_family_from_args(args_s)
     if n in _META_NAMES or n.startswith(_META_PREFIXES):
         return "Meta"
-    # Unknown name: if it looks like a shell command blob, refine; else keep name tag.
+    # Nameless / "?": treat args as a shell blob (legacy).
     if not n or n == "?":
         return _shell_family_from_args(args_s)
-    # Fallback: try args heuristics (e.g. odd wrappers), else Other:<name>
-    fam = _shell_family_from_args(args_s)
-    if fam != "Bash:other":
-        return fam
+    # Unknown named tool: only run shell heuristics when args look like a real command.
+    # Empty / "{}" must NOT become Bash:empty (that bucket is for empty Bash calls).
+    args_stripped = args_s.strip()
+    if args_stripped and args_stripped not in ("{}", "{ }", "null", "None"):
+        fam = _shell_family_from_args(args_s)
+        if fam != "Bash:other":
+            return fam
     return "Meta"
 
 

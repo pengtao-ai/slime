@@ -11,10 +11,10 @@
 
 set -euo pipefail
 
-MODEL="${MODEL:-/workspace/models/pyromind/PyroDash-4B-SFT-0916}"
+MODEL="${MODEL:-/workspace/models/pyromind/PyroDash-4B-SFT-0918}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-${MODEL}}"
 HOST="${HOST:-0.0.0.0}"
-PORT="${PORT:-8066}"
+PORT="${PORT:-9016}"
 TP="${TP:-1}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
@@ -26,7 +26,7 @@ mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/pyrodash4b_sft0902_${PORT}_$(date +%Y%m%d_%H%M%S).log"
 
 echo "======================================================================"
-echo "vLLM serve PyroDash-4B-SFT-0902"
+echo "vLLM serve PyroDash-4B-SFT-0918"
 echo "  MODEL=${MODEL}"
 echo "  SERVED_MODEL_NAME=${SERVED_MODEL_NAME}"
 echo "  HOST=${HOST} PORT=${PORT} TP=${TP}"

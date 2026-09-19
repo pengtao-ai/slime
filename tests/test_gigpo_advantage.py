@@ -48,6 +48,23 @@ def test_cross_agent_edit_write_read_names():
         assert fam == family, (msg, key, fam)
 
 
+def test_unknown_empty_args_not_bash_empty():
+    """Meta / MCP / unknown tools with empty args must not share Bash:empty."""
+    assert gigpo.classify_tool_call("Bash", "") == "Bash:empty"
+    assert gigpo.classify_tool_call("bash", "{}") == "Bash:empty"
+    for name in (
+        "EnterPlanMode",
+        "AskUserQuestion",
+        "SlashCommand",
+        "mcp__filesystem__read",
+        "WeirdTool",
+    ):
+        fam = gigpo.classify_tool_call(name, "")
+        assert fam == "Meta", (name, fam)
+        fam2 = gigpo.classify_tool_call(name, "{}")
+        assert fam2 == "Meta", (name, fam2)
+
+
 def test_compute_step_as_success_vs_fail():
     # One solved traj late pytest step should get higher A_S than fail traj same T.
     trajs = [

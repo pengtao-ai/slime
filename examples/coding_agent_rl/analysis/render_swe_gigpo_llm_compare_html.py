@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """8 SWE cases × 3 models in the same layout as gigpo_llm_compare_phase2_sft03/compare.html.
 
-GiGPO (per-step, not group-broadcast):
-  A = A_E + A_S + A_I
+GiGPO (matches training / ``gigpo_advantage``; per-step, not group-broadcast):
+  A = A_E + w * A_S
   G_t = R · γ^{n−1−t}
   A_S = G_t − mean(G | same T# across DeepSeek/SFT/Qwen)
-  A_I = G_t − mean(G | same S# on this traj)
-  S#  = edit-segment proxy (no git dump)
 
 If R=0 (unsolved), G_t=0 for every turn → A_S is constant inside a T# on that traj.
 """
@@ -15,23 +13,28 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import statistics
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT))
+_ANALYSIS_DIR = Path(__file__).resolve().parent
+_EXAMPLE_DIR = _ANALYSIS_DIR.parent
+_REPO_ROOT = _EXAMPLE_DIR.parents[1]
+sys.path.insert(0, str(_ANALYSIS_DIR))
+sys.path.insert(0, str(_REPO_ROOT))
 
 import compare_gigpo_llm_cases as cmp  # noqa: E402
-from render_compare_group_advantage_html import (  # noqa: E402
-    GAMMA,
-    MODEL_ORDER,
-    _is_edit_turn,
-    group_key,
+from examples.coding_agent_rl.gigpo_advantage import (  # noqa: E402
+    DEFAULT_GIGPO_GAMMA,
+    _intent_from_family,
+    classify_tool_call,
 )
 
+GAMMA = DEFAULT_GIGPO_GAMMA
+MODEL_ORDER = ["DeepSeek", "SFT", "Qwen"]
 W = 1.0
 
 
@@ -40,6 +43,38 @@ def _cmd(tr: dict[str, Any]) -> str:
     if cmds:
         return str(cmds[0])[:220]
     return str(tr.get("tool_calls") or "")[:220]
+
+
+def _parse_tool_calls_blob(blob: str) -> list[tuple[str, str]]:
+    """Parse judge ``tool_calls`` like ``bash: cmd; Edit: path`` into ``[(name, args), ...]``."""
+    s = (blob or "").strip()
+    if not s:
+        return []
+    parts = re.split(r"\s*;\s*(?=[A-Za-z_][\w\-]*\s*:)", s)
+    out: list[tuple[str, str]] = []
+    for p in parts:
+        p = p.strip()
+        m = re.match(r"^([A-Za-z_][\w\-]*)\s*:\s*(.*)$", p, flags=re.S)
+        if m:
+            out.append((m.group(1), m.group(2).strip()))
+        elif p:
+            out.append(("bash", p))
+    return out
+
+
+def group_key(tr: dict[str, Any]) -> tuple[str, str, str]:
+    """T# via ``gigpo_advantage.classify_tool_call`` (same families as training)."""
+    cmds = [str(c) for c in (tr.get("cmds") or []) if str(c).strip()]
+    if cmds:
+        name, args = "bash", cmds[0]
+    else:
+        parsed = _parse_tool_calls_blob(str(tr.get("tool_calls") or ""))
+        if not parsed:
+            return "其他 · 无 tool", "其他", "无 tool"
+        name, args = parsed[0]
+    family = classify_tool_call(name, args)
+    intent = _intent_from_family(family, args)
+    return f"{intent} · {family}", intent, family
 
 
 def build_case(case: dict[str, Any], *, gamma: float, w: float) -> dict[str, Any]:
@@ -53,7 +88,6 @@ def build_case(case: dict[str, Any], *, gamma: float, w: float) -> dict[str, Any
         items = list(m.get("llm_turn_rewards") or [])
         n = int(m.get("n_turns") or len(items))
         turns: list[dict[str, Any]] = []
-        seg = 0
         llm_turns: list[dict[str, Any]] = []
         scores = [float(x.get("score") or 0) for x in items]
         mean_r = statistics.mean(scores) if scores else 0.0
@@ -61,7 +95,6 @@ def build_case(case: dict[str, Any], *, gamma: float, w: float) -> dict[str, Any
             gkey, intent, tool = group_key(tr)
             i = int(tr.get("turn", 0))
             G = R * (gamma ** max(0, n - 1 - i))
-            s_label = "<empty>" if seg == 0 else f"S{seg}"
             residual = float(tr.get("residual") if tr.get("residual") is not None else (float(tr.get("score") or 0) - mean_r))
             turns.append(
                 {
@@ -69,7 +102,6 @@ def build_case(case: dict[str, Any], *, gamma: float, w: float) -> dict[str, Any
                     "T": gkey,
                     "intent": intent,
                     "tool": tool,
-                    "S": s_label,
                     "G": G,
                     "cmd": _cmd(tr),
                     "offload": bool(tr.get("offloaded")),
@@ -83,8 +115,6 @@ def build_case(case: dict[str, Any], *, gamma: float, w: float) -> dict[str, Any
                     "reason": tr.get("reason") or "",
                 }
             )
-            if _is_edit_turn(tr, tool):
-                seg += 1
         trajs.append(
             {
                 "traj_index": len(trajs),
@@ -113,16 +143,11 @@ def build_case(case: dict[str, Any], *, gamma: float, w: float) -> dict[str, Any
     t_bar = {k: statistics.mean(v) for k, v in by_T.items()}
 
     for t in trajs:
-        by_S: dict[str, list[float]] = defaultdict(list)
-        for tr in t["turns"]:
-            by_S[tr["S"]].append(float(tr["G"]))
-        s_bar = {k: statistics.mean(v) for k, v in by_S.items()}
         ae = t["A_E"]
         for tr in t["turns"]:
             tr["A_E"] = ae
             tr["A_S"] = float(tr["G"]) - t_bar[tr["T"]]
-            tr["A_I"] = float(tr["G"]) - s_bar[tr["S"]]
-            tr["A"] = ae + w * (tr["A_S"] + tr["A_I"])
+            tr["A"] = ae + w * tr["A_S"]
         for lt in t["llm"]["turns"]:
             lt["a_s"] = ae
             lt["advantage"] = ae + float(lt["residual"])
@@ -168,7 +193,7 @@ def main() -> None:
     report = {
         "title": "GiGPO vs LLM judge · SWE 8 cases",
         "run_dir": str(args.src),
-        "formula_gigpo": "A=A_E+A_S+A_I；A_S=G_t−mean(G|T#) 逐步非广播；G_t=R·γ^{n−1−t}。失败轨 R=0 ⇒ G=0 ⇒ 同T# 的 A_S 全相同",
+        "formula_gigpo": "A=A_E+w*A_S；T#=intent·tool（gigpo_advantage 新映射）；A_S=G_t−mean(G|T#)；G_t=R·γ^{n−1−t}",
         "formula_llm": "A_t=A_E+(r_i−r̄)；r_i 来自已有 LLM judge",
         "gamma": args.gamma,
         "w": args.w,

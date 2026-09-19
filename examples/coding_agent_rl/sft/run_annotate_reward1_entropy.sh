@@ -19,10 +19,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." &>/dev/null && pwd)"
 
-VLLM_URL="${VLLM_URL:-http://127.0.0.1:8066/v1}"
+VLLM_URL="${VLLM_URL:-http://127.0.0.1:9016/v1}"
 VLLM_API_KEY="${VLLM_API_KEY:-EMPTY}"
-VLLM_MODEL="${VLLM_MODEL:-/workspace/models/pyromind/PyroDash-4B-SFT-0916}"
-OUT_DIR="${OUT_DIR:-${SCRIPT_DIR}/trajectories_entropy_0916}"
+VLLM_MODEL="${VLLM_MODEL:-/workspace/models/pyromind/PyroDash-4B-SFT-0918}"
+OUT_DIR="${OUT_DIR:-${SCRIPT_DIR}/trajectories_entropy_0918}"
 TOP_LOGPROBS="${TOP_LOGPROBS:-20}"
 ENTROPY_SCOPE="${ENTROPY_SCOPE:-thinking}"
 MAX_TOKENS="${MAX_TOKENS:-8192}"

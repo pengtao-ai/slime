@@ -20,8 +20,7 @@ examples/coding_agent_rl/data/
 examples/coding_agent_rl/docker_build/dockerfiles_tmax
 examples/coding_agent_rl/sft/runs/
 examples/coding_agent_rl/sft/__pycache__/
-examples/coding_agent_rl/sft/trajectories_entropy/
-examples/coding_agent_rl/sft/trajectories_entropy2/
+examples/coding_agent_rl/sft/trajectories_outputs/
 # C extensions
 *.so
 a_csv/

@@ -8,7 +8,8 @@
 # continuation so the agent can keep editing. Default train reward is
 # help_seeking (OFFLOAD_REWARD_MODE) with OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG:
 # group α on valid in-think offload unless a sibling solved without offload;
-# otherwise unsolved→0 / solved→(1-λ*cost_ratio). Empty patches never count as solved.
+# otherwise unsolved→0 / solved→(1-λ*cost_ratio - coef*max(0,n_turns-ref)/ref), floored.
+# Empty patches never count as solved.
 #
 # Prerequisites:
 #   bash examples/coding_agent_rl/scripts/convert_pyrodash4b_to_torch_dist.sh
@@ -34,7 +35,7 @@ export NCCL_DEBUG=INFO
 export NCCL_CUMEM_ENABLE=0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-export ADAPTER_MAX_TURNS_PER_SID="${ADAPTER_MAX_TURNS_PER_SID:-50}"
+export ADAPTER_MAX_TURNS_PER_SID="${ADAPTER_MAX_TURNS_PER_SID:-150}"
 export SWE_AGENT_TIME_BUDGET_SEC="${SWE_AGENT_TIME_BUDGET_SEC:-600}"
 
 # TF32 (Ampere+): enable via env var so it overrides any internal PyTorch default.
@@ -47,7 +48,7 @@ SLIME_DIR="${SLIME_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 export SAVE_INTERVAL="${SAVE_INTERVAL:-20}"
 # ---- mid-turn offload ----
 export SLIME_AGENT_OFFLOAD=1
-export OFFLOAD_EFFICIENCY_LAMBDA=0.2
+export OFFLOAD_EFFICIENCY_LAMBDA=0.05
 # help_seeking + SEEK_ONLY_WHEN_ALL_WRONG: withhold α only if a sibling
 # solved without offload (see offload.shape_group_help_seeking_rewards).
 # Set OFFLOAD_REWARD_MODE=cost_aware to restore the old "fail → 0" shaping.
@@ -57,17 +58,22 @@ export OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG=1
 export OFFLOAD_SEEK_ALPHA=0.1
 export OFFLOAD_SEEK_EMPTY_SCALE=0.5
 export OFFLOAD_UNIQUE_SOLVER_BONUS=0.15
-# Soft seek budget: budget=max(1, n_turns//2); over-budget α*=decay^excess, solved -= pen*excess.
-export OFFLOAD_SEEK_BUDGET_TURN_K="${OFFLOAD_SEEK_BUDGET_TURN_K:-2}"
+# Do not use TURN_K (budget=n_turns//K rewards longer trajs). Penalize n_turns on solved.
+export OFFLOAD_SEEK_BUDGET_TURN_K="${OFFLOAD_SEEK_BUDGET_TURN_K:-0}"
 export OFFLOAD_SEEK_BUDGET_DECAY="${OFFLOAD_SEEK_BUDGET_DECAY:-0.5}"
-export OFFLOAD_SEEK_OVERAGE_PENALTY="${OFFLOAD_SEEK_OVERAGE_PENALTY:-0.05}"
+export OFFLOAD_SEEK_OVERAGE_PENALTY="${OFFLOAD_SEEK_OVERAGE_PENALTY:-0}"
+# Solved: r = 1 - λ*cost_ratio - coef*max(0, n_turns-ref)/ref, then max(floor, r).
+# Turns <= REF are free.
+export OFFLOAD_TURN_PENALTY_COEF="${OFFLOAD_TURN_PENALTY_COEF:-0.15}"
+export OFFLOAD_TURN_PENALTY_REF="${OFFLOAD_TURN_PENALTY_REF:-50}"
+export OFFLOAD_SOLVED_REWARD_FLOOR="${OFFLOAD_SOLVED_REWARD_FLOOR:-0.3}"
 # Optional fixed cap (min with turn budget when both set): OFFLOAD_SEEK_BUDGET=4
 # GiGPO: A = A_E + w * A_S (tool-intent T#). Set CUSTOM_ADVANTAGE_FUNCTION_PATH to
 # examples.coding_agent_rl.offload_turn_advantage.compute_turn_advantages for old residuals.
 export GIGPO_W="${GIGPO_W:-1.0}"
 export GIGPO_GAMMA="${GIGPO_GAMMA:-0.95}"
 export ADAPTER_MAX_TURNS_PER_SID="${ADAPTER_MAX_TURNS_PER_SID:-50}"
-export DASHSCOPE_BASE_URL=http://208.64.254.189:8001/v1
+export DASHSCOPE_BASE_URL=http://208.64.254.189:8000/v1
 export DASHSCOPE_API_KEY=sk-6137d26281697017ef07ef4da0823dc16d32acaad253ecac
 export DASHSCOPE_MODEL=deepseek-v4-flash-0731
 export OFFLOAD_MAX_TOKENS="${OFFLOAD_MAX_TOKENS:-32768}"
@@ -87,16 +93,16 @@ fi
 
 # ---- PyroDash checkpoints (BF16 train + BF16 rollout) ----
 # SGLang loads padded HF vocab rows; Megatron torch_dist is padded to 248320.
-export HF_CHECKPOINT=/workspace/models/pyromind/PyroDash-4B-SFT-0803
-export REF_MODEL_PATH=/workspace/models/pyromind/PyroDash-4B-SFT-0803_torch_dist
-export EXP_TAG=agent_offload_pyrodash4b_docker_async_turn
+export HF_CHECKPOINT=/workspace/work/spt/slime/runs/agent_offload_pyrodash4b_sft_entropy_docker_async_turn_20260917_145328/checkpoints/iter_0000059_hf
+export REF_MODEL_PATH=/workspace/work/spt/slime/runs/agent_offload_pyrodash4b_sft_entropy_docker_async_turn_20260917_145328/checkpoints/iter_0000059_torch_dist
+export EXP_TAG=agent_offload_pyrodash4b_sft_entropy_docker_async_turn
 # FP8 KV cache for longer agent decode contexts (rollout only; weights stay BF16).
 export SGLANG_KV_CACHE_DTYPE="${SGLANG_KV_CACHE_DTYPE:-fp8_e4m3}"
 
 # Pre-baked ScaleSWE agent images (Node22 + Claude Code + pre_commands).
 # Override with PROMPT_DATA=.../swe_train_scaleswe_200.jsonl for the raw bases.
 # export PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/data/swe_train_scaleswe_200_baked.jsonl}"
-export PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/data/mixed_reward1_agents_first200_baked_shuffled.jsonl}"
+export PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/data/release/mixed_reward1_agents_baked.jsonl}"
 
 # Multi-agent CLI packages for mixed_*_agents.jsonl (codex/pi/opencode/miniswe).
 # Claude Code + Node are set in run_qwen35_4b_swe_1node_async.sh; these four must
@@ -175,6 +181,7 @@ echo "  OFFLOAD_SEEK_BUDGET=${OFFLOAD_SEEK_BUDGET:-}"
 echo "  OFFLOAD_SEEK_BUDGET_TURN_K=${OFFLOAD_SEEK_BUDGET_TURN_K:-}"
 echo "  OFFLOAD_SEEK_BUDGET_DECAY=${OFFLOAD_SEEK_BUDGET_DECAY:-}"
 echo "  OFFLOAD_SEEK_OVERAGE_PENALTY=${OFFLOAD_SEEK_OVERAGE_PENALTY:-}"
+echo "  OFFLOAD_TURN_PENALTY_COEF=${OFFLOAD_TURN_PENALTY_COEF:-} REF=${OFFLOAD_TURN_PENALTY_REF:-} FLOOR=${OFFLOAD_SOLVED_REWARD_FLOOR:-}"
 echo "  GIGPO_W=${GIGPO_W:-} GIGPO_GAMMA=${GIGPO_GAMMA:-}"
 echo "  CUSTOM_ADVANTAGE_FUNCTION_PATH=${CUSTOM_ADVANTAGE_FUNCTION_PATH:-examples.coding_agent_rl.gigpo_advantage.compute_gigpo_advantages}"
 echo "  SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS=${SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS}"
