@@ -116,6 +116,85 @@ def test_compute_gigpo_advantages_paints_spans(monkeypatch):
     assert float(adv0[3]) > float(adv1[3])
 
 
+def test_turn_residual_hits_only_the_bad_turn(monkeypatch):
+    """Malformed −β is added on that turn's span, on top of A_E (A_S cancels)."""
+    monkeypatch.setenv("GIGPO_W", "1.0")
+    monkeypatch.setenv("GIGPO_GAMMA", "1.0")
+    monkeypatch.setenv("GIGPO_TURN_RESIDUAL_W", "1.0")
+    turn_rewards = [0.0, 0.0, -0.25]
+    mean_r = sum(turn_rewards) / len(turn_rewards)
+    rollout_data = {
+        "kl": [torch.zeros(6)],
+        "rewards": [-0.5],
+        "raw_reward": [mean_r],
+        "sample_indices": [0],
+        "metadata": [
+            {
+                "group_index": 0,
+                "sample_index": 0,
+                "turn_T": ["a", "b", "c"],
+                "turn_rewards": turn_rewards,
+                "turn_token_spans": [[0, 2], [2, 4], [4, 6]],
+            }
+        ],
+    }
+    gigpo.compute_gigpo_advantages(None, rollout_data)
+    adv = rollout_data["advantages"][0]
+    assert torch.allclose(adv[0], torch.tensor(-0.5 + (0.0 - mean_r)))
+    assert torch.allclose(adv[4], torch.tensor(-0.5 + (-0.25 - mean_r)))
+    assert float(adv[4]) < float(adv[0])
+    assert float(adv[0]) == float(adv[2])
+
+
+def test_turn_residual_disabled_keeps_flat_ae(monkeypatch):
+    monkeypatch.setenv("GIGPO_W", "1.0")
+    monkeypatch.setenv("GIGPO_GAMMA", "1.0")
+    monkeypatch.setenv("GIGPO_TURN_RESIDUAL_W", "0")
+    rollout_data = {
+        "kl": [torch.zeros(6)],
+        "rewards": [-0.5],
+        "raw_reward": [-0.05],
+        "sample_indices": [0],
+        "metadata": [
+            {
+                "group_index": 0,
+                "sample_index": 0,
+                "turn_T": ["a", "b", "c"],
+                "turn_rewards": [0.0, 0.0, -0.25],
+                "turn_token_spans": [[0, 2], [2, 4], [4, 6]],
+            }
+        ],
+    }
+    gigpo.compute_gigpo_advantages(None, rollout_data)
+    adv = rollout_data["advantages"][0]
+    assert torch.allclose(adv, torch.full((6,), -0.5))
+
+
+def test_turn_residual_length_mismatch_is_skipped(monkeypatch):
+    monkeypatch.setenv("GIGPO_TURN_RESIDUAL_W", "1.0")
+    monkeypatch.setenv("GIGPO_GAMMA", "1.0")
+    monkeypatch.setenv("GIGPO_W", "1.0")
+    rollout_data = {
+        "kl": [torch.zeros(4)],
+        "rewards": [0.2],
+        "raw_reward": [1.0],
+        "sample_indices": [0],
+        "metadata": [
+            {
+                "group_index": 0,
+                "sample_index": 0,
+                "turn_T": ["a", "b"],
+                "turn_rewards": [0.0, 0.1, -0.25],
+                "turn_token_spans": [[0, 2], [2, 4]],
+            }
+        ],
+    }
+    gigpo.compute_gigpo_advantages(None, rollout_data)
+    adv = rollout_data["advantages"][0]
+    # A_S cancels on a singleton; residual skipped, so the span stays at A_E.
+    assert torch.allclose(adv, torch.full((4,), 0.2))
+
+
 def test_stamp_turn_gigpo_key_openai_tools():
     class _R:
         manager_message = {

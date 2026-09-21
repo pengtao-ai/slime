@@ -13,10 +13,15 @@ stored on ``turn_costs[].gigpo_T`` at rollout and copied into ``train_metadata.t
 
   G_t = R * γ^{n-1-t}
   A_S = G_t - mean(G | same T# across sibling trajs)
-  A_t = A_E + w * A_S
+  A_t = A_E + w * A_S + w_r * (r_t - mean(r))
+
+``r_t`` is the per-turn ledger (seek α / malformed −β). The residual is zero
+when every turn shares the same ``r`` (typical solved traj). It is skipped when
+``turn_rewards`` length does not match ``turn_token_spans``.
 
 Env:
-  ``GIGPO_W`` (default 1.0), ``GIGPO_GAMMA`` (default 0.95).
+  ``GIGPO_W`` (default 1.0), ``GIGPO_GAMMA`` (default 0.95),
+  ``GIGPO_TURN_RESIDUAL_W`` (default 1.0; 0 disables the residual).
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_GIGPO_W = 1.0
 DEFAULT_GIGPO_GAMMA = 0.95
+DEFAULT_GIGPO_TURN_RESIDUAL_W = 1.0
 
 
 def gigpo_w() -> float:
@@ -44,6 +50,10 @@ def gigpo_w() -> float:
 
 def gigpo_gamma() -> float:
     return float(os.environ.get("GIGPO_GAMMA", str(DEFAULT_GIGPO_GAMMA)))
+
+
+def gigpo_turn_residual_w() -> float:
+    return float(os.environ.get("GIGPO_TURN_RESIDUAL_W", str(DEFAULT_GIGPO_TURN_RESIDUAL_W)))
 
 
 # ---------------------------------------------------------------------------
@@ -482,12 +492,22 @@ def _paint_ae_as(
     a_s_list: list[float],
     turn_token_spans: list[list[int]] | None,
     w: float,
+    turn_rewards: list[float] | None = None,
+    w_r: float = 0.0,
 ) -> torch.Tensor:
+    """Paint ``A_E + w*A_S + w_r*(r_t - mean r)`` onto each turn span."""
     adv = torch.ones_like(base, dtype=torch.float32) * float(a_e)
-    if not a_s_list or not turn_token_spans or len(turn_token_spans) != len(a_s_list):
+    if not turn_token_spans:
         return adv
+    n_spans = len(turn_token_spans)
+    use_as = bool(a_s_list) and len(a_s_list) == n_spans
+    rewards = [float(x) for x in turn_rewards] if turn_rewards else []
+    use_residual = bool(rewards) and len(rewards) == n_spans and float(w_r) != 0.0
+    if not use_as and not use_residual:
+        return adv
+    mean_r = sum(rewards) / len(rewards) if use_residual else 0.0
     n = int(adv.numel())
-    for span, a_s in zip(turn_token_spans, a_s_list, strict=False):
+    for i, span in enumerate(turn_token_spans):
         if not span or len(span) < 2:
             continue
         start, end = int(span[0]), int(span[1])
@@ -495,7 +515,10 @@ def _paint_ae_as(
             continue
         start = max(0, min(start, n))
         end = max(start, min(end, n))
-        adv[start:end] = float(a_e) + float(w) * float(a_s)
+        extra = float(w) * float(a_s_list[i]) if use_as else 0.0
+        if use_residual:
+            extra += float(w_r) * (rewards[i] - mean_r)
+        adv[start:end] = float(a_e) + extra
     return adv
 
 
@@ -534,7 +557,7 @@ def compute_step_as_for_group(
 
 
 def compute_gigpo_advantages(args: Namespace, rollout_data: dict[str, Any]) -> None:
-    """Populate ``advantages`` / ``returns`` with ``A_E + w * A_S``."""
+    """Populate ``advantages`` / ``returns`` with ``A_E + w * A_S + w_r * (r_t - mean r)``."""
     del args
     kl: list[torch.Tensor] = rollout_data["kl"]
     a_e_list: list[float] = list(rollout_data["rewards"])
@@ -543,6 +566,7 @@ def compute_gigpo_advantages(args: Namespace, rollout_data: dict[str, Any]) -> N
     sample_indices = list(rollout_data.get("sample_indices") or list(range(len(kl))))
     w = gigpo_w()
     gamma = gigpo_gamma()
+    w_r = gigpo_turn_residual_w()
 
     # One representative sample per (group_index, sample_index) for T# pooling.
     reps: dict[tuple[Any, Any], int] = {}
@@ -592,10 +616,25 @@ def compute_gigpo_advantages(args: Namespace, rollout_data: dict[str, Any]) -> N
         spans = md.get("turn_token_spans")
         if spans is not None and not isinstance(spans, list):
             spans = None
+        turn_rewards = md.get("turn_rewards")
+        if turn_rewards is not None and not isinstance(turn_rewards, list):
+            turn_rewards = None
         if a_s_list and spans is None:
             logger.debug(
                 "compute_gigpo_advantages: sample %d missing turn_token_spans; broadcast A_E",
                 i,
+            )
+        if (
+            w_r != 0.0
+            and turn_rewards
+            and spans is not None
+            and len(turn_rewards) != len(spans)
+        ):
+            logger.debug(
+                "compute_gigpo_advantages: sample %d turn_rewards len %d != spans %d; skip residual",
+                i,
+                len(turn_rewards),
+                len(spans),
             )
         advantages.append(
             _paint_ae_as(
@@ -604,6 +643,8 @@ def compute_gigpo_advantages(args: Namespace, rollout_data: dict[str, Any]) -> N
                 a_s_list=a_s_list,
                 turn_token_spans=spans,
                 w=w,
+                turn_rewards=turn_rewards,
+                w_r=w_r,
             )
         )
 

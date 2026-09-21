@@ -362,7 +362,7 @@ keys = (
     "OFFLOAD_STOP_TOKEN_ID", "ROLLOUT_STOP_TOKEN_IDS",
     "SLIME_AGENT_OFFLOAD_SYSTEM_APPEND",
     "SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS",
-    "GIGPO_W", "GIGPO_GAMMA",
+    "GIGPO_W", "GIGPO_GAMMA", "GIGPO_TURN_RESIDUAL_W",
 )
 env = {k: os.environ[k] for k in keys if k in os.environ}
 env["MASTER_ADDR"] = os.environ["MASTER_ADDR"]
