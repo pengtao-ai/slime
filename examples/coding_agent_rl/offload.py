@@ -1504,15 +1504,16 @@ def compute_turn_rewards(
     encourage_seek: bool = True,
     protocol: str | None = None,
 ) -> dict[str, Any]:
-    """Per-turn rewards ``r_i`` and scalar ``mean(r_i)``.
+    """Per-turn rewards ``r_i`` and a scalar episode return.
 
     Solved: one trajectory ``cost_ratio = actual_cost / GLM_baseline`` →
     ``r = 1 - λ * cost_ratio - coef * max(0, n_turns-ref) / ref`` (− format
     once, − seek overage on ``offload_count``), floored, then broadcast to turns
-    (non-conforming tags still ``-β`` per turn).
+    (non-conforming tags still ``-β`` per turn). Episode return is ``mean(r_i)``.
     Unsolved help_seeking: α' on valid in-think turns (unless deferred; soft
     budget decays α past the seek budget), ``-β`` on any tag format violation
-    (orphan OPEN / bad payload / stray CLOSE), else 0.
+    (orphan OPEN / bad payload / stray CLOSE), else 0. If any turn received
+    seek credit, the episode return is that credit (not the mean over turns).
     """
     st = dict(stats or {})
     turns: list[dict[str, Any]] = list(st.get("turn_costs") or [])
@@ -1552,6 +1553,7 @@ def compute_turn_rewards(
 
     turn_rewards: list[float] = []
     seek_ordinal = 0
+    seek_episode: float | None = None
 
     if float(solved) > 0.0:
         # Total traj cost once (not per-turn c_i/b_i).
@@ -1579,6 +1581,7 @@ def compute_turn_rewards(
         credit = _apply_empty_scale(
             alpha_v, empty_patch=empty_patch, empty_scale=emp_scale, protocol=proto, metadata=metadata
         )
+        seek_episode = max(0.0, float(credit))
         for tc in turns:
             if turn_offload_tag_violation(tc):
                 turn_rewards.append(-mal_pen)
@@ -1590,7 +1593,10 @@ def compute_turn_rewards(
             else:
                 turn_rewards.append(0.0)
 
-    reward = float(sum(turn_rewards) / max(len(turn_rewards), 1))
+    if seek_episode is not None and any(r > 0.0 for r in turn_rewards):
+        reward = seek_episode
+    else:
+        reward = float(sum(turn_rewards) / max(len(turn_rewards), 1))
     return {
         "reward": reward,
         "turn_rewards": turn_rewards,
@@ -1847,7 +1853,12 @@ def shape_group_help_seeking_rewards(args: Any, groups: list) -> None:
                             scale = seek_budget_alpha_scale(seek_ordinal, budget)
                             turn_rewards[i] = credit * scale
                 if turn_rewards:
-                    mean_r = float(sum(turn_rewards) / max(len(turn_rewards), 1))
+                    # Valid seek → fixed α' for the episode. Mean would wash
+                    # one seek out of a long failure. No seek → mean (0 or −β).
+                    if any(float(r) > 0.0 for r in turn_rewards):
+                        episode_r = credit
+                    else:
+                        episode_r = float(sum(turn_rewards) / max(len(turn_rewards), 1))
                     for sample in segs:
                         smd = dict(getattr(sample, "metadata", None) or {})
                         smd["turn_rewards"] = list(turn_rewards)
@@ -1867,7 +1878,7 @@ def shape_group_help_seeking_rewards(args: Any, groups: list) -> None:
                             tmd["turn_token_spans"] = smd["turn_token_spans"]
                         sample.train_metadata = tmd
                         if float(getattr(sample, "reward", 0.0) or 0.0) <= 0.0:
-                            sample.reward = mean_r
+                            sample.reward = episode_r
                 continue
 
             # Legacy scalar path (no turn ledger).

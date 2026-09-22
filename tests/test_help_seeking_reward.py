@@ -314,6 +314,39 @@ def test_compute_turn_rewards_malformed_negative_unsolved(monkeypatch):
     )
     assert out["turn_rewards"][0] == pytest.approx(0.1)
     assert out["turn_rewards"][1] == pytest.approx(-0.25)
+    # One valid seek fixes the episode return; −β stays on that turn only.
+    assert out["reward"] == pytest.approx(0.1)
+
+
+def test_unsolved_seek_episode_reward_ignores_length(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    turns = [_turn(valid=True)] + [_turn(valid=False) for _ in range(9)]
+    stats = {"turn_costs": turns, "offload_count": 1, "offload_outside_think_count": 0}
+    out = offload.compute_turn_rewards(0.0, stats, alpha=0.1, encourage_seek=True)
+    assert out["turn_rewards"].count(0.1) == 1
+    assert out["reward"] == pytest.approx(0.1)
+
+
+def test_unsolved_without_seek_episode_reward_stays_zero(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    turns = [_turn(valid=False) for _ in range(5)]
+    stats = {"turn_costs": turns, "offload_count": 0, "offload_outside_think_count": 0}
+    out = offload.compute_turn_rewards(0.0, stats, alpha=0.1, encourage_seek=True)
+    assert out["reward"] == 0.0
+
+
+def test_shape_group_long_failure_uses_fixed_alpha(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
+    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
+    turns = [_turn(valid=True)] + [_turn(valid=False) for _ in range(9)]
+    s = _sample(reward=0.0, solved=0.0, oc=1)
+    s.metadata["turn_costs"] = turns
+    s.metadata["turn_rewards"] = [0.0] * len(turns)
+    s.metadata["offload_stats"] = {"offload_count": 1, "turn_costs": turns}
+    offload.shape_group_help_seeking_rewards(None, [[s]])
+    assert s.metadata["turn_rewards"][0] == pytest.approx(0.1)
+    assert s.reward == pytest.approx(0.1)
 
 
 def test_analyze_offload_tags_valid_and_orphan():
