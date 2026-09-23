@@ -7,7 +7,8 @@
 # 4-6=high, 7-9=max via chat_template_kwargs.thinking) and returns the
 # continuation so the agent can keep editing. Default train reward is
 # help_seeking (OFFLOAD_REWARD_MODE) with OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG:
-# group α on valid in-think offload unless a sibling solved without offload;
+# group α on valid in-think offload; if a sibling solved without offload,
+# α is scaled by OFFLOAD_SEEK_SOLO_SCALE (default 0.3) rather than withheld.
 # otherwise unsolved→0 / solved→(1-λ*cost_ratio - coef*max(0,n_turns-ref)/ref), floored.
 # Empty patches never count as solved.
 #
@@ -49,11 +50,12 @@ export SAVE_INTERVAL="${SAVE_INTERVAL:-20}"
 # ---- mid-turn offload ----
 export SLIME_AGENT_OFFLOAD=1
 export OFFLOAD_EFFICIENCY_LAMBDA=0.05
-# help_seeking + SEEK_ONLY_WHEN_ALL_WRONG: withhold α only if a sibling
-# solved without offload (see offload.shape_group_help_seeking_rewards).
+# help_seeking + SEEK_ONLY_WHEN_ALL_WRONG: if a sibling solved without offload,
+# failed seekers still get α * OFFLOAD_SEEK_SOLO_SCALE (default 0.3).
 # Set OFFLOAD_REWARD_MODE=cost_aware to restore the old "fail → 0" shaping.
 export OFFLOAD_REWARD_MODE=help_seeking
 export OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG=1
+export OFFLOAD_SEEK_SOLO_SCALE="${OFFLOAD_SEEK_SOLO_SCALE:-0.3}"
 # export OFFLOAD_REWARD_MODE="${OFFLOAD_REWARD_MODE:-cost_aware}"
 export OFFLOAD_SEEK_ALPHA=0.1
 export OFFLOAD_SEEK_EMPTY_SCALE=0.5
@@ -112,6 +114,7 @@ export SLIME_AGENT_CODEX_TARBALL="${SLIME_AGENT_CODEX_TARBALL:-${_TB}/openai-cod
 export SLIME_AGENT_PI_TARBALL="${SLIME_AGENT_PI_TARBALL:-${_TB}/pi-coding-agent-local.tgz}"
 export SLIME_AGENT_OPENCODE_TARBALL="${SLIME_AGENT_OPENCODE_TARBALL:-${_TB}/opencode-ai-local-linux-x64.tgz}"
 export SLIME_AGENT_MINISWE_WHEEL="${SLIME_AGENT_MINISWE_WHEEL:-${_TB}/miniswe-wheels}"
+# 判断agent包是否存在，新镜像已预安装 CODEX / PI / OPENCODE / MINISWE
 for _agent_pkg in \
   SLIME_AGENT_CODEX_TARBALL \
   SLIME_AGENT_PI_TARBALL \
@@ -122,7 +125,7 @@ do
   if [[ ! -e "${_path}" ]]; then
     echo "ERROR: ${_agent_pkg} missing: ${_path}" >&2
     echo "  Mixed-agent PROMPT_DATA requires host tarballs under ${_TB}/ (see README)." >&2
-    exit 1
+    # exit 1
   fi
 done
 unset _TB _agent_pkg _path
@@ -176,6 +179,7 @@ echo "  DASHSCOPE_MODEL=${DASHSCOPE_MODEL}"
 echo "  OFFLOAD_EFFICIENCY_LAMBDA=${OFFLOAD_EFFICIENCY_LAMBDA}"
 echo "  OFFLOAD_REWARD_MODE=${OFFLOAD_REWARD_MODE}"
 echo "  OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG=${OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG}"
+echo "  OFFLOAD_SEEK_SOLO_SCALE=${OFFLOAD_SEEK_SOLO_SCALE:-}"
 echo "  OFFLOAD_SEEK_ALPHA=${OFFLOAD_SEEK_ALPHA}"
 echo "  OFFLOAD_SEEK_BUDGET=${OFFLOAD_SEEK_BUDGET:-}"
 echo "  OFFLOAD_SEEK_BUDGET_TURN_K=${OFFLOAD_SEEK_BUDGET_TURN_K:-}"

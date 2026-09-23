@@ -120,6 +120,9 @@ DEFAULT_OFFLOAD_MALFORMED_PENALTY = 0.25
 # help_seeking_reward: partial credit when unsolved but the SLM asked for help in-think.
 DEFAULT_OFFLOAD_SEEK_ALPHA = 0.1
 DEFAULT_OFFLOAD_SEEK_EMPTY_SCALE = 0.5
+# When SEEK_ONLY is on and a sibling solved without offload: multiply α by this
+# (0 = old withhold, 1 = full α). Default keeps a weak seek gradient.
+DEFAULT_OFFLOAD_SEEK_SOLO_SCALE = 0.3
 DEFAULT_OFFLOAD_UNIQUE_SOLVER_BONUS = 0.15
 # Soft seek budget: 0 disables. Prefer TURN_K=0; penalize n_turns on solved instead.
 DEFAULT_OFFLOAD_SEEK_BUDGET = 0
@@ -285,9 +288,9 @@ def seek_only_when_all_wrong() -> bool:
     """If true, defer help-seeking α to group shaping.
 
     Per-sample finish uses ``encourage_seek=False``; :func:`shape_group_help_seeking_rewards`
-    then grants α on valid in-think offload **unless** a sibling solved without
-    offloading (solo success as counterfactual). A sibling that solved *with*
-    offload does not block α.
+    then grants α on valid in-think offload. When a sibling solved without
+    offloading, α is multiplied by :func:`seek_solo_scale` (default 0.3) instead
+    of withheld entirely. A sibling that solved *with* offload does not reduce α.
     """
     return os.environ.get("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "").strip().lower() in (
         "1",
@@ -295,6 +298,18 @@ def seek_only_when_all_wrong() -> bool:
         "yes",
         "on",
     )
+
+
+def seek_solo_scale() -> float:
+    """α multiplier when a sibling solved without offload (SEEK_ONLY path).
+
+    ``0`` restores the old full withhold; ``1`` ignores the solo sibling.
+    """
+    try:
+        v = float(os.environ.get("OFFLOAD_SEEK_SOLO_SCALE", str(DEFAULT_OFFLOAD_SEEK_SOLO_SCALE)))
+    except ValueError:
+        return DEFAULT_OFFLOAD_SEEK_SOLO_SCALE
+    return max(0.0, min(1.0, v))
 
 
 def seek_budget_fixed() -> int:
@@ -1789,10 +1804,11 @@ def _session_segments(group_item: Any) -> list[Any]:
 
 
 def shape_group_help_seeking_rewards(args: Any, groups: list) -> None:
-    """Grant help-seeking α on valid offload turns unless a solo (no-offload) solve exists.
+    """Grant help-seeking α on valid offload turns for failed seekers.
 
-    Skips the group when any sibling solved with ``offload_count == 0``. A sibling
-    that solved *with* offload does not block α for failed help-seekers.
+    When any sibling solved with ``offload_count == 0``, multiply α by
+    :func:`seek_solo_scale` (default 0.3) instead of skipping the group. A
+    sibling that solved *with* offload does not reduce α.
 
     Mutates ``turn_rewards`` / ``sample.reward`` in place. tmax does not apply
     ``empty_scale`` on empty_patch.
@@ -1804,16 +1820,19 @@ def shape_group_help_seeking_rewards(args: Any, groups: list) -> None:
     alpha_v = seek_alpha()
     emp_scale = seek_empty_scale()
     mal_pen = malformed_penalty()
+    solo_scale_v = seek_solo_scale()
 
     for group in groups:
         sessions = [_session_segments(item) for item in group]
         sessions = [segs for segs in sessions if segs]
         if not sessions:
             continue
-        if any(
+        has_solo = any(
             _session_solved_without_offload(getattr(segs[0], "metadata", None))
             for segs in sessions
-        ):
+        )
+        group_scale = solo_scale_v if has_solo else 1.0
+        if group_scale <= 0.0:
             continue
 
         for segs in sessions:
@@ -1834,7 +1853,7 @@ def shape_group_help_seeking_rewards(args: Any, groups: list) -> None:
                 protocol=md.get("protocol"),
                 metadata=md,
             )
-            credit = max(0.0, float(credit))
+            credit = max(0.0, float(credit) * group_scale)
 
             if turn_costs and (not turn_rewards or len(turn_rewards) != len(turn_costs)):
                 turn_rewards = [0.0] * len(turn_costs)

@@ -135,11 +135,24 @@ def test_shape_group_all_wrong_grants_alpha(monkeypatch):
     assert b.reward == 0.0
 
 
-def test_shape_group_solo_solved_does_not_encourage(monkeypatch):
-    """Withhold α when a sibling solved without offload."""
+def test_shape_group_solo_solved_scales_alpha(monkeypatch):
+    """Sibling solved without offload → discounted α (not full withhold)."""
     monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
     monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
     monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
+    monkeypatch.setenv("OFFLOAD_SEEK_SOLO_SCALE", "0.3")
+    failed_offload = _sample(reward=0.0, solved=0.0, oc=2)
+    solved_solo = _sample(reward=0.9, solved=1.0, oc=0)
+    offload.shape_group_help_seeking_rewards(None, [[failed_offload, solved_solo]])
+    assert failed_offload.reward == pytest.approx(0.03)
+    assert solved_solo.reward == pytest.approx(0.9)
+
+
+def test_shape_group_solo_scale_zero_withholds(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
+    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
+    monkeypatch.setenv("OFFLOAD_SEEK_SOLO_SCALE", "0")
     failed_offload = _sample(reward=0.0, solved=0.0, oc=2)
     solved_solo = _sample(reward=0.9, solved=1.0, oc=0)
     offload.shape_group_help_seeking_rewards(None, [[failed_offload, solved_solo]])

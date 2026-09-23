@@ -2,6 +2,8 @@
 
 This directory provides an example of running end-to-end **SWE (Software-Engineering) coding-agent RL** with slime: a real coding agent (claude-code CLI) drives `Read/Edit/Grep/Bash/Agent` tools inside a fresh sandbox per sample, the model produces a `git diff`, and the diff is graded against the dataset's test harness in a second clean sandbox (no test-cheating).
 
+> **新手训练（`gigpo-entropy`，本机 Docker）：** [docs/TRAINING_README_zh.md](./docs/TRAINING_README_zh.md)
+
 **Qwen3.5-4B + public e2b.dev (1 node):** see [docs/README_qwen35_4b_public_e2b.md](./docs/README_qwen35_4b_public_e2b.md) for the local diff summary and runbook (template build, Cloudflare tunnel, smoke data).
 
 ## Directory map
