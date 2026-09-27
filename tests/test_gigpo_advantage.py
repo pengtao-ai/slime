@@ -65,6 +65,20 @@ def test_unknown_empty_args_not_bash_empty():
         assert fam2 == "Meta", (name, fam2)
 
 
+def test_shell_family_path_prefixed_bash_no_recursion():
+    """``/bin/bash`` / ``/bin/sh`` used to recurse forever (basename vs strip)."""
+    assert gigpo._shell_family_from_args("/bin/bash") == "Bash:script"
+    assert gigpo._shell_family_from_args("/bin/sh") == "Bash:script"
+    assert gigpo._shell_family_from_args("/bin/bash -c 'pytest -q'") == "Bash:pytest"
+    assert gigpo._shell_family_from_args("bash bash bash true") == "Bash:noop"
+    msg = {
+        "role": "assistant",
+        "tool_calls": [{"function": {"name": "Bash", "arguments": {"command": "/bin/sh -lc 'ls -la'"}}}],
+    }
+    _key, _intent, fam = gigpo.classify_message_tools(msg)
+    assert fam == "Bash:fs"
+
+
 def test_compute_step_as_success_vs_fail():
     # One solved traj late pytest step should get higher A_S than fail traj same T.
     trajs = [

@@ -28,6 +28,12 @@ if str(REPO_ROOT) not in sys.path:
 from tests.test_agent._fakes import FakeSGLangServer, FakeTokenizer  # noqa: E402
 
 from slime.agent.adapters import anthropic, openai  # noqa: E402
+from slime.agent.adapters.common import (  # noqa: E402
+    _assert_append_only_prompt,
+    _continue_from_canonical_turn,
+    _reasoning_preserving_chat_template,
+    _restore_canonical_assistant_history,
+)
 from slime.agent.parsing import parse_model_output, parse_xml_tool_uses  # noqa: E402
 from slime.utils.types import Sample  # noqa: E402
 
@@ -131,6 +137,86 @@ def test_anthropic_translation_keeps_tool_results_thinking_and_tools():
     ]
 
 
+def test_restore_canonical_assistant_history_from_client_echo():
+    canonical_tool_calls = [{"type": "function", "function": {"name": "lookup", "arguments": {"q": "slime"}}}]
+    messages = [
+        {"role": "user", "content": "find slime"},
+        {
+            "role": "assistant",
+            "content": "normalized by client",
+            "tool_calls": [{"type": "function", "function": {"name": "lookup", "arguments": {"q": " slime "}}}],
+        },
+        {"role": "tool", "content": "found"},
+    ]
+    history = [
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "I should call lookup.",
+            "tool_calls": canonical_tool_calls,
+        }
+    ]
+
+    assert _restore_canonical_assistant_history(messages, history) == 1
+    assert messages[1] == history[0]
+
+
+def test_reasoning_preserving_template_keeps_generation_prompt_unchanged():
+    class Tokenizer:
+        chat_template = (
+            "before "
+            "{%- if loop.index0 > ns.last_query_index %}history-with-reasoning"
+            "{%- else %}history-without-reasoning{%- endif %} "
+            "generation: \\n"
+        )
+
+    rendered = _reasoning_preserving_chat_template(Tokenizer())
+    assert rendered is not None
+    assert "if true" in rendered
+    assert "if loop.index0 > ns.last_query_index" not in rendered
+    assert rendered.endswith("generation: \\n")
+
+
+def test_reasoning_preserving_template_returns_none_without_branch():
+    class Tokenizer:
+        chat_template = "no reasoning branch here"
+
+    assert _reasoning_preserving_chat_template(Tokenizer()) is None
+
+
+def test_append_only_prompt_invariant():
+    _assert_append_only_prompt([1, 2, 3], [1, 2, 3, 4])
+    with pytest.raises(RuntimeError, match=r"previous_tokens=3 prompt_tokens=3 common_prefix=2"):
+        _assert_append_only_prompt([1, 2, 3], [1, 2, 9])
+
+
+def test_continue_from_canonical_turn_keeps_sampled_tokens_and_appends_new_suffix():
+    class NormalizingTokenizer:
+        def apply_chat_template(self, messages, *, add_generation_prompt, **kwargs):
+            if len(messages) == 2 and not add_generation_prompt:
+                return [1, 2, 90, 91]
+            if len(messages) == 3 and add_generation_prompt:
+                return [1, 2, 90, 91, 7, 8]
+            raise AssertionError((messages, add_generation_prompt, kwargs))
+
+    response = {"role": "assistant", "content": "visible"}
+    messages = [
+        {"role": "user", "content": "question"},
+        dict(response),
+        {"role": "tool", "content": "new observation"},
+    ]
+    prompt_ids = _continue_from_canonical_turn(
+        messages,
+        NormalizingTokenizer(),
+        tools=None,
+        chat_template="patched-qwen-template",
+        rendered_prompt_ids=[1, 2, 90, 91, 7, 8],
+        previous_turn_ids=[1, 2, 30, 31],
+        previous_response_message=response,
+    )
+    assert prompt_ids == [1, 2, 30, 31, 7, 8]
+
+
 def test_openai_translation_developer_to_system_and_tool_calls_to_dict():
     translated = openai._translate_messages(
         [
@@ -149,14 +235,20 @@ def test_openai_translation_developer_to_system_and_tool_calls_to_dict():
     assert translated == [
         {"role": "system", "content": "rules"},
         {"role": "user", "content": "hello"},
-        # wire-only id dropped; arguments coerced JSON-string -> dict.
+        # arguments coerced JSON-string -> dict; wire id kept for offload /
+        # tool-result correlation (TrajectoryManager routing ignores it).
         {
             "role": "assistant",
             "content": "",
-            "tool_calls": [{"type": "function", "function": {"name": "lookup", "arguments": {"q": "slime"}}}],
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": {"q": "slime"}},
+                    "id": "call_1",
+                }
+            ],
         },
-        # tool_call_id dropped.
-        {"role": "tool", "content": "found"},
+        {"role": "tool", "content": "found", "tool_call_id": "call_1"},
     ]
 
 

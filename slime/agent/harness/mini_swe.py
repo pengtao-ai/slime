@@ -1,7 +1,7 @@
 """mini-swe-agent harness.
 
 Runs ``mini`` inside the existing DockerSandbox (LocalEnvironment), pointing
-litellm's Anthropic provider at the host Anthropic adapter. Trajectories are
+litellm's OpenAI provider at the host OpenAI adapter. Trajectories are
 recorded by the adapter (same dumps as OpenCode / pi), not by mini's native
 SWE-bench host-side runner.
 """
@@ -125,9 +125,9 @@ class MiniSweHarness(BaseHarness):
         )
 
     async def write_config(self, sb: Sandbox, ctx: HarnessContext) -> None:
-        """Write mini YAML: Anthropic via litellm → slime adapter, yolo local env."""
-        # litellm anthropic provider requests {api_base}/v1/messages, matching
-        # Claude Code (api_base = adapter root, no trailing /v1).
+        """Write mini YAML: OpenAI via litellm → slime adapter, yolo local env."""
+        # litellm openai provider requests {api_base}/chat/completions; slime
+        # serves OpenAI routes under {adapter}/v1 (same as Codex).
         config = {
             "agent": {
                 "system_template": (
@@ -156,10 +156,12 @@ class MiniSweHarness(BaseHarness):
                 },
             },
             "model": {
-                "model_name": f"anthropic/{ctx.model_label}",
+                "model_name": f"openai/{ctx.model_label}",
                 "cost_tracking": "ignore_errors",
+                # Override litellm catalog; raise ContextWindowExceededError past this.
+                "max_input_tokens": 160000,
                 "model_kwargs": {
-                    "api_base": ctx.adapter_url,
+                    "api_base": f"{ctx.adapter_url}/v1",
                     "api_key": ctx.session_id,
                     "drop_params": True,
                 },
@@ -189,9 +191,8 @@ class MiniSweHarness(BaseHarness):
         if extra:
             cmd = f"{cmd} {extra}"
         env = {
-            "ANTHROPIC_API_KEY": ctx.session_id,
-            "ANTHROPIC_AUTH_TOKEN": ctx.session_id,
-            "ANTHROPIC_BASE_URL": ctx.adapter_url,
+            "OPENAI_API_KEY": ctx.session_id,
+            "OPENAI_BASE_URL": f"{ctx.adapter_url}/v1",
             "MSWEA_COST_TRACKING": "ignore_errors",
             "MSWEA_CONFIGURED": "true",
         }

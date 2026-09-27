@@ -459,22 +459,26 @@ def test_1_4_user_fork_shared_system():
 
 
 def test_1_5_assistant_message_fork():
-    """Same (sys,user) prefix, two distinct assistant turns -> assistant fork."""
+    """Same (sys,user) prompt regenerated -> supersede tip, keep latest only.
+
+    Harness FormatError retries re-POST the same prompt; accumulating sibling
+    tips would cascade-fork later. Live branches (assistants with children) are
+    unaffected — see tool-level forks in 1.6.
+    """
     mgr = TrajectoryManager()
     sid = "1.5"
     s, u = sys_msg("S"), usr_msg("u")
     append(mgr, sid, [s, u], "a1")
     append(mgr, sid, [s, u], "a2")
     user_node = mgr._trees[sid].children[0].children[0]
-    assert len(user_node.children) == 2, "two assistant leaves hang off shared user"
+    assert len(user_node.children) == 1, "same-prompt regen supersedes the prior tip"
+    assert user_node.children[0].message["content"] == "a2"
     samples = get_traj(mgr, sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
-    # Two independent single-turn leaves sharing only the (sys,user) prefix.
     assert goldens(samples) == [
-        "<sys> system:S </sys> <usr> user:u </usr> <gen> [r:a1] [</ast>]",
         "<sys> system:S </sys> <usr> user:u </usr> <gen> [r:a2] [</ast>]",
     ]
     _check_invariants(samples)
-    _record("1.5 assistant fork under shared user", mgr, sid, samples)
+    _record("1.5 same-prompt regen supersedes tip", mgr, sid, samples)
     print("PASS 1.5")
 
 
@@ -506,36 +510,29 @@ def test_1_6_tool_fork_shared_assistant():
 
 def test_1_7_token_only_drift_no_fork():
     """Identical messages, tampered prompt_ids -> NO tree fork (DFS ignores
-    tokens), but the drift DOES surface in the linearized sample: it lands in
-    leaf 2's prompt region (stripped / loss=0), proving token drift cannot
-    corrupt a trained response yet is still carried in the sample tokens."""
+    tokens). Same-prompt regen also supersedes the prior tip, so the drifted
+    prompt lands on the single surviving leaf as stripped / loss=0 context.
+    """
     mgr = TrajectoryManager()
     sid = "1.7"
     s, u = sys_msg("S"), usr_msg("u")
     pa, _ = append(mgr, sid, [s, u], "a")
     tampered = drift(pa, 1)  # <DRIFT> spliced into the prompt at index 1
     append(mgr, sid, [s, u], "b", prompt_ids=tampered)
-    # Tree: (sys,user) shared, two assistant turns hang off it -> two leaves; the
-    # path above the assistant is single (NOT forked on tokens).
     user_node = mgr._trees[sid].children[0].children[0]
-    assert len(user_node.children) == 2, "two assistant turns share the (sys,user) path"
+    assert len(user_node.children) == 1, "same-prompt regen supersedes; no tip fork"
     assert len(mgr._trees[sid].children) == 1
 
     samples = get_traj(mgr, sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
-    assert len(samples) == 2
-    # Leaf 1: clean. Leaf 2: the <DRIFT> token sits in the stripped prompt region
-    # (bare, no brackets); the response r:b is fully trained ([...]).
+    assert len(samples) == 1
     assert goldens(samples) == [
-        "<sys> system:S </sys> <usr> user:u </usr> <gen> [r:a] [</ast>]",
         "<sys> <DRIFT> system:S </sys> <usr> user:u </usr> <gen> [r:b] [</ast>]",
     ]
-    # Belt-and-suspenders on the drift placement: token present, but never inside
-    # the response region.
-    s_b = samples[1]
+    s_b = samples[0]
     assert (_DRIFT_BAND + 1) in s_b.tokens, "drift token is still carried in the sample"
     assert (_DRIFT_BAND + 1) not in s_b.tokens[len(tampered) :], "drift not in the response region"
     _check_invariants(samples)
-    _record("1.7 token-only drift -> no tree fork, drift lands in stripped prompt", mgr, sid, samples)
+    _record("1.7 token-only drift on superseded tip", mgr, sid, samples)
     print("PASS 1.7")
 
 
@@ -666,7 +663,7 @@ def test_2_3_drift_case_A_forks():
 
 
 def test_2_4_drift_case_B1_short_replaces():
-    """Small drift inside the most-recent response span -> replace."""
+    """Small drift inside the most-recent response span -> replace suffix only."""
     mgr = TrajectoryManager()  # default threshold 1024
     sid = "2.4"
     s, u, a1, t = sys_msg("S"), usr_msg("u"), asst_msg("call"), tool_msg("t")
@@ -681,15 +678,16 @@ def test_2_4_drift_case_B1_short_replaces():
     s0 = samples[0]
     L = _common_prefix_len(p1 + r1, p2)
     assert L == drift_idx
-    # replace: the drifted r:call response is no longer a faithful echo of what the
-    # model generated (its tail diverged), so the WHOLE surviving span is masked and
-    # re-supplied as loss=0 prompt context (the <DRIFT> token marks the divergence);
-    # only the new r:done trains.
+    # Matching response prefix keeps loss=1; only the drifted suffix + new prompt
+    # tail are loss=0 context; the new r:done trains.
     assert goldens(samples) == [
-        "<sys> system:S </sys> <usr> user:u </usr> <gen> r:call <DRIFT> "
+        "<sys> system:S </sys> <usr> user:u </usr> <gen> [r:call] <DRIFT> "
         "<tul> tool:t </tul> <gen> [r:done] [</ast>]",
     ]
-    assert s0.rollout_log_probs == [0.0] * (len(p2) - len(p1)) + [-0.4] * len(r2)
+    preserved = drift_idx - len(p1)
+    assert s0.rollout_log_probs == (
+        [-0.5] * preserved + [0.0] * (len(p2) - drift_idx) + [-0.4] * len(r2)
+    )
     _check_invariants(samples)
     _record("2.4 drift case B1 (small) -> replace", mgr, sid, samples)
     print("PASS 2.4")
@@ -953,26 +951,24 @@ def test_3_3_rewrite_merge_threshold_zero_forks():
 
 
 def test_3_4_rewrite_merge_ambiguous_forks():
+    """Same-prompt tips are superseded, so a later rewrite sees one candidate
+    and merges (short) instead of cascading sibling forks."""
     mgr = TrajectoryManager()
     sid = "3.4"
     s, u = sys_msg("S"), usr_msg("u")
-    # two short assistant leaves under shared (sys,user)
     append(mgr, sid, [s, u], "a")
-    append(mgr, sid, [s, u], "b")
+    append(mgr, sid, [s, u], "b")  # supersedes tip "a"
     a_c, t1 = asst_msg("c"), tool_msg("t")
     append(mgr, sid, [s, u, a_c, t1], "d")
-    assert len(_leaves(mgr, sid)) == 3, "ambiguous candidates fork"
+    assert len(_leaves(mgr, sid)) == 1, "supersede + short rewrite merge -> one leaf"
     samples = get_traj(mgr, sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
-    assert len(samples) == 3
-    # Leaves "a" and "b" are standalone single turns; leaf "d" carries the
-    # ambiguous-rewrite assistant (r:c) as routing-only (bare) -> trains only r:d.
+    assert len(samples) == 1
+    # Tip "b" demoted by rewrite-merge; only r:d trains.
     assert goldens(samples) == [
-        "<sys> system:S </sys> <usr> user:u </usr> <gen> [r:a] [</ast>]",
-        "<sys> system:S </sys> <usr> user:u </usr> <gen> [r:b] [</ast>]",
         "<sys> system:S </sys> <usr> user:u </usr> <gen> r:c </ast> " "<tul> tool:t </tul> <gen> [r:d] [</ast>]",
     ]
     _check_invariants(samples)
-    _record("3.4 rewrite-merge ambiguous -> fork", mgr, sid, samples)
+    _record("3.4 supersede tips then rewrite-merge", mgr, sid, samples)
     print("PASS 3.4")
 
 
@@ -1135,6 +1131,392 @@ def test_3_8_long_mixed_session():
 # ===========================================================================
 
 
+def _tc(name: str, args: dict) -> dict:
+    """An assistant message carrying one tool call, canonical (tool_call_dict) shape."""
+    return {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"type": "function", "function": {"name": name, "arguments": args}}],
+    }
+
+
+# What the model generated: trailing whitespace inside the payload, and no
+# `replace_all` key (it emitted none).
+_EDIT_GEN = _tc("Edit", {"file_path": "/p.py", "old_string": "a \n", "new_string": "b \n"})
+# The harness echo of that same call: `replace_all` filled in with the value the
+# schema declares, payload right-stripped per line. Same action, different bytes.
+_EDIT_ECHO = _tc("Edit", {"file_path": "/p.py", "old_string": "a\n", "new_string": "b\n", "replace_all": False})
+
+# Tool schemas as the adapter hands them over. `Edit.replace_all` defaults to
+# False and `Fetch.follow_redirects` to True: a default of either polarity has to
+# work, which is what rules out "treat a False value as the default".
+_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "Edit",
+            "parameters": {
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "old_string": {"type": "string"},
+                    "new_string": {"type": "string"},
+                    "replace_all": {"type": "boolean", "default": False},
+                }
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "Fetch",
+            "parameters": {
+                "properties": {
+                    "url": {"type": "string"},
+                    "follow_redirects": {"type": "boolean", "default": True},
+                }
+            },
+        },
+    },
+]
+
+
+def test_3_9_restore_echo_keeps_turn_trainable():
+    """A harness echo that only fills in a declared default and right-strips string
+    args is the same tool call. Restoring it before the prompt is rendered keeps the
+    turn CLEAN, so its generated tokens still train -- without the restore the
+    routing walk misses the node, `_try_merge_assistant_rewrite` demotes that turn
+    to routing-only, and it trains on nothing."""
+    mgr = TrajectoryManager()
+    sid = "3.9"
+    s, u = sys_msg("S"), usr_msg("u")
+    t1 = tool_msg("t")
+
+    p1 = render_prompt([s, u])
+    r1 = render_response("edit")
+    mgr.record_turn(
+        sid,
+        turn=turn(p1, r1, finish_reason="tool_calls"),
+        prompt_messages=messages([s, u]),
+        response_message=_EDIT_GEN,
+    )
+
+    incoming = [*messages([s, u]), _EDIT_ECHO, t1.message]
+    restored = mgr.restore_generated_messages(sid, incoming, _SCHEMA)
+    assert restored[2] == _EDIT_GEN, "the echoed assistant message is restored"
+    assert incoming[2] == _EDIT_ECHO, "the caller's list is not mutated"
+    assert restored[0] is incoming[0] and restored[3] is incoming[3], "other messages pass through"
+
+    # Rendering the restored history reproduces the tokens we hold -> CLEAN.
+    p2 = p1 + r1 + t1.render() + [_GEN]
+    mgr.record_turn(
+        sid,
+        turn=turn(p2, render_response("done"), finish_reason="stop"),
+        prompt_messages=restored,
+        response_message={"role": "assistant", "content": "done"},
+    )
+
+    leaves = _leaves(mgr, sid)
+    assert len(leaves) == 1, "the restored echo descends the existing chain"
+    edit_node = leaves[0].path_from_root()[2]
+    assert edit_node.turn is not None, "the Edit turn keeps its TurnRecord"
+    assert "merged_rewrite" not in edit_node.metadata
+
+    samples = get_traj(mgr, sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
+    assert len(samples) == 1
+    # Both generated turns train: the Edit (r:edit) and the follow-up (r:done).
+    assert goldens(samples) == [
+        "<sys> system:S </sys> <usr> user:u </usr> <gen> [r:edit] [</ast>] "
+        "<tul> tool:t </tul> <gen> [r:done] [</ast>]",
+    ]
+    _check_invariants(samples)
+    _record("3.9 restored echo keeps the turn trainable", mgr, sid, samples)
+    print("PASS 3.9")
+
+
+def test_3_10_restore_echo_from_whitespace_alone():
+    """The recognition must not depend on a default having been filled in. Write's
+    schema declares none, so its echo differs only by the per-line rstrip of a
+    multi-line payload -- and that alone is enough to lose the turn. Covering Write
+    keeps each kind of client edit under test independently."""
+    body_gen = "def f(x): \n    return x + 1 \n\nDEFAULTS = {} \n"
+    body_echo = "def f(x):\n    return x + 1\n\nDEFAULTS = {}\n"
+    write_gen = _tc("Write", {"file_path": "/p.py", "content": body_gen})
+    write_echo = _tc("Write", {"file_path": "/p.py", "content": body_echo})
+    assert "replace_all" not in str(write_echo), "Write's echo carries no schema default"
+
+    mgr = TrajectoryManager()
+    sid = "3.9b"
+    s, u = sys_msg("S"), usr_msg("u")
+    t1 = tool_msg("t")
+
+    p1 = render_prompt([s, u])
+    r1 = render_response("write")
+    mgr.record_turn(
+        sid,
+        turn=turn(p1, r1, finish_reason="tool_calls"),
+        prompt_messages=messages([s, u]),
+        response_message=write_gen,
+    )
+
+    restored = mgr.restore_generated_messages(sid, [*messages([s, u]), write_echo, t1.message], _SCHEMA)
+    assert restored[2] == write_gen, "an rstrip-only echo is still the same call"
+
+    mgr.record_turn(
+        sid,
+        turn=turn(p1 + r1 + t1.render() + [_GEN], render_response("done"), finish_reason="stop"),
+        prompt_messages=restored,
+        response_message={"role": "assistant", "content": "done"},
+    )
+    assert len(_leaves(mgr, sid)) == 1
+    samples = get_traj(mgr, sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
+    assert goldens(samples) == [
+        "<sys> system:S </sys> <usr> user:u </usr> <gen> [r:write] [</ast>] "
+        "<tul> tool:t </tul> <gen> [r:done] [</ast>]",
+    ]
+    _check_invariants(samples)
+    _record("3.10 Write echo restored from rstrip alone", mgr, sid, samples)
+    print("PASS 3.10")
+
+
+def test_3_11_restore_echo_with_either_default_polarity():
+    """The filled-in value has to be checked against the schema, not assumed to be
+    False. `Fetch.follow_redirects` defaults to True, so an echo that fills in
+    True is the same call, while one that fills in False is a different one --
+    the reverse of `Edit.replace_all`. Treating "a False value" as the default
+    would get both of these wrong."""
+    mgr = TrajectoryManager()
+    sid = "3.9c"
+    s, u = sys_msg("S"), usr_msg("u")
+    t1 = tool_msg("t")
+    gen = _tc("Fetch", {"url": "u"})  # model omitted follow_redirects
+    mgr.record_turn(
+        sid,
+        turn=turn(render_prompt([s, u]), render_response("fetch"), finish_reason="tool_calls"),
+        prompt_messages=messages([s, u]),
+        response_message=gen,
+    )
+
+    filled_default = _tc("Fetch", {"url": "u", "follow_redirects": True})  # == the declared default
+    overridden = _tc("Fetch", {"url": "u", "follow_redirects": False})  # a real change
+
+    out = mgr.restore_generated_messages(sid, [*messages([s, u]), filled_default, t1.message], _SCHEMA)
+    assert out[2] == gen, "filling in the declared default is the same call"
+    out = mgr.restore_generated_messages(sid, [*messages([s, u]), overridden, t1.message], _SCHEMA)
+    assert out[2] == overridden, "the non-default value is a different call"
+    print("PASS 3.14")
+
+
+def test_3_12_no_schema_falls_back_to_stricter_matching():
+    """Without a schema the defaults are unknown, so a filled-in default can no
+    longer be recognized. That must cost a restore, never cause a wrong one: the
+    echo is left as the harness sent it."""
+    mgr = TrajectoryManager()
+    sid = "3.9d"
+    s, u = sys_msg("S"), usr_msg("u")
+    t1 = tool_msg("t")
+    mgr.record_turn(
+        sid,
+        turn=turn(render_prompt([s, u]), render_response("edit-ns"), finish_reason="tool_calls"),
+        prompt_messages=messages([s, u]),
+        response_message=_EDIT_GEN,
+    )
+
+    incoming = [*messages([s, u]), _EDIT_ECHO, t1.message]
+    assert mgr.restore_generated_messages(sid, incoming)[2] == _EDIT_ECHO, "no schema -> no restore"
+    assert mgr.restore_generated_messages(sid, incoming, _SCHEMA)[2] == _EDIT_GEN, "with schema -> restored"
+
+    # An echo differing only by whitespace still works without a schema, since
+    # that projection needs no schema knowledge.
+    ws_only = _tc("Edit", {"file_path": "/p.py", "old_string": "a\n", "new_string": "b\n"})
+    assert mgr.restore_generated_messages(sid, [*messages([s, u]), ws_only, t1.message])[2] == _EDIT_GEN
+    print("PASS 3.12")
+
+
+def test_3_13_restore_declines_anything_but_an_echo():
+    """The restore must not rewrite history it does not recognize: swapping a
+    genuinely different action for the one we generated would silently corrupt
+    the training data. Only tool-call arguments are compared modulo the known
+    client normalizations; everything else must match exactly."""
+    mgr = TrajectoryManager()
+    sid = "3.10"
+    s, u = sys_msg("S"), usr_msg("u")
+    t1 = tool_msg("t")
+    mgr.record_turn(
+        sid,
+        turn=turn(render_prompt([s, u]), render_response("e"), finish_reason="tool_calls"),
+        prompt_messages=messages([s, u]),
+        response_message=_EDIT_GEN,
+    )
+
+    cases = {
+        "the real echo": (_EDIT_ECHO, True),
+        "different old_string": (
+            _tc("Edit", {"file_path": "/p.py", "old_string": "OTHER\n", "new_string": "b\n"}),
+            False,
+        ),
+        "replace_all=True": (
+            _tc("Edit", {"file_path": "/p.py", "old_string": "a\n", "new_string": "b\n", "replace_all": True}),
+            False,
+        ),
+        "different file": (
+            _tc("Edit", {"file_path": "/other.py", "old_string": "a\n", "new_string": "b\n"}),
+            False,
+        ),
+        "different tool": (_tc("Write", {"file_path": "/p.py", "content": "b\n"}), False),
+        "nested payload differs": (
+            _tc("MultiEdit", {"file_path": "/p.py", "edits": [{"old_string": "a\n", "new_string": "OTHER\n"}]}),
+            False,
+        ),
+        "no tool call at all": ({"role": "assistant", "content": "Let me reconsider."}, False),
+        "leading whitespace differs": (
+            _tc("Edit", {"file_path": "/p.py", "old_string": " a\n", "new_string": "b \n"}),
+            False,
+        ),
+    }
+    for label, (msg, should_restore) in cases.items():
+        out = mgr.restore_generated_messages(sid, [*messages([s, u]), msg, t1.message], _SCHEMA)
+        assert (out[2] == _EDIT_GEN) is should_restore, f"{label}: restore decision wrong"
+    print(f"PASS 3.10 ({len(cases)} cases)")
+
+
+def test_3_14_restore_across_a_long_rewriting_session():
+    """End-to-end along the adapter's path: every turn's history is restored
+    before rendering, exactly as ``_run_turn`` does, with the harness rewriting
+    each assistant echo. Every generated turn must stay trained and the session
+    must not fork."""
+    mgr = TrajectoryManager()
+    sid = "3.11"
+    s, u = sys_msg("S"), usr_msg("u")
+    n_turns = 5
+
+    hist = messages([s, u])
+    tokens = render_prompt([s, u])
+    for i in range(n_turns):
+        restored = mgr.restore_generated_messages(sid, hist, _SCHEMA)
+        gen = _tc("Edit", {"file_path": f"/f{i}.py", "old_string": f"x{i} \n", "new_string": f"y{i} \n"})
+        resp = render_response(f"edit{i}")
+        mgr.record_turn(
+            sid,
+            turn=turn(tokens, resp, finish_reason="tool_calls"),
+            prompt_messages=restored,
+            response_message=gen,
+        )
+        # The harness replays its own rewritten echo of that turn, plus a result.
+        echo = _tc(
+            "Edit",
+            {"file_path": f"/f{i}.py", "old_string": f"x{i}\n", "new_string": f"y{i}\n", "replace_all": False},
+        )
+        tool = tool_msg(f"r{i}")
+        hist = [*restored, echo, tool.message]
+        tokens = tokens + resp + tool.render() + [_GEN]
+
+    assert len(_leaves(mgr, sid)) == 1, "a restored session never forks"
+    samples = get_traj(mgr, sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
+    assert len(samples) == 1
+    trained_turns = sum(1 for i in range(n_turns) if f"[r:edit{i}]" in goldens(samples)[0])
+    assert trained_turns == n_turns, f"all {n_turns} generated turns must train, got {trained_turns}"
+    _check_invariants(samples)
+    _record("3.14 restore across a long rewriting session", mgr, sid, samples)
+    print("PASS 3.14")
+
+
+def test_3_15_restore_ignores_openai_wire_ids():
+    """OpenAI clients replay tool_calls[].id / tool_call_id; manager leaves omit them.
+
+    Routing and restore must still hit the held leaf, otherwise every subsequent
+    turn demotes and only the tip trains.
+    """
+    mgr = TrajectoryManager()
+    sid = "3.15"
+    s, u = sys_msg("S"), usr_msg("u")
+    gen = _tc("bash", {"command": "ls"})
+    mgr.record_turn(
+        sid,
+        turn=turn(render_prompt([s, u]), render_response("bash"), finish_reason="tool_calls"),
+        prompt_messages=messages([s, u]),
+        response_message=gen,
+    )
+
+    echo = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "call_client_replayed",
+                "type": "function",
+                "function": {"name": "bash", "arguments": {"command": "ls"}},
+            }
+        ],
+    }
+    tool = {
+        "role": "tool",
+        "tool_call_id": "call_client_replayed",
+        "content": "ok",
+    }
+    restored = mgr.restore_generated_messages(sid, [*messages([s, u]), echo, tool])
+    assert restored[2] == gen, "assistant echo with wire id is restored to the held leaf"
+    assert "id" not in (restored[2].get("tool_calls") or [{}])[0]
+    # Prefer the held tool message once mounted, or keep walking past id-only diffs.
+    mgr.record_turn(
+        sid,
+        turn=turn(
+            render_prompt([s, u]) + render_response("bash") + [9001, 9002] + [_GEN],
+            render_response("done"),
+            finish_reason="stop",
+        ),
+        prompt_messages=restored,
+        response_message={"role": "assistant", "content": "done"},
+    )
+    leaves = _leaves(mgr, sid)
+    assert len(leaves) == 1
+    assert leaves[0].path_from_root()[2].turn is not None
+    assert "merged_rewrite" not in leaves[0].path_from_root()[2].metadata
+    samples = get_traj(mgr, sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
+    assert "[r:bash]" in goldens(samples)[0]
+    print("PASS 3.15")
+
+
+def test_3_16_tip_regen_supersedes_and_returns_flag():
+    """FormatError-style retries: N same-prompt generations -> one tip; record_turn
+    reports superseded so adapters can pop canonical assistant_history."""
+    mgr = TrajectoryManager()
+    sid = "3.16"
+    s, u = sys_msg("S"), usr_msg("u")
+    p = render_prompt([s, u])
+    assert (
+        mgr.record_turn(
+            sid,
+            turn=turn(p, render_response("fail1")),
+            prompt_messages=messages([s, u]),
+            response_message={"role": "assistant", "content": "fail1"},
+        )
+        is False
+    )
+    for i, label in enumerate(["fail2", "fail3", "ok"], start=2):
+        superseded = mgr.record_turn(
+            sid,
+            turn=turn(p, render_response(label)),
+            prompt_messages=messages([s, u]),
+            response_message={"role": "assistant", "content": label},
+        )
+        assert superseded is True, f"retry {i} must supersede prior tip"
+    user_node = mgr._trees[sid].children[0].children[0]
+    assert len(user_node.children) == 1
+    assert user_node.children[0].message["content"] == "ok"
+    # Continue with a tool result under the surviving tip — must not revive orphans.
+    a_ok = asst_msg("ok")
+    append(mgr, sid, [s, u, a_ok, tool_msg("t")], "done")
+    assert len(_leaves(mgr, sid)) == 1
+    samples = get_traj(mgr, sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
+    assert goldens(samples) == [
+        "<sys> system:S </sys> <usr> user:u </usr> <gen> [r:ok] [</ast>] "
+        "<tul> tool:t </tul> <gen> [r:done] [</ast>]",
+    ]
+    _check_invariants(samples)
+    _record("3.16 tip regen supersedes; no cascade", mgr, sid, samples)
+    print("PASS 3.16")
+
+
 def test_4_2_logprobs_length_mismatch_raises():
     """output_log_probs whose length != output_ids -> ValueError at record_turn."""
     mgr = TrajectoryManager()
@@ -1263,12 +1645,63 @@ def test_4_6_drift_B1_threshold_boundary():
     replaced, p1b, r1b, p2b, r2b = run(threshold=3, new_resp_len=2)
     assert len(replaced) == 1, f"len(r2)<threshold must replace, got {len(replaced)}"
     assert replaced[0].tokens == p2b + r2b
-    # the drifted r1 echo is not a faithful response anymore -> the WHOLE r1 span is
-    # masked (loss=0 prompt context), r2 trains.
-    assert replaced[0].loss_mask == [0] * (len(p2b) - len(p1b)) + [1] * len(r2b)
+    # Matching prefix of r1 keeps loss=1; drifted suffix + new prompt tail are 0;
+    # r2 trains.
+    drift_idx = len(p1b) + len(r1b) - 1
+    preserved = drift_idx - len(p1b)
+    assert replaced[0].loss_mask == (
+        [1] * preserved + [0] * (len(p2b) - drift_idx) + [1] * len(r2b)
+    )
     _check_invariants(forked)
     _check_invariants(replaced)
     print("PASS 4.6")
+
+
+def test_4_7_large_prompt_expansion_realigns_not_fork():
+    """Offload-style prompt expansion must REALIGN (keep prefix loss), not force-FORK.
+
+    After mid-turn GLM embed, the next turn's prompt often expands far beyond the
+    held response (rewritten assistant echo + tool results). With prefix-preserving
+    REALIGN, that expansion stays in one sample: matching response prefix keeps
+    loss=1; only the drifted suffix + new prompt tail are loss=0.
+    """
+    mgr = TrajectoryManager(fork_threshold_tokens=1024)
+    sid = "4.7"
+    s, u = sys_msg("S"), usr_msg("u")
+    p1 = render_prompt([s, u])
+    # Short SLM-like response (trainable), then we will expand the next prompt a lot.
+    r1 = [9001, 9002, 9003, 9004]
+    mgr.record_turn(
+        sid,
+        turn=turn(p1, r1, finish_reason="tool_calls", logprobs=[-0.5] * len(r1)),
+        prompt_messages=messages([s, u]),
+        response_message={"role": "assistant", "content": "a1"},
+    )
+    a1m = {"role": "assistant", "content": "a1"}
+    tm = tool_msg("t")
+    # Honest echo of r1, then a huge synthetic expansion (>> held_resp_len) + tool.
+    glm_like = list(range(9500, 9500 + 200))
+    p2_honest = p1 + r1 + glm_like + tm.render() + [_GEN]
+    assert len(p2_honest) - len(p1) > 2 * len(r1) + 32  # would have tripped old expand_slack
+    # Small drift inside r1 so we take REALIGN rather than CLEAN.
+    drift_idx = len(p1) + len(r1) - 1
+    p2 = drift_replace(p2_honest, drift_idx)
+    r2 = [9100, 9101]
+    mgr.record_turn(
+        sid,
+        turn=turn(p2, r2, finish_reason="stop", logprobs=[-0.4] * len(r2)),
+        prompt_messages=[*messages([s, u]), a1m, tm.message],
+        response_message={"role": "assistant", "content": "done"},
+    )
+    samples = get_traj(mgr, sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
+    assert len(samples) == 1, f"large expansion should REALIGN into one sample, got {len(samples)}"
+    preserved = drift_idx - len(p1)
+    assert samples[0].loss_mask == (
+        [1] * preserved + [0] * (len(p2) - drift_idx) + [1] * len(r2)
+    )
+    _check_invariants(samples)
+    _record("4.7 large prompt expansion -> realign keep prefix", mgr, sid, samples)
+    print("PASS 4.7")
 
 
 # ===========================================================================
@@ -1367,6 +1800,14 @@ _CASES = [
     test_3_6_tree_fork_plus_token_drift,
     test_3_7_deep_multi_leaf_dedup,
     test_3_8_long_mixed_session,
+    test_3_9_restore_echo_keeps_turn_trainable,
+    test_3_10_restore_echo_from_whitespace_alone,
+    test_3_11_restore_echo_with_either_default_polarity,
+    test_3_12_no_schema_falls_back_to_stricter_matching,
+    test_3_13_restore_declines_anything_but_an_echo,
+    test_3_14_restore_across_a_long_rewriting_session,
+    test_3_15_restore_ignores_openai_wire_ids,
+    test_3_16_tip_regen_supersedes_and_returns_flag,
     test_4_2_logprobs_length_mismatch_raises,
     test_4_3_empty_prompt_messages_skipped,
     test_4_4_default_base_sample,

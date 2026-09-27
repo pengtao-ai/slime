@@ -81,6 +81,14 @@ fi
 # ============ context length ============
 MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-160000}"
 MAX_GEN_LEN="${MAX_GEN_LEN:-160000}"
+# Claude Code should compact before slime's max_context_tokens; keep 20k headroom.
+if [[ -z "${AUTO_COMPACT_WINDOW:-}" ]]; then
+  if (( MAX_CONTEXT_LEN > 160000 )); then
+    AUTO_COMPACT_WINDOW=$((MAX_CONTEXT_LEN - 20000))
+  else
+    AUTO_COMPACT_WINDOW="${MAX_CONTEXT_LEN}"
+  fi
+fi
 # Per-GPU token budget after CP split. Sync uses MAX/4 with CP=4.
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-$((MAX_CONTEXT_LEN / CP_SIZE))}"
 # Megatron asserts seq_length % (2 * CP) == 0. Align up when needed
@@ -100,6 +108,10 @@ PROMPT_DATA="${PROMPT_DATA:-${SCRIPT_DIR}/data/swe_train_scaleswe_200.jsonl}"
 
 # Fan-out defaults (docker_async wrapper may override).
 export SLIME_AGENT_E2B_USE_TEMPLATE="${SLIME_AGENT_E2B_USE_TEMPLATE:-0}"
+# Sandbox pool: prefetch next-batch containers during current rollout (default on).
+# SANDBOX_POOL_MAX defaults to 2 * ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT
+# (current in-flight + next-step warm).
+export SANDBOX_POOL="${SANDBOX_POOL:-1}"
 if [[ "${SLIME_AGENT_E2B_USE_TEMPLATE}" == "1" ]]; then
   ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-1}"
   N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-2}"
@@ -111,6 +123,7 @@ else
   GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))}"
   SWE_BOOT_CONCURRENCY="${SWE_BOOT_CONCURRENCY:-16}"
 fi
+export SANDBOX_POOL_MAX="${SANDBOX_POOL_MAX:-$((2 * ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))}"
 
 EXP_TAG="${EXP_TAG:-agent_only_qwen35_4b_async}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
@@ -118,7 +131,8 @@ RUN_ROOT="${RUN_ROOT:-${SLIME_DIR}/runs/${EXP_TAG}_${STAMP}}"
 SAVE_DIR="${SAVE_DIR:-${RUN_ROOT}/checkpoints}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-10}"
 UPDATE_WEIGHTS_INTERVAL="${UPDATE_WEIGHTS_INTERVAL:-1}"
-# eos/pad; offload launchers append <|/llm_offload|> id (e.g. 248078).
+# eos/pad; offload constrained decode uses OPEN (248077) as free-phase stop.
+# CLOSE is applied only on the ebnf continuation (see OFFLOAD_CONSTRAINED_DECODE).
 ROLLOUT_STOP_TOKEN_IDS="${ROLLOUT_STOP_TOKEN_IDS:-248046 248044}"
 
 # ============ logging ============
@@ -129,8 +143,9 @@ echo "======================================================================"
 echo "Async training log: ${LOG_FILE}"
 echo "RUN_ROOT=${RUN_ROOT}"
 echo "SAVE_DIR=${SAVE_DIR}  LOAD=${SAVE_DIR}  SAVE_INTERVAL=${SAVE_INTERVAL}"
-echo "ACTOR_GPUS=${ACTOR_GPUS} ROLLOUT_GPUS=${ROLLOUT_GPUS} (TP=${TP_SIZE} PP=${PP_SIZE} CP=${CP_SIZE} DP=${DP_SIZE} seq=${SEQ_LENGTH} max_tokens/gpu=${MAX_TOKENS_PER_GPU})"
+echo "ACTOR_GPUS=${ACTOR_GPUS} ROLLOUT_GPUS=${ROLLOUT_GPUS} (TP=${TP_SIZE} PP=${PP_SIZE} CP=${CP_SIZE} DP=${DP_SIZE} seq=${SEQ_LENGTH} max_context=${MAX_CONTEXT_LEN} autoCompact=${AUTO_COMPACT_WINDOW} max_tokens/gpu=${MAX_TOKENS_PER_GPU})"
 echo "ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE} N_SAMPLES=${N_SAMPLES_PER_PROMPT} GLOBAL_BATCH=${GLOBAL_BATCH_SIZE}"
+echo "SANDBOX_POOL=${SANDBOX_POOL} SANDBOX_POOL_MAX=${SANDBOX_POOL_MAX} SWE_BOOT_CONCURRENCY=${SWE_BOOT_CONCURRENCY}"
 echo "QWEN_GDN_BACKEND=${QWEN_GDN_BACKEND}"
 echo "SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS=${SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS:-160000}"
 echo "======================================================================"
@@ -151,6 +166,7 @@ CKPT_ARGS=(
 
 ROLLOUT_ARGS=(
    --custom-generate-function-path examples.coding_agent_rl.generate.generate
+   --rollout-function-path examples.coding_agent_rl.rollout_with_pool.generate_rollout
    --custom-rollout-log-function-path examples.coding_agent_rl.scripts.log_rollout_timeline.log_rollout_timeline
    --prompt-data "${PROMPT_DATA}"
    --input-key prompt
@@ -243,6 +259,18 @@ MISC_ARGS=(
    --attention-backend flash
 )
 
+# W&B: enable when WANDB_API_KEY is exported by the launcher.
+if [[ -n "${WANDB_API_KEY:-}" ]]; then
+  MISC_ARGS+=(
+    --use-wandb
+    --wandb-key "${WANDB_API_KEY}"
+    --wandb-project "${WANDB_PROJECT:-swe-slime}"
+    --wandb-group "${WANDB_GROUP:-${EXP_TAG:-coding_agent_rl}}"
+    --disable-wandb-random-suffix
+  )
+  echo "W&B enabled: project=${WANDB_PROJECT:-swe-slime} group=${WANDB_GROUP:-${EXP_TAG:-coding_agent_rl}}"
+fi
+
 # Optional CUDA memory snapshot (rank 0 only; see slime/utils/profile_utils.py).
 RECORD_MEMORY_HISTORY="${RECORD_MEMORY_HISTORY:-0}"
 if [[ "${RECORD_MEMORY_HISTORY}" == "1" ]]; then
@@ -297,7 +325,8 @@ export ADAPTER_MAX_TURNS_PER_SID="${ADAPTER_MAX_TURNS_PER_SID:-64}"
 # Higher = fewer TOKEN_FORK segments (more REALIGN / rewrite-merge); default was 1024.
 export SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS="${SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS:-160000}"
 
-SETTINGS_JSON='{"permissions":{"defaultMode":"bypassPermissions"},"autoCompactEnabled":true,"autoCompactWindow":160000}'
+# autoCompactWindow = MAX_CONTEXT_LEN - 20k so the CLI compacts before slime rejects.
+SETTINGS_JSON="{\"permissions\":{\"defaultMode\":\"bypassPermissions\"},\"autoCompactEnabled\":true,\"autoCompactWindow\":${AUTO_COMPACT_WINDOW}}"
 AGENTS_JSON='{"investigator":{"description":"Searches the repo for relevant files before any edit","prompt":"You are an investigator sub-agent. Use Grep/Read/Glob to find every file relevant to the user task, then return a short bulleted summary. Do NOT edit anything.","tools":["Grep","Read","Glob"]}}'
 export SLIME_AGENT_CC_EXTRA_ARGS="--settings '${SETTINGS_JSON}' --disable-slash-commands --agents '${AGENTS_JSON}' --disallowedTools WebFetch WebSearch"
 if [[ -z "${SLIME_AGENT_CC_EXTRA_ENVS:-}" ]]; then
@@ -348,19 +377,18 @@ keys = (
     "DASHSCOPE_API_KEY", "OPENAI_API_KEY",
     "DASHSCOPE_BASE_URL", "DASHSCOPE_MODEL",
     "OFFLOAD_EFFICIENCY_LAMBDA", "OFFLOAD_MAX_TOKENS",
-    "OFFLOAD_THINK_FORMAT_PENALTY", "OFFLOAD_MALFORMED_PENALTY",
+    "OFFLOAD_MALFORMED_PENALTY",
     "OFFLOAD_REWARD_MODE", "OFFLOAD_SEEK_ALPHA",
-    "OFFLOAD_SEEK_EMPTY_SCALE", "OFFLOAD_UNIQUE_SOLVER_BONUS",
     "OFFLOAD_COST_SMALL_PROMPT", "OFFLOAD_COST_SMALL_OUTPUT",
     "OFFLOAD_COST_GLM_INPUT", "OFFLOAD_COST_GLM_OUTPUT",
     "OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG",
-    "OFFLOAD_SEEK_SOLO_SCALE",
     "OFFLOAD_SEEK_BUDGET", "OFFLOAD_SEEK_BUDGET_TURN_K",
     "OFFLOAD_SEEK_BUDGET_DECAY", "OFFLOAD_SEEK_OVERAGE_PENALTY",
-    "OFFLOAD_TURN_PENALTY_COEF", "OFFLOAD_TURN_PENALTY_REF",
     "OFFLOAD_SOLVED_REWARD_FLOOR",
-    "OFFLOAD_COMPACT_ORPHAN_OPEN_K", "OFFLOAD_COMPACT_OPEN_CLOSE_RATIO",
     "OFFLOAD_STOP_TOKEN_ID", "ROLLOUT_STOP_TOKEN_IDS",
+    "OFFLOAD_CONSTRAINED_DECODE",
+    "OFFLOAD_OPEN_TOKEN_ID", "OFFLOAD_CLOSE_TOKEN_ID",
+    "OFFLOAD_CLOSE_LOGIT_BIAS", "OFFLOAD_EBNF_MAX_NEW_TOKENS",
     "SLIME_AGENT_OFFLOAD_SYSTEM_APPEND",
     "SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS",
     "GIGPO_W", "GIGPO_GAMMA", "GIGPO_TURN_RESIDUAL_W",

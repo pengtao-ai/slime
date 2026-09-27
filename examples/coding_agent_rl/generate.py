@@ -5,8 +5,9 @@
 generate() is a four-stage orchestrator: swe.prepare_workspace + harness.run
 -> swe.git_diff -> swe.run_evaluation -> adapter.finish_session. The harness is
 chosen per sample via ``metadata.agent`` (fallback: ``SWE_AGENT`` env); see
-``agents_registry``. All agents except ``codex`` use the Anthropic (CC) adapter;
-``codex`` uses the OpenAI adapter. Both protocols share one HTTP server.
+``agents_registry``. ``claude_code`` / ``opencode`` use the Anthropic adapter;
+``codex`` / ``pi`` / ``miniswe`` use the OpenAI adapter. Both protocols share one
+HTTP server.
 Sandbox-side work is split across three layers: the provider-agnostic sandbox
 contract (slime.agent.sandbox), the swappable harness lifecycle
 (slime.agent.harness), and the SWE task layer (examples.coding_agent_rl.swe --
@@ -46,7 +47,7 @@ from slime.utils.misc import SingletonMeta
 from slime.utils.processing_utils import load_tokenizer
 from slime.utils.types import Sample
 
-from . import offload, swe
+from . import offload, sandbox_pool, swe
 from .agents_registry import AdapterProtocol, resolve_agent
 
 logger = logging.getLogger(__name__)
@@ -148,6 +149,7 @@ class SweConfig:
     adapter_bind_host: str
     adapter_port: int
     fork_merge_threshold: int | None
+    preserve_reasoning_history: bool
     agent_time_budget_sec: int
     eval_timeout_sec: int
     rollout_guard_sec: int
@@ -160,6 +162,12 @@ class SweConfig:
         eval_timeout = int(os.environ.get("SWE_EVAL_TIMEOUT_SEC", "600"))
         guard = int(os.environ.get("SWE_ROLLOUT_GUARD_SEC", "0") or 0) or (agent_time_budget + eval_timeout + 180)
         fork = int(v) if (v := os.environ.get("SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS")) else None
+        preserve_reasoning = os.environ.get("SLIME_PRESERVE_REASONING_HISTORY", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         return cls(
             eval_protocol=os.environ.get("SWE_EVAL_PROTOCOL", swe.PROTOCOL_SCALESWE),
             train_protocol=os.environ.get("SWE_TRAIN_PROTOCOL", swe.PROTOCOL_SCALESWE),
@@ -168,6 +176,7 @@ class SweConfig:
             adapter_bind_host=os.environ.get("ADAPTER_BIND_HOST", "0.0.0.0"),
             adapter_port=int(os.environ.get("ADAPTER_PORT", "18001")),
             fork_merge_threshold=fork,
+            preserve_reasoning_history=preserve_reasoning,
             agent_time_budget_sec=agent_time_budget,
             eval_timeout_sec=eval_timeout,
             rollout_guard_sec=guard,
@@ -179,6 +188,7 @@ class SweConfig:
 CONFIG = SweConfig.from_env()
 
 _BOOT_SEM = asyncio.Semaphore(CONFIG.boot_concurrency)
+sandbox_pool.set_boot_sem(_BOOT_SEM)
 
 
 def _sample_tid(sample: Sample, session_id: str) -> int:
@@ -224,59 +234,113 @@ async def boot_agent_sandbox(
     from host tarballs, retry transient boot/install failures, and close the
     sandbox when the caller leaves the context.
 
-    Records ``boot_wait`` (semaphore queue) and ``boot_sandbox`` (create+install)
-    as separate Chrome Trace spans.
+    When ``SANDBOX_POOL`` is enabled (default), **wait** for a pre-warmed
+    sandbox (starting an on-demand warm if needed). Cold-boot only if the
+    wait times out (``SANDBOX_POOL_ACQUIRE_TIMEOUT_SEC``, default 600s).
+
+    Records ``boot_wait`` (pool wait / semaphore queue) and ``boot_sandbox``
+    (create+install, or near-zero on pool hit) as separate Chrome Trace spans.
     """
     sb = None
-    last_err: Exception | None = None
-    for attempt in range(CONFIG.boot_retries):
-        cand = make_sandbox(image)
-        try:
-            with chrome_span(events, "boot_wait", cat="outer", tid=tid, args={"instance_id": instance_id}):
-                await _BOOT_SEM.acquire()
-            try:
-                with chrome_span(
-                    events,
-                    "boot_sandbox",
-                    cat="outer",
-                    tid=tid,
-                    args={"instance_id": instance_id, "attempt": attempt + 1, "agent": harness.name},
-                ):
-                    await cand.__aenter__()
-                    logger.info(
-                        "[coding_agent_rl] %s: sandbox_id=%s image=%s agent=%s",
-                        instance_id,
-                        cand.sandbox_id,
-                        image,
-                        harness.name,
-                    )
-                    try:
-                        await harness.install_cli(cand)
-                    except BaseException:
-                        await cand.__aexit__(None, None, None)
-                        raise
-            finally:
-                _BOOT_SEM.release()
-            sb = cand
-            break
-        except Exception as e:
-            last_err = e
+    from_pool = False
+    pool = sandbox_pool.get_pool() if sandbox_pool.pool_enabled() else None
+
+    if pool is not None:
+        with chrome_span(
+            events,
+            "boot_wait",
+            cat="outer",
+            tid=tid,
+            args={"instance_id": instance_id, "pool": True},
+        ):
+            hit = await pool.acquire(image, harness.name)
+        if hit is not None:
+            with chrome_span(
+                events,
+                "boot_sandbox",
+                cat="outer",
+                tid=tid,
+                args={
+                    "instance_id": instance_id,
+                    "agent": harness.name,
+                    "pool_hit": True,
+                },
+            ):
+                sb = hit
+                from_pool = True
+                logger.info(
+                    "[coding_agent_rl] %s: pool_hit sandbox_id=%s image=%s agent=%s",
+                    instance_id,
+                    getattr(sb, "sandbox_id", ""),
+                    image,
+                    harness.name,
+                )
+        else:
             logger.warning(
-                "[coding_agent_rl] %s: provision attempt %d/%d failed: %s: %s",
+                "[coding_agent_rl] %s: pool wait timed out; falling back to cold boot image=%s agent=%s",
                 instance_id,
-                attempt + 1,
-                CONFIG.boot_retries,
-                type(e).__name__,
-                str(e)[:200],
+                image,
+                harness.name,
             )
-            await asyncio.sleep(1 + attempt + random.random())
+
     if sb is None:
-        assert last_err is not None
-        raise last_err
+        last_err: Exception | None = None
+        for attempt in range(CONFIG.boot_retries):
+            cand = make_sandbox(image)
+            try:
+                with chrome_span(events, "boot_wait", cat="outer", tid=tid, args={"instance_id": instance_id}):
+                    await _BOOT_SEM.acquire()
+                try:
+                    with chrome_span(
+                        events,
+                        "boot_sandbox",
+                        cat="outer",
+                        tid=tid,
+                        args={
+                            "instance_id": instance_id,
+                            "attempt": attempt + 1,
+                            "agent": harness.name,
+                            "pool_hit": False,
+                        },
+                    ):
+                        await cand.__aenter__()
+                        logger.info(
+                            "[coding_agent_rl] %s: sandbox_id=%s image=%s agent=%s",
+                            instance_id,
+                            cand.sandbox_id,
+                            image,
+                            harness.name,
+                        )
+                        try:
+                            await harness.install_cli(cand)
+                        except BaseException:
+                            await cand.__aexit__(None, None, None)
+                            raise
+                finally:
+                    _BOOT_SEM.release()
+                sb = cand
+                break
+            except Exception as e:
+                last_err = e
+                logger.warning(
+                    "[coding_agent_rl] %s: provision attempt %d/%d failed: %s: %s",
+                    instance_id,
+                    attempt + 1,
+                    CONFIG.boot_retries,
+                    type(e).__name__,
+                    str(e)[:200],
+                )
+                await asyncio.sleep(1 + attempt + random.random())
+        if sb is None:
+            assert last_err is not None
+            raise last_err
     try:
         yield sb
     finally:
-        await sb.__aexit__(None, None, None)
+        if from_pool and pool is not None:
+            await pool.release(sb)
+        else:
+            await sb.__aexit__(None, None, None)
 
 
 class _AdapterService(metaclass=SingletonMeta):
@@ -300,6 +364,7 @@ class _AdapterService(metaclass=SingletonMeta):
             sglang_url=sglang_url,
             tool_parser=self.tool_parser,
             reasoning_parser=self.reasoning_parser,
+            preserve_reasoning_history=CONFIG.preserve_reasoning_history,
             fork_threshold_tokens=CONFIG.fork_merge_threshold,
             max_turns_per_sid=max_turns,
         )
@@ -330,12 +395,14 @@ class _AdapterService(metaclass=SingletonMeta):
         else:
             self.adapter_url = f"http://{CONFIG.adapter_public_host}:{self.app_handle.port}"
         logger.info(
-            "[coding_agent_rl] tokenizer=%s adapter=%s max_context_len=%s tool_parser=%s reasoning_parser=%s",
+            "[coding_agent_rl] tokenizer=%s adapter=%s max_context_len=%s tool_parser=%s reasoning_parser=%s "
+            "preserve_reasoning_history=%s",
             args.hf_checkpoint,
             self.adapter_url,
             self.max_context_len,
             self.tool_parser,
             self.reasoning_parser,
+            CONFIG.preserve_reasoning_history,
         )
 
     def adapter_for(self, protocol: AdapterProtocol):

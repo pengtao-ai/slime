@@ -43,7 +43,7 @@ def test_resolve_agent_aliases(raw, expected):
     spec = resolve_agent(raw)
     assert spec.name == expected
     assert spec.harness_cls().name == expected
-    if expected == "codex":
+    if expected in ("codex", "pi", "miniswe"):
         assert spec.adapter_protocol == "openai"
     else:
         assert spec.adapter_protocol == "anthropic"

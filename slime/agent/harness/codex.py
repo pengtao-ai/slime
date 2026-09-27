@@ -39,6 +39,7 @@ class CodexHarness(BaseHarness):
     config_toml = (
         'model = "{model}"\n'
         'model_provider = "slime"\n'
+        "model_context_window = 160000\n"
         'approval_policy = "never"\n'
         'sandbox_mode = "danger-full-access"\n'
         "\n"

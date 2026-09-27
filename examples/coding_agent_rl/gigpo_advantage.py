@@ -201,18 +201,25 @@ def _first_shell_token(cmd: str) -> str:
     return tok.lower()
 
 
-def _shell_family_from_args(args: str) -> str:
+_SHELL_NEST_DEPTH = 8
+
+
+def _shell_family_from_args(args: str, *, _depth: int = 0) -> str:
     """Refine a shell/bash invocation from its command string."""
     raw = (args or "").strip()
     low = raw.lower()
     if not low or low in ("{}", "{ }"):
         return "Bash:empty"
+    # Guard nested ``bash``/``sh`` peel (e.g. ``/bin/bash`` kept looping when the
+    # basename matched but the leading-path strip did not shrink ``core``).
+    if _depth >= _SHELL_NEST_DEPTH:
+        return "Bash:script"
 
     # Drop leading full-line comments then retry once.
     if raw.lstrip().startswith("#"):
         rest = re.sub(r"^\s*#[^\n]*\n?", "", raw, count=1).strip()
         if rest and rest != raw:
-            return _shell_family_from_args(rest)
+            return _shell_family_from_args(rest, _depth=_depth + 1)
 
     # High-signal phrases (anywhere) before token tables.
     if "complete_task_and_submit_final_output" in low:
@@ -269,10 +276,13 @@ def _shell_family_from_args(args: str) -> str:
     if tok.endswith((".sh", ".bash")):
         return "Bash:script"
     if tok in ("bash", "sh", "zsh"):
-        rest = re.sub(rf"^{re.escape(tok)}\s+", "", core, count=1, flags=re.I).strip()
-        if rest:
-            # ``bash foo.sh`` / ``bash -lc '...'`` — classify the remainder once.
-            nested = _shell_family_from_args(rest)
+        # Peel the first argv word (``bash``, ``/bin/sh``, ``./bash``), not only
+        # a bare ``^bash\s+`` prefix — basename match alone used to leave ``core``
+        # unchanged and recurse forever.
+        m = re.match(r"^(\S+)(?:\s+(.*))?$", core, flags=re.S)
+        rest = (m.group(2) or "").strip() if m else ""
+        if rest and rest != core and rest != raw:
+            nested = _shell_family_from_args(rest, _depth=_depth + 1)
             if nested != "Bash:other":
                 return nested
             if re.search(r"\.(sh|bash)\b", rest.lower()):

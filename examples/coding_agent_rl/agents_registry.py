@@ -3,7 +3,8 @@
 Canonical names match ``BaseHarness.name``. Aliases: ``cc`` -> ``claude_code``,
 ``mini-swe-agent`` / ``mini_swe`` -> ``miniswe``.
 
-Adapter protocol is ``anthropic`` for every agent except ``codex`` (``openai``).
+Adapter protocol: ``claude_code`` / ``opencode`` use ``anthropic``;
+``codex`` / ``pi`` / ``miniswe`` use ``openai``.
 """
 
 from __future__ import annotations
@@ -48,9 +49,9 @@ class AgentSpec:
 _SPECS: dict[str, AgentSpec] = {
     "claude_code": AgentSpec("claude_code", ClaudeCodeHarness, "anthropic"),
     "codex": AgentSpec("codex", CodexHarness, "openai"),
-    "pi": AgentSpec("pi", PiHarness, "anthropic"),
+    "pi": AgentSpec("pi", PiHarness, "openai"),
     "opencode": AgentSpec("opencode", OpenCodeHarness, "anthropic"),
-    "miniswe": AgentSpec("miniswe", MiniSweHarness, "anthropic"),
+    "miniswe": AgentSpec("miniswe", MiniSweHarness, "openai"),
 }
 
 

@@ -5,7 +5,9 @@ Wire via::
     --custom-rollout-log-function-path examples.coding_agent_rl.scripts.log_rollout_timeline.log_rollout_timeline
 
 Writes ``${RUN_ROOT}/timelines/rollout_{rollout_id}.json`` (sibling of
-``rollout_dumps/``). Returns ``False`` so default slime perf logging still runs.
+``rollout_dumps/``). Also injects offload / solved W&B metrics into
+``extra_metrics`` (``rollout/offload_*``, ``rollout/solved_*``). Returns
+``False`` so default slime perf logging still runs.
 """
 
 from __future__ import annotations
@@ -61,6 +63,110 @@ def _sample_timeline(sample: Any) -> dict[str, Any] | None:
         return None
     timeline = md.get("timeline")
     return timeline if isinstance(timeline, dict) else None
+
+
+def _sample_metadata(sample: Any) -> dict[str, Any]:
+    md = getattr(sample, "metadata", None)
+    return md if isinstance(md, dict) else {}
+
+
+def _traj_key(sample: Any) -> tuple[Any, ...]:
+    """Identity for one agent trajectory (fan-out segments share this key)."""
+    md = _sample_metadata(sample)
+    gid = md.get("group_index", getattr(sample, "group_index", None))
+    idx = md.get("sample_index", getattr(sample, "index", None))
+    instance_id = md.get("instance_id")
+    return (gid, idx, instance_id)
+
+
+def _offload_stats(sample: Any) -> dict[str, Any]:
+    stats = _sample_metadata(sample).get("offload_stats")
+    return stats if isinstance(stats, dict) else {}
+
+
+def per_traj_offload_counts(samples: list[Any]) -> list[int]:
+    """One ``offload_count`` per agent traj (dedupe fan-out segments)."""
+    seen: set[tuple[Any, ...]] = set()
+    counts: list[int] = []
+    for sample in samples:
+        key = _traj_key(sample)
+        if key in seen:
+            continue
+        seen.add(key)
+        stats = _offload_stats(sample)
+        counts.append(int(stats.get("offload_count", 0) or 0))
+    return counts
+
+
+def _sample_solved(sample: Any) -> bool:
+    md = _sample_metadata(sample)
+    if md.get("grading_solved") is True:
+        return True
+    try:
+        return float(md.get("solved", 0) or 0) > 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _prompt_key(sample: Any) -> Any:
+    """Group identity for one prompt in the rollout batch (``rollout_batch_size``)."""
+    md = _sample_metadata(sample)
+    gid = md.get("group_index", getattr(sample, "group_index", None))
+    if gid is not None:
+        return gid
+    return md.get("instance_id") or md.get("label") or getattr(sample, "index", id(sample))
+
+
+def per_traj_solved_flags(samples: list[Any]) -> list[tuple[Any, bool]]:
+    """``(prompt_key, solved)`` per agent traj (dedupe fan-out segments)."""
+    seen: set[tuple[Any, ...]] = set()
+    out: list[tuple[Any, bool]] = []
+    for sample in samples:
+        key = _traj_key(sample)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((_prompt_key(sample), _sample_solved(sample)))
+    return out
+
+
+def compute_offload_rollout_metrics(samples: list[Any]) -> dict[str, float]:
+    """W&B keys under ``rollout/offload_*`` / ``rollout/solved_*`` for one batch."""
+    counts = per_traj_offload_counts(samples)
+    solved_rows = per_traj_solved_flags(samples)
+    metrics: dict[str, float] = {}
+    if counts:
+        n = len(counts)
+        total = float(sum(counts))
+        metrics.update(
+            {
+                "rollout/offload_count_mean": total / n,
+                "rollout/offload_count_max": float(max(counts)),
+                "rollout/offload_count_sum": total,
+                "rollout/offload_frac": sum(1 for c in counts if c > 0) / n,
+                "rollout/offload_n_trajs": float(n),
+            }
+        )
+    if solved_rows:
+        n_traj = len(solved_rows)
+        traj_solved = sum(1 for _, sol in solved_rows if sol)
+        by_prompt: dict[Any, list[bool]] = {}
+        for prompt_key, sol in solved_rows:
+            by_prompt.setdefault(prompt_key, []).append(sol)
+        n_prompts = len(by_prompt)
+        prompt_solved = sum(1 for flags in by_prompt.values() if any(flags))
+        metrics.update(
+            {
+                # Trajectory-level mean (e.g. 41/128).
+                "rollout/solved_mean": traj_solved / n_traj,
+                "rollout/solved_traj_count": float(traj_solved),
+                # Prompt-level (rollout_batch_size): how many of 16 are solvable.
+                "rollout/solved_prompt_frac": prompt_solved / n_prompts if n_prompts else 0.0,
+                "rollout/solved_prompt_count": float(prompt_solved),
+                "rollout/n_prompts": float(n_prompts),
+            }
+        )
+    return metrics
 
 
 def build_chrome_trace(samples: list[Any], *, rollout_id: int) -> dict[str, Any]:
@@ -138,6 +244,17 @@ def log_rollout_timeline(
     out_path = out_dir / f"rollout_{rollout_id}.json"
     out_path.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
 
+    offload_metrics = compute_offload_rollout_metrics(flat)
+    if offload_metrics and isinstance(extra_metrics, dict):
+        extra_metrics.update(offload_metrics)
+    elif offload_metrics:
+        # Debug-load path may pass metrics=None; still emit W&B/TB points.
+        from slime.utils import logging_utils
+        from slime.utils.metric_utils import compute_rollout_step
+
+        step = compute_rollout_step(args, rollout_id)
+        logging_utils.log(args, {**offload_metrics, "rollout/step": step}, step_key="rollout/step")
+
     n_events = len(doc["traceEvents"])
     ts_values = [float(e["ts"]) for e in doc["traceEvents"] if e.get("ph") in {"B", "E"} and "ts" in e]
     wall_range = ""
@@ -145,12 +262,18 @@ def log_rollout_timeline(
         wall_range = f" ts_us=[{min(ts_values):.0f},{max(ts_values):.0f}]"
     logger.info(
         "[coding_agent_timeline] rollout=%s path=%s n_samples=%d n_events=%d "
-        "rollout_time=%.1fs%s",
+        "rollout_time=%.1fs offload_mean=%.2f offload_frac=%.2f "
+        "solved_mean=%.3f solved_prompt=%s/%s%s",
         rollout_id,
         out_path,
         doc.get("meta_n_samples_with_timeline", 0),
         n_events,
         float(rollout_time or 0.0),
+        float(offload_metrics.get("rollout/offload_count_mean", 0.0)),
+        float(offload_metrics.get("rollout/offload_frac", 0.0)),
+        float(offload_metrics.get("rollout/solved_mean", 0.0)),
+        int(offload_metrics.get("rollout/solved_prompt_count", 0.0)),
+        int(offload_metrics.get("rollout/n_prompts", 0.0)),
         wall_range,
     )
     # False => keep default slime perf / rollout metric logging.

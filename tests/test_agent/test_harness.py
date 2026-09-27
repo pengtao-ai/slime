@@ -26,7 +26,13 @@ if str(REPO_ROOT) not in sys.path:
 from tests.test_agent._fakes import FakeSandbox  # noqa: E402
 
 from slime.agent import sandbox as sandbox_mod  # noqa: E402
-from slime.agent.harness import ClaudeCodeHarness, CodexHarness, HarnessContext  # noqa: E402
+from slime.agent.harness import (
+    ClaudeCodeHarness,
+    CodexHarness,
+    HarnessContext,
+    MiniSweHarness,
+    PiHarness,
+)  # noqa: E402
 from slime.agent.harness import common as hc  # noqa: E402
 
 NUM_GPUS = 0
@@ -157,6 +163,7 @@ def test_codex_write_config_base64_roundtrips_inline_base_url():
         b64 = cmd.split("echo ")[1].split(" | base64")[0].strip("'")
         toml = base64.b64decode(b64).decode()
         assert 'base_url = "http://host:18001/v1"' in toml  # MUST be inline
+        assert "model_context_window = 160000" in toml
         assert 'wire_api = "chat"' in toml
         assert 'model_provider = "slime"' in toml
         assert 'approval_policy = "never"' in toml
@@ -185,6 +192,72 @@ def test_codex_launch_command_and_env():
         env = captured["env"]
         assert env["OPENAI_API_KEY"] == "sess-cx"
         assert env["OPENAI_BASE_URL"] == "http://host:18001/v1"
+
+    asyncio.run(run_case())
+
+
+# ===========================================================================
+# §3b PiHarness / MiniSweHarness OpenAI wiring
+# ===========================================================================
+
+
+def test_pi_write_config_and_launch_use_openai():
+    async def run_case():
+        sb = FakeSandbox()
+        await PiHarness().write_config(sb, _ctx(sid="sess-pi", url="http://host:18001"))
+        joined = " ".join(cmd for cmd, _ in sb.exec_log)
+        assert "/home/agent/.pi/agent/models.json" in joined
+        assert "openai-completions" in joined
+        assert "http://host:18001/v1" in joined
+        assert '"api":"openai-completions"' in joined or "openai-completions" in joined
+
+        captured = {}
+
+        async def agent(env):
+            captured["env"] = env
+            return 0
+
+        launching = FakeSandbox(on_launch=agent)
+        with patch.object(hc.asyncio, "sleep", new=_fast_sleep):
+            rc = await PiHarness().launch_and_wait(
+                launching, _ctx(sid="sess-pi", url="http://host:18001"), prompt="fix", time_budget_sec=30
+            )
+        assert rc == 0
+        body = next(v for k, v in launching.files.items() if k.endswith("run.sh"))
+        assert "--provider openai" in body
+        env = captured["env"]
+        assert env["OPENAI_API_KEY"] == "sess-pi"
+        assert env["OPENAI_BASE_URL"] == "http://host:18001/v1"
+
+    asyncio.run(run_case())
+
+
+def test_miniswe_write_config_and_launch_use_openai():
+    async def run_case():
+        sb = FakeSandbox()
+        await MiniSweHarness().write_config(sb, _ctx(sid="sess-ms", url="http://host:18001"))
+        text = sb.files[MiniSweHarness.config_path]
+        assert "openai/" in text
+        assert "http://host:18001/v1" in text
+        assert "max_input_tokens: 160000" in text
+        assert "anthropic/" not in text
+
+        captured = {}
+
+        async def agent(env):
+            captured["env"] = env
+            return 0
+
+        launching = FakeSandbox(on_launch=agent)
+        with patch.object(hc.asyncio, "sleep", new=_fast_sleep):
+            rc = await MiniSweHarness().launch_and_wait(
+                launching, _ctx(sid="sess-ms", url="http://host:18001"), prompt="fix", time_budget_sec=30
+            )
+        assert rc == 0
+        env = captured["env"]
+        assert env["OPENAI_API_KEY"] == "sess-ms"
+        assert env["OPENAI_BASE_URL"] == "http://host:18001/v1"
+        assert "ANTHROPIC_BASE_URL" not in env
 
     asyncio.run(run_case())
 

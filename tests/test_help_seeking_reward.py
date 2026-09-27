@@ -1,4 +1,4 @@
-"""Unit tests for offload.help_seeking_reward."""
+"""Unit tests for help_seeking / turn-α offload rewards."""
 
 from __future__ import annotations
 
@@ -12,15 +12,15 @@ NUM_GPUS = 0
 
 
 @pytest.fixture(autouse=True)
-def _clear_seek_budget_env(monkeypatch):
+def _clear_reward_env(monkeypatch):
     for key in (
         "OFFLOAD_SEEK_BUDGET",
         "OFFLOAD_SEEK_BUDGET_TURN_K",
         "OFFLOAD_SEEK_BUDGET_DECAY",
         "OFFLOAD_SEEK_OVERAGE_PENALTY",
-        "OFFLOAD_TURN_PENALTY_COEF",
-        "OFFLOAD_TURN_PENALTY_REF",
         "OFFLOAD_SOLVED_REWARD_FLOOR",
+        "OFFLOAD_SEEK_ALPHA",
+        "OFFLOAD_MALFORMED_PENALTY",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -34,183 +34,6 @@ def _stats(*, oc: int = 0, outside: int = 0, small_o: int = 100, glm_o: int = 0)
         "glm_input_tokens": 500 if oc else 0,
         "glm_output_tokens": glm_o if oc else 0,
     }
-
-
-def _sample(*, reward: float, solved: float, oc: int = 0, outside: int = 0, empty_patch: bool = False):
-    return SimpleNamespace(
-        reward=reward,
-        metadata={
-            "solved": solved,
-            "grading_solved": solved == 1.0,
-            "empty_patch": empty_patch,
-            "offload_stats": _stats(oc=oc, outside=outside),
-        },
-    )
-
-
-def test_unsolved_no_offload_is_zero():
-    assert offload.help_seeking_reward(0.0, _stats(oc=0), alpha=0.1) == 0.0
-
-
-def test_unsolved_in_think_offload_gets_alpha():
-    assert offload.help_seeking_reward(0.0, _stats(oc=2), alpha=0.1) == pytest.approx(0.1)
-
-
-def test_unsolved_encourage_seek_false_is_zero():
-    assert (
-        offload.help_seeking_reward(0.0, _stats(oc=2), alpha=0.1, encourage_seek=False) == 0.0
-    )
-
-
-def test_unsolved_empty_patch_scales_alpha():
-    r = offload.help_seeking_reward(
-        0.0, _stats(oc=1), alpha=0.1, empty_patch=True, empty_scale=0.5
-    )
-    assert r == pytest.approx(0.05)
-
-
-def test_unsolved_outside_think_gets_zero():
-    assert offload.help_seeking_reward(0.0, _stats(oc=3, outside=1), alpha=0.1) == 0.0
-
-
-def test_solved_matches_cost_aware_without_unique_bonus():
-    st = _stats(oc=1, glm_o=50)
-    a = offload.cost_aware_reward(1.0, st, usage=None, lam=0.05)
-    b = offload.help_seeking_reward(1.0, st, usage=None, lam=0.05)
-    assert b == pytest.approx(a)
-    assert 0.0 < b < 1.0
-
-
-def test_unique_solver_bonus():
-    st = _stats(oc=1, glm_o=10)
-    base = offload.help_seeking_reward(1.0, st, usage=None, lam=0.05)
-    bumped = offload.help_seeking_reward(
-        1.0, st, usage=None, lam=0.05, unique_solver=True, unique_bonus=0.15
-    )
-    assert bumped == pytest.approx(base + 0.15)
-
-
-def test_apply_unique_solver_bonus_sole_solver(monkeypatch):
-    monkeypatch.setenv("OFFLOAD_UNIQUE_SOLVER_BONUS", "0.15")
-    winner = _sample(reward=0.7, solved=1.0, oc=0)
-    loser = _sample(reward=0.0, solved=0.0, oc=1)
-    offload.apply_unique_solver_bonus(None, [[winner, loser]])
-    assert winner.reward == pytest.approx(0.85)
-    assert winner.metadata.get("unique_solver") is True
-    assert loser.reward == 0.0
-    assert not loser.metadata.get("unique_solver")
-
-
-def test_apply_unique_solver_bonus_skips_when_two_solved(monkeypatch):
-    monkeypatch.setenv("OFFLOAD_UNIQUE_SOLVER_BONUS", "0.15")
-    a = _sample(reward=0.7, solved=1.0, oc=0)
-    b = _sample(reward=0.6, solved=1.0, oc=1)
-    offload.apply_unique_solver_bonus(None, [[a, b]])
-    assert a.reward == pytest.approx(0.7)
-    assert b.reward == pytest.approx(0.6)
-
-
-def test_cost_rates_read_env_at_call_time(monkeypatch):
-    monkeypatch.setenv("OFFLOAD_COST_GLM_OUTPUT", "9.0")
-    assert offload.cost_glm_output() == pytest.approx(9.0)
-    monkeypatch.setenv("OFFLOAD_COST_GLM_OUTPUT", "1.32")
-    assert offload.cost_glm_output() == pytest.approx(1.32)
-
-
-def test_reward_mode_help_seeking(monkeypatch):
-    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
-    assert offload.reward_mode() == "help_seeking"
-    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "cost_aware")
-    assert offload.reward_mode() == "cost_aware"
-
-
-def test_shape_group_all_wrong_grants_alpha(monkeypatch):
-    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
-    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
-    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
-    a = _sample(reward=0.0, solved=0.0, oc=1)
-    b = _sample(reward=0.0, solved=0.0, oc=0)
-    offload.shape_group_help_seeking_rewards(None, [[a, b]])
-    assert a.reward == pytest.approx(0.1)
-    assert b.reward == 0.0
-
-
-def test_shape_group_solo_solved_scales_alpha(monkeypatch):
-    """Sibling solved without offload → discounted α (not full withhold)."""
-    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
-    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
-    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
-    monkeypatch.setenv("OFFLOAD_SEEK_SOLO_SCALE", "0.3")
-    failed_offload = _sample(reward=0.0, solved=0.0, oc=2)
-    solved_solo = _sample(reward=0.9, solved=1.0, oc=0)
-    offload.shape_group_help_seeking_rewards(None, [[failed_offload, solved_solo]])
-    assert failed_offload.reward == pytest.approx(0.03)
-    assert solved_solo.reward == pytest.approx(0.9)
-
-
-def test_shape_group_solo_scale_zero_withholds(monkeypatch):
-    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
-    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
-    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
-    monkeypatch.setenv("OFFLOAD_SEEK_SOLO_SCALE", "0")
-    failed_offload = _sample(reward=0.0, solved=0.0, oc=2)
-    solved_solo = _sample(reward=0.9, solved=1.0, oc=0)
-    offload.shape_group_help_seeking_rewards(None, [[failed_offload, solved_solo]])
-    assert failed_offload.reward == 0.0
-    assert solved_solo.reward == pytest.approx(0.9)
-
-
-def test_shape_group_solved_with_offload_still_grants_alpha(monkeypatch):
-    """A sibling that solved *with* offload does not block α for failed seekers."""
-    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
-    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
-    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
-    failed_offload = _sample(reward=0.0, solved=0.0, oc=2)
-    solved_with_help = _sample(reward=0.8, solved=1.0, oc=3)
-    # Pretend solved path already painted turn rewards; must not be overwritten with α.
-    solved_with_help.metadata["turn_costs"] = [_turn(valid=True), _turn(valid=False)]
-    solved_with_help.metadata["turn_rewards"] = [0.7, 1.0]
-    offload.shape_group_help_seeking_rewards(None, [[failed_offload, solved_with_help]])
-    assert failed_offload.reward == pytest.approx(0.1)
-    assert solved_with_help.reward == pytest.approx(0.8)
-    assert solved_with_help.metadata["turn_rewards"] == [0.7, 1.0]
-
-
-def test_shape_group_noop_without_flag(monkeypatch):
-    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
-    monkeypatch.delenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", raising=False)
-    a = _sample(reward=0.0, solved=0.0, oc=1)
-    offload.shape_group_help_seeking_rewards(None, [[a]])
-    assert a.reward == 0.0
-
-
-def test_shape_group_fanout_segments(monkeypatch):
-    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
-    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
-    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
-    seg0 = _sample(reward=0.0, solved=0.0, oc=1)
-    seg1 = _sample(reward=0.0, solved=0.0, oc=1)
-    other = _sample(reward=0.0, solved=0.0, oc=0)
-    offload.shape_group_help_seeking_rewards(None, [[[seg0, seg1], other]])
-    assert seg0.reward == pytest.approx(0.1)
-    assert seg1.reward == pytest.approx(0.1)
-    assert other.reward == 0.0
-
-
-def test_tmax_empty_patch_does_not_scale_alpha():
-    st = _stats(oc=1)
-    r = offload.help_seeking_reward(
-        0.0, st, alpha=0.1, empty_patch=True, empty_scale=0.5, protocol="tmax"
-    )
-    assert r == pytest.approx(0.1)
-
-
-def test_scaleswe_empty_patch_scales_alpha():
-    st = _stats(oc=1)
-    r = offload.help_seeking_reward(
-        0.0, st, alpha=0.1, empty_patch=True, empty_scale=0.5, protocol="scaleswe"
-    )
-    assert r == pytest.approx(0.05)
 
 
 def _turn(*, valid=False, outside=False, orphan=0, mal=0, small_o=10, glm_o=0, opens=0, closes=0):
@@ -229,137 +52,219 @@ def _turn(*, valid=False, outside=False, orphan=0, mal=0, small_o=10, glm_o=0, o
     }
 
 
-def test_compute_turn_rewards_solved_uses_total_cost():
-    turns = [_turn(valid=True, small_o=100, glm_o=0), _turn(valid=False, small_o=100, glm_o=0)]
+def _sample(*, reward: float, solved: float, oc: int = 0, outside: int = 0, turns=None):
+    turns = turns if turns is not None else []
+    return SimpleNamespace(
+        reward=reward,
+        metadata={
+            "solved": solved,
+            "grading_solved": solved == 1.0,
+            "empty_patch": False,
+            "offload_stats": {**_stats(oc=oc, outside=outside), "turn_costs": turns},
+            "turn_costs": turns,
+            "turn_rewards": [0.0] * len(turns) if turns else [],
+        },
+    )
+
+
+def test_unsolved_episode_always_zero():
+    assert offload.help_seeking_reward(0.0, _stats(oc=2), alpha=1.0) == 0.0
+    assert offload.help_seeking_reward(0.0, _stats(oc=0), alpha=1.0) == 0.0
+
+
+def test_solved_matches_cost_aware():
+    st = _stats(oc=1, glm_o=50)
+    a = offload.cost_aware_reward(1.0, st, usage=None, lam=0.05)
+    b = offload.help_seeking_reward(1.0, st, usage=None, lam=0.05)
+    assert b == pytest.approx(a)
+    assert 0.0 < b < 1.0
+
+
+def test_solved_outside_think_does_not_cut_episode():
+    bad = _stats(oc=0, outside=1, small_o=0, glm_o=0)
+    bad["small_prompt_tokens"] = 0
+    bad["glm_input_tokens"] = 0
+    assert offload.cost_aware_reward(1.0, bad, usage=None, lam=0.0) == 1.0
+
+
+def test_reward_mode_help_seeking(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    assert offload.reward_mode() == "help_seeking"
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "cost_aware")
+    assert offload.reward_mode() == "cost_aware"
+
+
+def test_compute_turn_rewards_failed_episode_zero_with_turn_alpha(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    turns = [_turn(valid=True)] + [_turn(valid=False) for _ in range(3)]
+    stats = {"turn_costs": turns, "offload_count": 1, "offload_outside_think_count": 0}
+    out = offload.compute_turn_rewards(0.0, stats, alpha=1.0, encourage_seek=True)
+    assert out["reward"] == 0.0
+    assert out["turn_rewards"][0] == pytest.approx(1.0)
+    assert out["turn_rewards"][1:] == [0.0, 0.0, 0.0]
+
+
+def test_compute_turn_rewards_outside_and_malformed_neg(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    turns = [
+        _turn(valid=True),
+        _turn(valid=True, outside=True),
+        _turn(orphan=2, opens=2),
+    ]
+    stats = {"turn_costs": turns, "offload_count": 1, "offload_outside_think_count": 1}
+    out = offload.compute_turn_rewards(
+        0.0, stats, alpha=1.0, encourage_seek=True, malformed_pen=0.25
+    )
+    assert out["reward"] == 0.0
+    assert out["turn_rewards"][0] == pytest.approx(1.0)
+    assert out["turn_rewards"][1] == pytest.approx(-0.25)
+    assert out["turn_rewards"][2] == pytest.approx(-0.25)
+
+
+def test_compute_turn_rewards_stacks_illegal_and_legal(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    # Valid in-think offload + orphan on the same turn → α − β.
+    stacked = _turn(valid=True, orphan=1, opens=2, closes=1)
+    assert offload.turn_offload_tag_violation(stacked)
+    turns = [stacked]
+    stats = {"turn_costs": turns, "offload_count": 1}
+    out = offload.compute_turn_rewards(
+        0.0, stats, alpha=1.0, encourage_seek=True, malformed_pen=0.25
+    )
+    assert out["reward"] == 0.0
+    assert out["turn_rewards"][0] == pytest.approx(1.0 - 0.25)
+
+
+def test_compute_turn_rewards_solved_broadcast_and_turn_neg(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_SOLVED_REWARD_FLOOR", "0.0")
+    turns = [_turn(valid=False), _turn(valid=True, outside=True)]
     stats = {
         "turn_costs": turns,
         "offload_count": 1,
-        "offload_outside_think_count": 0,
-        "small_output_tokens": 200,
-    }
-    # Total traj cost once (not per-turn); lam=0 isolates cost term off.
-    out = offload.compute_turn_rewards(
-        1.0,
-        stats,
-        completion_tokens=200,
-        metadata={"completion_tokens": 200},
-        lam=0.0,
-    )
-    assert len(out["turn_rewards"]) == 2
-    assert out["turn_rewards"][0] == pytest.approx(1.0)
-    assert out["turn_rewards"][1] == pytest.approx(1.0)
-    assert out["reward"] == pytest.approx(1.0)
-
-
-def test_solved_turn_penalty_and_floor(monkeypatch):
-    monkeypatch.setenv("OFFLOAD_TURN_PENALTY_COEF", "0.15")
-    monkeypatch.setenv("OFFLOAD_TURN_PENALTY_REF", "50")
-    monkeypatch.setenv("OFFLOAD_SOLVED_REWARD_FLOOR", "0.3")
-    turns = [_turn(valid=True) for _ in range(10)]
-    stats = {
-        "turn_costs": turns,
-        "offload_count": 10,
-        "offload_outside_think_count": 0,
-        "small_output_tokens": 100,
+        "offload_outside_think_count": 1,
         "small_prompt_tokens": 0,
+        "small_output_tokens": 0,
         "glm_input_tokens": 0,
         "glm_output_tokens": 0,
     }
-    out = offload.compute_turn_rewards(1.0, stats, lam=0.0)
-    # <= REF: no turn penalty
+    out = offload.compute_turn_rewards(1.0, stats, lam=0.0, malformed_pen=0.25)
     assert out["reward"] == pytest.approx(1.0)
     assert out["turn_rewards"][0] == pytest.approx(1.0)
-
-    at_ref = offload.compute_turn_rewards(
-        1.0,
-        {
-            "turn_costs": [_turn(valid=False) for _ in range(50)],
-            "offload_count": 0,
-            "offload_outside_think_count": 0,
-            "small_output_tokens": 0,
-            "small_prompt_tokens": 0,
-            "glm_input_tokens": 0,
-            "glm_output_tokens": 0,
-        },
-        lam=0.0,
-    )
-    assert at_ref["reward"] == pytest.approx(1.0)
-
-    long_turns = [_turn(valid=False) for _ in range(200)]
-    long_stats = {
-        "turn_costs": long_turns,
-        "offload_count": 0,
-        "offload_outside_think_count": 0,
-        "small_output_tokens": 0,
-        "small_prompt_tokens": 0,
-        "glm_input_tokens": 0,
-        "glm_output_tokens": 0,
-    }
-    long_out = offload.compute_turn_rewards(1.0, long_stats, lam=0.0)
-    # 1 - 0.15 * (200-50)/50 = 0.55
-    assert long_out["reward"] == pytest.approx(0.55)
-
-    floor_turns = [_turn(valid=False) for _ in range(300)]
-    floor_stats = {
-        "turn_costs": floor_turns,
-        "offload_count": 0,
-        "offload_outside_think_count": 0,
-        "small_output_tokens": 0,
-        "small_prompt_tokens": 0,
-        "glm_input_tokens": 0,
-        "glm_output_tokens": 0,
-    }
-    floor_out = offload.compute_turn_rewards(1.0, floor_stats, lam=0.0)
-    # 1 - 0.15 * (300-50)/50 = 0.25 → floor 0.3
-    assert floor_out["reward"] == pytest.approx(0.3)
-    unsolved = offload.help_seeking_reward(0.0, _stats(oc=2), alpha=0.1)
-    assert unsolved == pytest.approx(0.1)
-    assert floor_out["reward"] > unsolved
-
-
-def test_compute_turn_rewards_malformed_negative_unsolved(monkeypatch):
-    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
-    monkeypatch.setenv("OFFLOAD_MALFORMED_PENALTY", "0.25")
-    turns = [_turn(valid=True), _turn(orphan=3, opens=3)]
-    stats = {"turn_costs": turns, "offload_count": 1, "offload_outside_think_count": 0}
-    out = offload.compute_turn_rewards(
-        0.0, stats, alpha=0.1, encourage_seek=True, malformed_pen=0.25
-    )
-    assert out["turn_rewards"][0] == pytest.approx(0.1)
     assert out["turn_rewards"][1] == pytest.approx(-0.25)
-    # One valid seek fixes the episode return; −β stays on that turn only.
-    assert out["reward"] == pytest.approx(0.1)
 
 
-def test_unsolved_seek_episode_reward_ignores_length(monkeypatch):
+def test_compute_turn_rewards_solved_stacks_legal_and_illegal(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_SOLVED_REWARD_FLOOR", "0.0")
+    stacked = _turn(valid=True, mal=1, opens=2, closes=1)
+    assert offload.turn_offload_tag_violation(stacked)
+    stats = {
+        "turn_costs": [stacked],
+        "offload_count": 1,
+        "offload_outside_think_count": 0,
+        "small_prompt_tokens": 0,
+        "small_output_tokens": 0,
+        "glm_input_tokens": 0,
+        "glm_output_tokens": 0,
+    }
+    out = offload.compute_turn_rewards(1.0, stats, lam=0.0, malformed_pen=0.25)
+    assert out["reward"] == pytest.approx(1.0)
+    assert out["turn_rewards"][0] == pytest.approx(1.0 - 0.25)
+
+
+def test_compute_turn_rewards_defer_seek(monkeypatch):
     monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
-    turns = [_turn(valid=True)] + [_turn(valid=False) for _ in range(9)]
-    stats = {"turn_costs": turns, "offload_count": 1, "offload_outside_think_count": 0}
-    out = offload.compute_turn_rewards(0.0, stats, alpha=0.1, encourage_seek=True)
-    assert out["turn_rewards"].count(0.1) == 1
-    assert out["reward"] == pytest.approx(0.1)
-
-
-def test_unsolved_without_seek_episode_reward_stays_zero(monkeypatch):
-    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
-    turns = [_turn(valid=False) for _ in range(5)]
-    stats = {"turn_costs": turns, "offload_count": 0, "offload_outside_think_count": 0}
-    out = offload.compute_turn_rewards(0.0, stats, alpha=0.1, encourage_seek=True)
+    turns = [_turn(valid=True)]
+    stats = {"turn_costs": turns, "offload_count": 1}
+    out = offload.compute_turn_rewards(0.0, stats, alpha=1.0, encourage_seek=False)
     assert out["reward"] == 0.0
+    assert out["turn_rewards"] == [0.0]
 
 
-def test_shape_group_long_failure_uses_fixed_alpha(monkeypatch):
+def test_shape_group_all_wrong_paints_turn_alpha_keeps_episode_zero(monkeypatch):
     monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
     monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
-    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
-    turns = [_turn(valid=True)] + [_turn(valid=False) for _ in range(9)]
-    s = _sample(reward=0.0, solved=0.0, oc=1)
-    s.metadata["turn_costs"] = turns
-    s.metadata["turn_rewards"] = [0.0] * len(turns)
-    s.metadata["offload_stats"] = {"offload_count": 1, "turn_costs": turns}
+    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "1.0")
+    turns_a = [_turn(valid=True), _turn(valid=False)]
+    a = _sample(reward=0.0, solved=0.0, oc=1, turns=turns_a)
+    b = _sample(reward=0.0, solved=0.0, oc=0, turns=[_turn(valid=False)])
+    offload.shape_group_help_seeking_rewards(None, [[a, b]])
+    assert a.reward == 0.0
+    assert a.metadata["turn_rewards"][0] == pytest.approx(1.0)
+    assert a.metadata["turn_rewards"][1] == 0.0
+    assert b.reward == 0.0
+
+
+def test_shape_group_partial_solved_no_turn_alpha(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
+    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "1.0")
+    failed = _sample(reward=0.0, solved=0.0, oc=2, turns=[_turn(valid=True)])
+    solved = _sample(reward=0.9, solved=1.0, oc=0, turns=[_turn(valid=False)])
+    solved.metadata["turn_rewards"] = [0.9]
+    offload.shape_group_help_seeking_rewards(None, [[failed, solved]])
+    assert failed.reward == 0.0
+    assert failed.metadata["turn_rewards"] == [0.0]
+    assert solved.reward == pytest.approx(0.9)
+
+
+def test_shape_group_stacks_malformed_and_valid(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
+    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "1.0")
+    monkeypatch.setenv("OFFLOAD_MALFORMED_PENALTY", "0.25")
+    bad = _turn(valid=True, orphan=1, opens=2, closes=1)
+    assert offload.turn_offload_tag_violation(bad)
+    s = _sample(reward=0.0, solved=0.0, oc=1, turns=[bad])
+    s.metadata["turn_rewards"] = [-0.25]
     offload.shape_group_help_seeking_rewards(None, [[s]])
-    assert s.metadata["turn_rewards"][0] == pytest.approx(0.1)
-    assert s.reward == pytest.approx(0.1)
+    assert s.metadata["turn_rewards"][0] == pytest.approx(1.0 - 0.25)
+    assert s.reward == 0.0
+
+
+def test_shape_group_malformed_only_keeps_penalty(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
+    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "1.0")
+    monkeypatch.setenv("OFFLOAD_MALFORMED_PENALTY", "0.25")
+    bad = _turn(orphan=2, opens=2)
+    assert offload.turn_offload_tag_violation(bad)
+    assert not bad["valid_offload"]
+    s = _sample(reward=0.0, solved=0.0, oc=0, turns=[bad])
+    s.metadata["turn_rewards"] = [-0.25]
+    offload.shape_group_help_seeking_rewards(None, [[s]])
+    assert s.metadata["turn_rewards"][0] == pytest.approx(-0.25)
+    assert s.reward == 0.0
+
+
+def test_shape_group_fanout_segments(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
+    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "1.0")
+    turns = [_turn(valid=True)]
+    seg0 = _sample(reward=0.0, solved=0.0, oc=1, turns=turns)
+    seg1 = _sample(reward=0.0, solved=0.0, oc=1, turns=turns)
+    other = _sample(reward=0.0, solved=0.0, oc=0, turns=[_turn(valid=False)])
+    offload.shape_group_help_seeking_rewards(None, [[[seg0, seg1], other]])
+    assert seg0.metadata["turn_rewards"][0] == pytest.approx(1.0)
+    assert seg1.metadata["turn_rewards"][0] == pytest.approx(1.0)
+    assert seg0.reward == 0.0
+
+
+def test_compact_and_shape_does_not_drop(monkeypatch):
+    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
+    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
+    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "1.0")
+    good = _sample(reward=0.0, solved=0.0, oc=1, turns=[_turn(valid=True)])
+    spam = _sample(
+        reward=0.0,
+        solved=0.0,
+        oc=0,
+        turns=[_turn(orphan=10, opens=10, closes=0)],
+    )
+    offload.compact_and_shape_group_help_seeking_rewards(None, [[good, spam]])
+    assert good.reward == 0.0
+    assert good.metadata["turn_rewards"][0] == pytest.approx(1.0)
+    assert not getattr(spam, "remove_sample", False)
 
 
 def test_analyze_offload_tags_valid_and_orphan():
@@ -367,196 +272,58 @@ def test_analyze_offload_tags_valid_and_orphan():
     tags = offload.analyze_offload_tags(raw)
     assert tags["valid_count"] == 1
     assert tags["orphan_open_count"] >= 1
-    assert tags["open_count"] == 2
-    assert tags["close_count"] == 1
-    assert "max_open_run" not in tags
 
 
-def test_analyze_offload_tags_bad_payload_is_malformed():
-    raw = "x <|llm_offload|>abc<|/llm_offload|> y"
-    tags = offload.analyze_offload_tags(raw)
-    assert tags["valid_count"] == 0
-    assert tags["malformed_count"] >= 1
+def test_default_malformed_penalty_is_008():
+    assert offload.malformed_penalty() == pytest.approx(0.08)
 
 
-def test_shape_group_keeps_malformed_penalty(monkeypatch):
-    """Format -β must not be overwritten by seek α."""
-    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
-    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
-    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
-    monkeypatch.setenv("OFFLOAD_MALFORMED_PENALTY", "0.25")
-    from slime.utils.types import Sample
+def test_default_seek_alpha_is_one():
+    assert offload.seek_alpha() == pytest.approx(1.0)
 
-    # One turn: valid offload + spam orphan on same ledger entry → violation.
-    bad = _turn(valid=True, orphan=1, opens=2, closes=1)
-    assert offload.turn_offload_tag_violation(bad)
-    s = Sample(
-        index=0,
-        prompt="p",
-        response="x",
-        response_length=10,
-        reward=0.0,
-        status=Sample.Status.COMPLETED,
-        metadata={
-            "solved": 0,
-            "empty_patch": False,
-            "turn_costs": [bad],
-            "turn_rewards": [-0.25],
-            "offload_stats": {"offload_count": 1, "turn_costs": [bad]},
-        },
+
+def test_decide_offload_valid_in_think_earns_alpha():
+    raw = f"plan {offload.OFFLOAD_OPEN}7{offload.OFFLOAD_CLOSE}"
+    assert offload.decide_offload_directive(raw) == (7, True)
+
+
+def test_decide_offload_orphan_close_fallback():
+    raw = f"stuck {offload.OFFLOAD_CLOSE}"
+    assert offload.decide_offload_directive(raw) == (3, False)
+
+
+def test_decide_offload_bad_payload_fallback():
+    raw = f"x {offload.OFFLOAD_OPEN}12{offload.OFFLOAD_CLOSE}"
+    assert offload.decide_offload_directive(raw) == (3, False)
+
+
+def test_decide_offload_orphan_open_no_call():
+    raw = f"x {offload.OFFLOAD_OPEN}"
+    assert offload.decide_offload_directive(raw) is None
+
+
+def test_decide_offload_digit_span_outside_think_no_call():
+    raw = f"</think>\nvisible {offload.OFFLOAD_OPEN}5{offload.OFFLOAD_CLOSE}"
+    assert offload.decide_offload_directive(raw) is None
+    assert offload.parse_offload_directive(raw) is not None
+
+
+def test_decide_offload_orphan_close_outside_think_no_call():
+    raw = f"</think>\n{offload.OFFLOAD_CLOSE}"
+    assert offload.decide_offload_directive(raw) is None
+    assert offload.fallback_offload_n(raw) is None
+
+
+def test_fallback_offload_no_alpha_but_still_beta():
+    """Fallback GLM turns keep valid_offload=False → -β only, no α."""
+    tc = _turn(valid=False, mal=1, closes=1, opens=0)
+    tc["fallback_offload"] = True
+    stats = {"turn_costs": [tc], "offload_count": 1, "offload_outside_think_count": 0}
+    out = offload.compute_turn_rewards(
+        0.0, stats, alpha=1.0, encourage_seek=True, malformed_pen=0.08
     )
-    offload.shape_group_help_seeking_rewards(None, [[s]])
-    assert s.metadata["turn_rewards"][0] == pytest.approx(-0.25)
-
-
-def test_compact_removes_orphan_spam():
-    from slime.utils.types import Sample
-
-    turns = [_turn(orphan=10, opens=10, closes=0, small_o=20) for _ in range(2)]
-    stats = {
-        "turn_costs": turns,
-        "offload_count": 0,
-        "offload_outside_think_count": 0,
-        "small_output_tokens": 40,
-    }
-    s = Sample(
-        index=0,
-        prompt="p",
-        response="x",
-        response_length=40,
-        status=Sample.Status.COMPLETED,
-        metadata={"offload_stats": stats},
-    )
-    remove, reason = offload.compact_should_remove_sample(s)
-    assert remove
-    assert reason == "orphan_open"
-
-
-def test_compact_removes_timeout_and_max_steps():
-    from slime.utils.types import Sample
-
-    s1 = Sample(
-        index=0,
-        prompt="p",
-        response="",
-        response_length=0,
-        status=Sample.Status.ABORTED,
-        metadata={"abort_reason": "wall_clock_timeout", "timeout": True},
-    )
-    s2 = Sample(
-        index=1,
-        prompt="p",
-        response="",
-        response_length=0,
-        status=Sample.Status.COMPLETED,
-        metadata={"max_steps_reached": True, "offload_stats": {}},
-    )
-    assert offload.compact_should_remove_sample(s1)[0]
-    assert offload.compact_should_remove_sample(s2)[0]
-
-
-def test_compact_and_shape_group(monkeypatch):
-    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
-    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
-    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
-    from slime.utils.types import Sample
-
-    good = _sample(reward=0.0, solved=0.0, oc=1)
-    spam_stats = {
-        "turn_costs": [_turn(orphan=10, opens=10, closes=0)],
-        "offload_count": 0,
-        "offload_outside_think_count": 0,
-        "small_output_tokens": 20,
-    }
-    spam = Sample(
-        index=1,
-        prompt="p",
-        response="x",
-        response_length=20,
-        reward=0.0,
-        status=Sample.Status.COMPLETED,
-        metadata={
-            "solved": 0.0,
-            "grading_solved": False,
-            "empty_patch": False,
-            "offload_stats": spam_stats,
-        },
-    )
-    offload.compact_and_shape_group_help_seeking_rewards(None, [[good, spam]])
-    assert good.reward == pytest.approx(0.1)
-    assert spam.remove_sample is True
-
-
-def test_shape_group_tmax_empty_no_scale(monkeypatch):
-    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
-    monkeypatch.setenv("OFFLOAD_SEEK_ONLY_WHEN_ALL_WRONG", "1")
-    monkeypatch.setenv("OFFLOAD_SEEK_ALPHA", "0.1")
-    monkeypatch.setenv("OFFLOAD_SEEK_EMPTY_SCALE", "0.5")
-    a = _sample(reward=0.0, solved=0.0, oc=1, empty_patch=True)
-    a.metadata["protocol"] = "tmax"
-    b = _sample(reward=0.0, solved=0.0, oc=0)
-    offload.shape_group_help_seeking_rewards(None, [[a, b]])
-    assert a.reward == pytest.approx(0.1)
-
-
-def test_resolve_seek_budget_modes(monkeypatch):
-    monkeypatch.delenv("OFFLOAD_SEEK_BUDGET", raising=False)
-    monkeypatch.delenv("OFFLOAD_SEEK_BUDGET_TURN_K", raising=False)
-    assert offload.resolve_seek_budget(12) is None
-
-    monkeypatch.setenv("OFFLOAD_SEEK_BUDGET", "4")
-    assert offload.resolve_seek_budget(12) == 4
-
-    monkeypatch.delenv("OFFLOAD_SEEK_BUDGET", raising=False)
-    monkeypatch.setenv("OFFLOAD_SEEK_BUDGET_TURN_K", "4")
-    assert offload.resolve_seek_budget(12) == 3  # 12//4
-    assert offload.resolve_seek_budget(3) == 1  # max(1, 0)
-
-    monkeypatch.setenv("OFFLOAD_SEEK_BUDGET", "2")
-    assert offload.resolve_seek_budget(12) == 2  # min(3, 2)
-
-
-def test_seek_budget_alpha_decay():
-    assert offload.seek_budget_alpha_scale(1, 2, decay=0.5) == 1.0
-    assert offload.seek_budget_alpha_scale(2, 2, decay=0.5) == 1.0
-    assert offload.seek_budget_alpha_scale(3, 2, decay=0.5) == pytest.approx(0.5)
-    assert offload.seek_budget_alpha_scale(4, 2, decay=0.5) == pytest.approx(0.25)
-    assert offload.seek_budget_alpha_scale(3, None) == 1.0
-
-
-def test_compute_turn_rewards_soft_budget_decays_alpha(monkeypatch):
-    monkeypatch.setenv("OFFLOAD_REWARD_MODE", "help_seeking")
-    monkeypatch.setenv("OFFLOAD_SEEK_BUDGET", "1")
-    monkeypatch.setenv("OFFLOAD_SEEK_BUDGET_DECAY", "0.5")
-    monkeypatch.delenv("OFFLOAD_SEEK_BUDGET_TURN_K", raising=False)
-    turns = [_turn(valid=True), _turn(valid=True), _turn(valid=False)]
-    stats = {"turn_costs": turns, "offload_count": 2, "offload_outside_think_count": 0}
-    out = offload.compute_turn_rewards(0.0, stats, alpha=0.1, encourage_seek=True)
-    assert out["seek_budget"] == 1
-    assert out["turn_rewards"][0] == pytest.approx(0.1)
-    assert out["turn_rewards"][1] == pytest.approx(0.05)
-    assert out["turn_rewards"][2] == 0.0
-
-
-def test_compute_turn_rewards_soft_budget_solved_overage(monkeypatch):
-    monkeypatch.setenv("OFFLOAD_SEEK_BUDGET", "1")
-    monkeypatch.setenv("OFFLOAD_SEEK_OVERAGE_PENALTY", "0.1")
-    monkeypatch.delenv("OFFLOAD_SEEK_BUDGET_TURN_K", raising=False)
-    turns = [_turn(valid=True, small_o=0, glm_o=0), _turn(valid=True, small_o=0, glm_o=0)]
-    stats = {"turn_costs": turns, "offload_count": 2, "offload_outside_think_count": 0}
-    out = offload.compute_turn_rewards(1.0, stats, lam=0.0)
-    # Traj-level overage once on offload_count, then broadcast.
-    assert out["turn_rewards"][0] == pytest.approx(0.9)
-    assert out["turn_rewards"][1] == pytest.approx(0.9)
-    assert out["reward"] == pytest.approx(0.9)
-
-
-def test_help_seeking_scalar_soft_budget(monkeypatch):
-    monkeypatch.setenv("OFFLOAD_SEEK_BUDGET", "1")
-    monkeypatch.setenv("OFFLOAD_SEEK_BUDGET_DECAY", "0.5")
-    monkeypatch.delenv("OFFLOAD_SEEK_BUDGET_TURN_K", raising=False)
-    r = offload.help_seeking_reward(0.0, _stats(oc=3), alpha=0.1, n_turns=8)
-    assert r == pytest.approx(0.1 * (0.5**2))
+    assert out["reward"] == 0.0
+    assert out["turn_rewards"][0] == pytest.approx(-0.08)
 
 
 def test_turn_advantage_paints_residuals():
@@ -567,7 +334,7 @@ def test_turn_advantage_paints_residuals():
     kl = [torch.zeros(6)]
     rollout_data = {
         "kl": kl,
-        "rewards": [0.5],  # already group-demeaned A_s
+        "rewards": [0.5],
         "metadata": [
             {
                 "turn_rewards": [1.0, 0.0],
@@ -577,18 +344,8 @@ def test_turn_advantage_paints_residuals():
     }
     compute_turn_advantages(None, rollout_data)
     adv = rollout_data["advantages"][0]
-    # mean_r = 0.5; residual +0.5 / -0.5
     assert adv[0].item() == pytest.approx(1.0)
     assert adv[3].item() == pytest.approx(0.0)
-
-
-def test_per_turn_baseline_uses_completion_over_n():
-    b = offload.per_turn_baseline_cost(n_turns=10, completion_tokens=4243, metadata={})
-    expected = (
-        offload._DEFAULT_BASELINE_PROMPT_TOKENS / 10 * offload.COST_GLM_INPUT
-        + 424.3 * offload.COST_GLM_OUTPUT
-    )
-    assert b == pytest.approx(expected)
 
 
 if __name__ == "__main__":

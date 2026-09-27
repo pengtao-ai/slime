@@ -1,8 +1,8 @@
 """Pi coding-agent harness (badlogic / earendil pi CLI).
 
 Non-interactive entrypoint is ``pi -p``. Provider traffic is pointed at the host
-Anthropic adapter via ``~/.pi/agent/models.json`` (api: anthropic-messages) and
-``ANTHROPIC_*`` env vars. Custom model ids must be registered under the anthropic
+OpenAI adapter via ``~/.pi/agent/models.json`` (api: openai-completions) and
+``OPENAI_*`` env vars. Custom model ids must be registered under the openai
 provider or pi rejects them.
 """
 
@@ -51,15 +51,14 @@ class PiHarness(BaseHarness):
         )
 
     async def write_config(self, sb: Sandbox, ctx: HarnessContext) -> None:
-        """Point anthropic provider at slime adapter; register custom model."""
-        # pi anthropic-messages appends /v1/messages itself; slime serves
-        # /v1/messages on the adapter root. Passing .../v1 yields /v1/v1/messages 404
-        # (unlike OpenCode, which only appends /messages).
+        """Point openai provider at slime OpenAI adapter; register custom model."""
+        # openai-completions talks to {baseUrl}/chat/completions; slime serves
+        # OpenAI routes under {adapter}/v1 (same as Codex).
         models = {
             "providers": {
-                "anthropic": {
-                    "baseUrl": ctx.adapter_url,
-                    "api": "anthropic-messages",
+                "openai": {
+                    "baseUrl": f"{ctx.adapter_url}/v1",
+                    "api": "openai-completions",
                     "apiKey": ctx.session_id,
                     "models": [
                         {
@@ -68,7 +67,7 @@ class PiHarness(BaseHarness):
                             "reasoning": False,
                             "input": ["text"],
                             "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-                            "contextWindow": 128000,
+                            "contextWindow": 160000,
                             "maxTokens": 32768,
                         }
                     ],
@@ -88,7 +87,7 @@ class PiHarness(BaseHarness):
     async def launch_and_wait(self, sb: Sandbox, ctx: HarnessContext, prompt: str, time_budget_sec: int) -> int:
         cmd = (
             f"/usr/local/bin/pi {self.launch_flags} "
-            f"--provider anthropic --model {shlex.quote(ctx.model_label)} "
+            f"--provider openai --model {shlex.quote(ctx.model_label)} "
             f"--api-key {shlex.quote(ctx.session_id)} "
             f"{shlex.quote(prompt)}"
         )
@@ -96,9 +95,8 @@ class PiHarness(BaseHarness):
         if extra:
             cmd = f"{cmd} {extra}"
         env = {
-            "ANTHROPIC_API_KEY": ctx.session_id,
-            "ANTHROPIC_AUTH_TOKEN": ctx.session_id,
-            "ANTHROPIC_BASE_URL": ctx.adapter_url,
+            "OPENAI_API_KEY": ctx.session_id,
+            "OPENAI_BASE_URL": f"{ctx.adapter_url}/v1",
             "PI_CODING_AGENT_DIR": "/home/agent/.pi/agent",
             **self.static_env,
         }

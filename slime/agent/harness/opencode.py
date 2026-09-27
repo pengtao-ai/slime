@@ -61,14 +61,17 @@ class OpenCodeHarness(BaseHarness):
         #
         # OpenCode validates provider/model against a local catalog. Custom labels
         # like slime-actor are rejected with ProviderModelNotFoundError unless
-        # registered under provider.anthropic.models. small_model keeps title
-        # generation on the same local model (otherwise it defaults to a Claude
-        # haiku id that is also absent from the catalog).
+        # registered under provider.anthropic.models. small_model pins any leftover
+        # lightweight calls to the same local model (defaults would hit a missing
+        # Claude haiku id). Title generation is disabled: the hidden title agent
+        # otherwise shares this session_id and forks a no-tool leaf into the
+        # training trajectory.
         model_id = f"anthropic/{ctx.model_label}"
         config = {
             "$schema": "https://opencode.ai/config.json",
             "model": model_id,
             "small_model": model_id,
+            "agent": {"title": {"disable": True}},
             "provider": {
                 "anthropic": {
                     "options": {
@@ -78,7 +81,7 @@ class OpenCodeHarness(BaseHarness):
                     "models": {
                         ctx.model_label: {
                             "name": ctx.model_label,
-                            "limit": {"context": 128000, "output": 32768},
+                            "limit": {"context": 160000, "output": 32768},
                         }
                     },
                 }

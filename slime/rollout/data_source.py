@@ -57,6 +57,9 @@ class RolloutDataSource(DataSource):
         self.sample_offset = 0
         # TODO remove this
         self.metadata = {}
+        # Groups parked by ``reserve_samples`` for the next ``get_samples`` call
+        # (used by sandbox pool prefetch). Offset/indices already advanced.
+        self._reserved: list[list[Sample]] | None = None
 
         if args.rollout_global_dataset and args.prompt_data is not None:
             tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
@@ -87,7 +90,7 @@ class RolloutDataSource(DataSource):
         else:
             self.dataset = None
 
-    def get_samples(self, num_samples):
+    def _materialize_samples(self, num_samples: int) -> list[list[Sample]]:
         # TODO further improve code
         if self.dataset is not None:
             if self.sample_offset + num_samples <= len(self.dataset):
@@ -95,16 +98,16 @@ class RolloutDataSource(DataSource):
                 self.sample_offset += num_samples
             else:
                 prompt_samples = self.dataset.samples[self.sample_offset :]
-                num_samples -= len(prompt_samples)
+                remaining = num_samples - len(prompt_samples)
                 self.epoch_id += 1
                 if self.args.rollout_shuffle:
                     self.dataset.shuffle(self.epoch_id)
-                prompt_samples += self.dataset.samples[:num_samples]
-                self.sample_offset = num_samples
+                prompt_samples += self.dataset.samples[:remaining]
+                self.sample_offset = remaining
         else:
             prompt_samples = [Sample() for _ in range(num_samples)]
 
-        samples = []
+        samples: list[list[Sample]] = []
         for prompt_sample in prompt_samples:
             group = []
             for _ in range(self.args.n_samples_per_prompt):
@@ -116,6 +119,31 @@ class RolloutDataSource(DataSource):
             self.sample_group_index += 1
             samples.append(group)
         return samples
+
+    def reserve_samples(self, num_samples: int) -> list[list[Sample]]:
+        """Materialize the next batch without exposing it to callers yet.
+
+        Offset and indices advance immediately so the parked groups match what
+        the next ``get_samples`` would have returned. A second reserve while
+        one is pending returns the same parked groups.
+        """
+        if self._reserved is not None:
+            return self._reserved
+        self._reserved = self._materialize_samples(num_samples)
+        return self._reserved
+
+    def get_samples(self, num_samples):
+        if self._reserved is not None:
+            out = self._reserved
+            self._reserved = None
+            if len(out) != num_samples:
+                logger.warning(
+                    "reserved sample groups len=%d != requested num_samples=%d; returning reserved",
+                    len(out),
+                    num_samples,
+                )
+            return out
+        return self._materialize_samples(num_samples)
 
     def add_samples(self, samples: list[list[Sample]]):
         raise RuntimeError(f"Cannot add samples to {self.__class__.__name__}. This is a read-only data source.")
@@ -130,6 +158,7 @@ class RolloutDataSource(DataSource):
             "sample_group_index": self.sample_group_index,
             "sample_index": self.sample_index,
             "metadata": self.metadata,
+            "reserved": self._reserved,
         }
         path = os.path.join(self.args.save, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -155,6 +184,7 @@ class RolloutDataSource(DataSource):
         self.sample_group_index = state_dict.get("sample_group_index", 0)
         self.sample_index = state_dict.get("sample_index", 0)
         self.metadata = state_dict.get("metadata", {})
+        self._reserved = state_dict.get("reserved", None)
 
         if self.args.rollout_global_dataset and self.args.rollout_shuffle and self.dataset is not None:
             self.dataset.shuffle(self.epoch_id)
@@ -178,6 +208,10 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
         """
         Return num_samples samples
         """
+        # Prefer parked reserved groups when the abort buffer is empty so
+        # sandbox-pool prefetch stays aligned with the next dataset batch.
+        if self._reserved is not None and len(self.buffer) == 0:
+            return RolloutDataSource.get_samples(self, num_samples)
 
         samples = self._get_samples_from_buffer(num_samples)
         num_samples -= len(samples)

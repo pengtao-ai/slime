@@ -67,11 +67,24 @@ async def _await_done_marker(sb: Sandbox, done_file: str, *, user: str, time_bud
     The 5s ``test -f && cat`` polls are deliberately short, idempotent RPCs --
     they keep the sandbox alive against idle GC while the detached command runs
     over a stream the gateway can't sever.
+
+    Under docker-rt load a single poll may hit the host ``subprocess`` timeout
+    even though the probe itself is cheap; retry once at 20s before failing.
     """
+    poll_cmd = f"test -f {done_file} && cat {done_file}"
     deadline = time.time() + time_budget_sec
     while time.time() < deadline:
         await asyncio.sleep(5)
-        ec, out, _ = await sb.exec(f"test -f {done_file} && cat {done_file}", user=user, timeout=15, check=False)
+        try:
+            ec, out, _ = await sb.exec(poll_cmd, user=user, timeout=15, check=False)
+        except RuntimeError as e:
+            if "host cmd timed out" not in str(e):
+                raise
+            logger.warning(
+                "[agent.sandbox] done-marker poll timed out (15s); retrying once with 20s: %s",
+                done_file,
+            )
+            ec, out, _ = await sb.exec(poll_cmd, user=user, timeout=20, check=False)
         if ec == 0 and (out or "").strip():
             return int(out.strip())
     return EXIT_TIME_BUDGET_EXCEEDED
@@ -438,6 +451,9 @@ class DockerSandbox:
       * ``SLIME_AGENT_DOCKER_ADD_HOST`` (default ``host.docker.internal:host-gateway``)
       * ``SLIME_AGENT_DOCKER_PULL`` (``1``/``true`` to pull before run)
       * ``SLIME_AGENT_DOCKER_RUN_TIMEOUT_SEC`` (default ``300``)
+      * ``SLIME_AGENT_DOCKER_READY_TIMEOUT_SEC`` (default ``180``; wait until
+        ``State.Status=running`` after ``docker run`` — needed for docker-rt
+        where ``run -d`` returns while the pod is still ``Created``)
       * ``SLIME_AGENT_DOCKER_NAME_PREFIX`` (default ``slime-sb``; container name
         is ``{prefix}-{12-hex}``, trailing ``-`` on the prefix is optional)
     """
@@ -446,7 +462,13 @@ class DockerSandbox:
     lifetime_sec_env = E2BSandbox.lifetime_sec_env
     default_lifetime_sec = E2BSandbox.default_lifetime_sec
 
-    def __init__(self, image: str, *, timeout: int | None = None) -> None:
+    def __init__(
+        self,
+        image: str,
+        *,
+        timeout: int | None = None,
+        existing_name: str | None = None,
+    ) -> None:
         self.image = image
         self.timeout = int(timeout if timeout is not None else (_getenv(*self.lifetime_sec_env) or self.default_lifetime_sec))
         self.network = (_getenv("SLIME_AGENT_DOCKER_NETWORK", default="bridge") or "bridge").lower()
@@ -455,9 +477,51 @@ class DockerSandbox:
         self.remove = True
         self.sandbox_id = ""
         self._container = ""
+        self._existing_name = (existing_name or "").strip()
+
+    @classmethod
+    def from_container(cls, image: str, name: str, *, timeout: int | None = None) -> DockerSandbox:
+        """Attach to an already-running container (skip ``docker run`` on enter)."""
+        sb = cls(image, timeout=timeout, existing_name=name)
+        sb._container = name
+        sb.sandbox_id = name
+        return sb
+
+    async def _wait_until_running(self, name: str) -> None:
+        """Block until the container accepts ``docker exec`` (ready for install_cli).
+
+        Local Docker exposes ``.State.Status``; docker-rt uses a top-level
+        ``status`` field and Go templates for ``.State.*`` fail. Probing with
+        ``docker exec … true`` works for both once the sandbox is actually up.
+        """
+        ready_timeout = int(_getenv("SLIME_AGENT_DOCKER_READY_TIMEOUT_SEC", default="180") or "180")
+        deadline = time.monotonic() + max(1, ready_timeout)
+        last_err = ""
+        while time.monotonic() < deadline:
+            code, _out, err = await self._run_host(
+                ["docker", "exec", name, "true"],
+                timeout=30,
+                check=False,
+            )
+            if code == 0:
+                return
+            last_err = (err or "").strip()
+            err_l = last_err.lower()
+            if "no such container" in err_l or "no such object" in err_l:
+                raise RuntimeError(f"container {name} disappeared before ready: {last_err[:200]}")
+            await asyncio.sleep(1.0)
+        raise RuntimeError(
+            f"container {name} not exec-ready within {ready_timeout}s (last_err={last_err[:160]!r})"
+        )
 
     async def __aenter__(self) -> DockerSandbox:
         import uuid
+
+        if self._existing_name:
+            self._container = self._existing_name
+            self.sandbox_id = self._existing_name
+            await self._wait_until_running(self._existing_name)
+            return self
 
         name = f"{self.name_prefix}-{uuid.uuid4().hex[:12]}"
         if self.pull:
@@ -485,6 +549,9 @@ class DockerSandbox:
         run_timeout = int(_getenv("SLIME_AGENT_DOCKER_RUN_TIMEOUT_SEC", default="300") or "300")
         try:
             await self._run_host(cmd, timeout=run_timeout, check=True)
+            # docker-rt often returns from ``run -d`` while status is still Created.
+            # install_cli / exec must wait until Running or they hit "No such container".
+            await self._wait_until_running(name)
         except Exception:
             # Client timeout/failure does not mean the daemon failed: a container
             # may already exist under ``name``. ``async with`` skips __aexit__ when

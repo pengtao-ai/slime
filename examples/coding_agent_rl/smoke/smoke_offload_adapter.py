@@ -202,7 +202,7 @@ async def _run() -> None:
                 reward = offload.cost_aware_reward(1.0, stats, usage=None)
                 assert reward < 1.0, reward
                 assert int(stats.get("offload_outside_think_count", 0)) == 0
-                # Outside-think span: no GLM, but solved reward takes format penalty.
+                # Outside-think no longer reduces episode R (turn -β only).
                 bad = {
                     "offload_outside_think_count": 1,
                     "small_prompt_tokens": 0,
@@ -210,7 +210,7 @@ async def _run() -> None:
                     "glm_input_tokens": 0,
                     "glm_output_tokens": 0,
                 }
-                assert offload.cost_aware_reward(1.0, bad, usage=None, format_penalty=0.25) == 0.75
+                assert offload.cost_aware_reward(1.0, bad, usage=None) == 1.0
                 # Failures must not get a length/cost gradient (EOS-collapse fix).
                 assert offload.cost_aware_reward(0.0, stats, usage=None) == 0.0
                 assert (

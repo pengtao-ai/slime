@@ -43,7 +43,7 @@ Actor 发出 `<|llm_offload|>N<|/llm_offload|>` → Adapter 调用远程 LLM（N
 | `OFFLOAD_MAX_TOKENS` | `32768` | 单次 offload 最大生成 token |
 | `OFFLOAD_STOP_TOKEN_ID` | `248078` | `<\|/llm_offload\|>` close token（PyroDash vocab） |
 | `ROLLOUT_STOP_TOKEN_IDS` | `248046 248044 248078` | rollout 停止 token 列表 |
-| `SLIME_OFFLOAD_EMBED_IN_TRAJECTORY` | `1` | 远程续写 embed 进 `Sample.tokens`（`loss_mask=0`） |
+| `SLIME_OFFLOAD_EMBED_IN_TRAJECTORY` | `1` | 远程续写 embed 进 `Sample.tokens`（`loss_mask=0`，不训远程；前后 SLM 仍 `loss=1`） |
 | `SLIME_OFFLOAD_EMBED_MAX_TOKENS` | （未设） | 可选：embed 进轨迹的 token 上限 |
 | `SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS` | `160000` | fork / rewrite-merge 响应 token 上限 |
 

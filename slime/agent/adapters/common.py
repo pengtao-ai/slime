@@ -13,11 +13,14 @@ protocols handle identically.
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 import logging
+import os
 import time
 import uuid
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -40,12 +43,18 @@ class Session:
     offload accounting (filled by coding-agent adapters when enabled).
     ``timing`` holds optional Chrome Trace event state (``trace_events``, ``tid``,
     ``n_turns``, ``n_offloads``) when the caller enables rollout timelines.
+
+    When ``preserve_reasoning_history`` is on, ``assistant_history`` /
+    ``last_turn_ids`` keep the server's canonical structured replies and exact
+    ``prompt_ids + output_ids`` so later turns append instead of re-tokenizing.
     """
 
     sampling_defaults: dict = dataclasses.field(default_factory=dict)
     max_context_tokens: int = 0
     offload_stats: dict = dataclasses.field(default_factory=dict)
     timing: dict = dataclasses.field(default_factory=dict)
+    assistant_history: list[dict] = dataclasses.field(default_factory=list)
+    last_turn_ids: list[int] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass
@@ -67,16 +76,142 @@ def _render_token_ids(
     *,
     tools: list[dict] | None,
     add_generation_prompt: bool = True,
+    chat_template: str | None = None,
 ) -> list[int]:
     """Render a chat-message list to token ids with the served chat template."""
-    enc = tokenizer.apply_chat_template(
-        messages,
-        tools=tools,
-        tokenize=True,
-        add_generation_prompt=add_generation_prompt,
-    )
+    kwargs: dict[str, Any] = {
+        "tools": tools,
+        "tokenize": True,
+        "add_generation_prompt": add_generation_prompt,
+    }
+    if chat_template is not None:
+        kwargs["chat_template"] = chat_template
+    enc = tokenizer.apply_chat_template(messages, **kwargs)
     ids = enc["input_ids"] if hasattr(enc, "__getitem__") and "input_ids" in enc else enc
     return list(ids)
+
+
+_QWEN_REASONING_HISTORY_BRANCH = "{%- if loop.index0 > ns.last_query_index %}"
+
+
+def _load_tokenizer_chat_template(tokenizer) -> str | None:
+    """Return the tokenizer's chat template string, including jinja-on-disk."""
+    template = getattr(tokenizer, "chat_template", None)
+    if isinstance(template, str) and template:
+        return template
+    name = getattr(tokenizer, "name_or_path", None)
+    if not name:
+        return None
+    jinja = Path(name) / "chat_template.jinja"
+    if jinja.is_file():
+        return jinja.read_text(encoding="utf-8")
+    return None
+
+
+def _reasoning_preserving_chat_template(tokenizer) -> str | None:
+    """Return the Qwen chat template variant needed for append-only RL turns.
+
+    Qwen3/3.5 normally drops reasoning from assistant messages before the most
+    recent user message. That inference-time compaction rewrites already sampled
+    tokens, which breaks a multi-turn RL trajectory. In this explicit mode all
+    available ``reasoning_content`` is rendered while the normal open generation
+    prompt remains unchanged.
+
+    Returns ``None`` when the served template has no Qwen reasoning branch; the
+    caller can still run append-only token continuation with the default template.
+    """
+    template = _load_tokenizer_chat_template(tokenizer)
+    if not isinstance(template, str) or _QWEN_REASONING_HISTORY_BRANCH not in template:
+        return None
+    return template.replace(_QWEN_REASONING_HISTORY_BRANCH, "{%- if true %}", 1)
+
+
+def _assistant_visible_signature(message: dict) -> tuple[Any, Any]:
+    """Content + tool_calls, ignoring wire-only correlation ids."""
+    normalized = {
+        k: v
+        for k, v in message.items()
+        if k in {"content", "tool_calls"}
+    }
+    tcs = normalized.get("tool_calls")
+    if isinstance(tcs, list):
+        normalized["tool_calls"] = [
+            ({k: v for k, v in tc.items() if k != "id"} if isinstance(tc, dict) else tc) for tc in tcs
+        ]
+    return normalized.get("content"), normalized.get("tool_calls")
+
+
+def _restore_canonical_assistant_history(messages: list[dict], assistant_history: list[dict]) -> int:
+    """Replace client-echoed assistant turns with the server's canonical copy.
+
+    Clients may omit reasoning and normalize text or tool-call arguments when
+    replaying a response. The adapter generated those turns and owns their exact
+    structured form, so align assistant messages from the newest turn backwards
+    and restore them wholesale. User and tool messages remain client-owned.
+    """
+    positions = [i for i, message in enumerate(messages) if message.get("role") == "assistant"]
+    restored = 0
+    for position, canonical in zip(reversed(positions), reversed(assistant_history), strict=False):
+        if messages[position] != canonical:
+            messages[position] = copy.deepcopy(canonical)
+            restored += 1
+    return restored
+
+
+def _assert_append_only_prompt(previous_turn_ids: list[int], prompt_ids: list[int]) -> None:
+    """Require a new prompt to preserve every token sampled in the prior turn."""
+    if not previous_turn_ids:
+        return
+    if prompt_ids[: len(previous_turn_ids)] == previous_turn_ids:
+        return
+    common = 0
+    limit = min(len(previous_turn_ids), len(prompt_ids))
+    while common < limit and previous_turn_ids[common] == prompt_ids[common]:
+        common += 1
+    raise RuntimeError(
+        "non-append-only agent prompt: "
+        f"previous_tokens={len(previous_turn_ids)} prompt_tokens={len(prompt_ids)} common_prefix={common}"
+    )
+
+
+def _continue_from_canonical_turn(
+    messages: list[dict],
+    tokenizer,
+    *,
+    tools: list[dict] | None,
+    chat_template: str | None,
+    rendered_prompt_ids: list[int],
+    previous_turn_ids: list[int],
+    previous_response_message: dict,
+) -> list[int]:
+    """Append only the client messages added after the last sampled response.
+
+    A parsed assistant response is semantically equivalent to the sampled text,
+    but tool parsers and chat templates can normalize whitespace or argument
+    formatting. The sampled token ids are therefore the canonical history. We
+    use message identity only to locate the assistant boundary in the freshly
+    rendered prompt, then append the new suffix to those canonical ids.
+    """
+    assistant_positions = [i for i, message in enumerate(messages) if message.get("role") == "assistant"]
+    if not assistant_positions:
+        raise RuntimeError("append-only agent prompt has no replayed assistant message")
+    boundary = assistant_positions[-1]
+    if _assistant_visible_signature(messages[boundary]) != _assistant_visible_signature(previous_response_message):
+        raise RuntimeError("latest replayed assistant does not match the previous sampled response")
+
+    rendered_through_assistant = _render_token_ids(
+        messages[: boundary + 1],
+        tokenizer,
+        tools=tools,
+        add_generation_prompt=False,
+        chat_template=chat_template,
+    )
+    if rendered_prompt_ids[: len(rendered_through_assistant)] != rendered_through_assistant:
+        raise RuntimeError("chat template rewrote messages before the latest assistant boundary")
+
+    prompt_ids = previous_turn_ids + rendered_prompt_ids[len(rendered_through_assistant) :]
+    _assert_append_only_prompt(previous_turn_ids, prompt_ids)
+    return prompt_ids
 
 
 def flatten_content(c: Any) -> str:
@@ -151,6 +286,7 @@ class BaseAdapter:
         sglang_url,
         tool_parser=None,
         reasoning_parser=None,
+        preserve_reasoning_history: bool = False,
         max_turns_per_sid: int | None = None,
         fork_threshold_tokens: int | None = None,
         debug_callback: Callable[..., None] | None = None,
@@ -159,6 +295,16 @@ class BaseAdapter:
         self.sglang_url = sglang_url.rstrip("/") if isinstance(sglang_url, str) else sglang_url
         self.tool_parser = tool_parser
         self.reasoning_parser = reasoning_parser
+        self.preserve_reasoning_history = bool(preserve_reasoning_history)
+        self.chat_template = (
+            _reasoning_preserving_chat_template(tokenizer) if self.preserve_reasoning_history else None
+        )
+        if self.preserve_reasoning_history and self.chat_template is None:
+            self.logger.warning(
+                "[%s] preserve_reasoning_history=1 but no Qwen reasoning-history branch in "
+                "chat template; append-only token continuation still enabled",
+                self.log_prefix,
+            )
         self.store: dict[str, Any] = {}
         self.inflight: dict[str, set[asyncio.Task]] = {}
         self.closed: set[str] = set()
@@ -381,7 +527,37 @@ class BaseAdapter:
                 args={"turn": turn_idx, "session_id": sid},
             ):
                 translated, tools_schema = self._translate(body)
-                prompt_ids = _render_token_ids(translated, tok, tools=tools_schema, add_generation_prompt=True)
+                # A harness may echo a prior assistant turn re-rendered rather than
+                # byte-identical; render from what we generated so the turn stays CLEAN.
+                translated = self.manager.restore_generated_messages(sid, translated, tools_schema)
+                if self.preserve_reasoning_history:
+                    restored = _restore_canonical_assistant_history(translated, s.assistant_history)
+                    if restored:
+                        self.logger.debug(
+                            "[%s] sid=%s restored canonical history for %d assistant turn(s)",
+                            self.log_prefix,
+                            sid,
+                            restored,
+                        )
+                rendered_prompt_ids = _render_token_ids(
+                    translated,
+                    tok,
+                    tools=tools_schema,
+                    add_generation_prompt=True,
+                    chat_template=self.chat_template,
+                )
+                if self.preserve_reasoning_history and s.last_turn_ids:
+                    prompt_ids = _continue_from_canonical_turn(
+                        translated,
+                        tok,
+                        tools=tools_schema,
+                        chat_template=self.chat_template,
+                        rendered_prompt_ids=rendered_prompt_ids,
+                        previous_turn_ids=s.last_turn_ids,
+                        previous_response_message=s.assistant_history[-1],
+                    )
+                else:
+                    prompt_ids = rendered_prompt_ids
 
                 # 1) Always SLM first for this agent round.
                 turn = await call_sglang_generate(prompt_ids, s, body, adapter=self, session_id=sid)
@@ -435,13 +611,21 @@ class BaseAdapter:
                     turn,
                 )
 
-                self.manager.record_turn(
+                superseded = self.manager.record_turn(
                     sid,
                     turn=turn,
                     prompt_messages=translated,
                     response_message=reply.manager_message,
                     metadata={"sid": sid},
                 )
+                if self.preserve_reasoning_history:
+                    # Tip regeneration drops the abandoned leaf in the manager;
+                    # mirror that in canonical history so restore stays aligned
+                    # with what the client actually kept.
+                    if superseded and s.assistant_history:
+                        s.assistant_history.pop()
+                    s.assistant_history.append(copy.deepcopy(reply.manager_message))
+                    s.last_turn_ids = list(prompt_ids) + list(turn.output_ids)
                 return response
         finally:
             self.inflight.get(sid, set()).discard(task)
@@ -493,6 +677,71 @@ def _sampling_params(session: Any, body: dict, *, max_token_keys: tuple[str, ...
     return sp
 
 
+def _offload_constrained_decode_api() -> Any | None:
+    """Lazy import so non-offload adapters do not depend on examples.*."""
+    if os.environ.get("SLIME_AGENT_OFFLOAD", "").strip().lower() not in ("1", "true", "yes", "on"):
+        return None
+    try:
+        from examples.coding_agent_rl import offload as offload_mod
+    except ImportError:
+        return None
+    if not offload_mod.constrained_decode_enabled():
+        return None
+    return offload_mod
+
+
+async def _sglang_generate_once(
+    *,
+    prompt_ids: list[int],
+    sampling_params: dict[str, Any],
+    sglang_url: str,
+    headers: dict[str, str] | None,
+    logger: logging.Logger,
+    log_prefix: str,
+    session_id: str | None,
+) -> tuple[list[int], list[float], str]:
+    """POST ``/generate`` once; return ``(output_ids, output_log_probs, finish_reason)``."""
+    rid = uuid.uuid4().hex
+    timeout = aiohttp.ClientTimeout(total=None, sock_read=900)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as sess, sess.post(
+            f"{sglang_url}/generate",
+            json={
+                "rid": rid,
+                "input_ids": prompt_ids,
+                "sampling_params": sampling_params,
+                "return_logprob": True,
+            },
+            headers=headers,
+        ) as r:
+            if r.status >= 400:
+                text = await r.text()
+                logger.warning(
+                    "[%s] sid=%s rid=%s sglang upstream %d: %.200s",
+                    log_prefix,
+                    session_id,
+                    rid,
+                    r.status,
+                    text,
+                )
+                raise RuntimeError(f"sglang upstream {r.status}: {text[:400]}")
+            data = await r.json(content_type=None)
+        meta = data.get("meta_info") or {}
+        output_token_logprobs = meta.get("output_token_logprobs") or []
+        output_ids = [x[1] for x in output_token_logprobs]
+        output_log_probs = [float(x[0]) for x in output_token_logprobs]
+        finish = (meta.get("finish_reason") or {}).get("type", "stop") or "stop"
+        return output_ids, output_log_probs, finish
+    except (asyncio.CancelledError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logger.debug("[%s] sid=%s rid=%s turn aborted: %s", log_prefix, session_id, rid, type(e).__name__)
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as s2:
+                await s2.post(f"{sglang_url}/abort_request", json={"rid": rid})
+        except Exception:
+            pass
+        raise
+
+
 async def call_sglang_generate(
     prompt_ids: list[int],
     session: Any,
@@ -502,6 +751,10 @@ async def call_sglang_generate(
     session_id: str | None = None,
 ) -> TurnRecord:
     """POST one turn to sglang /generate and pack the reply into a TurnRecord.
+
+    When coding-agent offload constrained decode is enabled, runs Free phase
+    (ban CLOSE, stop on OPEN) then an ebnf continuation for digit+CLOSE, merging
+    tokens/logprobs into one :class:`TurnRecord`.
 
     Module-level (not a method) so tests can monkeypatch it.
     """
@@ -521,10 +774,12 @@ async def call_sglang_generate(
             return TurnRecord(prompt_ids=list(prompt_ids), output_ids=[], finish_reason="length")
         sp["max_new_tokens"] = min(int(sp.get("max_new_tokens", remaining_context)), remaining_context)
 
+    offload_mod = _offload_constrained_decode_api()
+    if offload_mod is not None:
+        sp = offload_mod.apply_free_phase_constrained_sampling(sp)
+
     sglang_url = adapter.sglang_url
-    rid = uuid.uuid4().hex
     headers = {"X-SMG-Routing-Key": session_id} if session_id and session_id != "default" else None
-    timeout = aiohttp.ClientTimeout(total=None, sock_read=900)
     events, tid, timing = session_trace_ctx(session)
     turn_idx = int((timing or {}).get("current_turn", 0) or 0)
     post_offload = int((timing or {}).get("n_offloads", 0) or 0) > 0
@@ -535,44 +790,45 @@ async def call_sglang_generate(
         tid=tid,
         args={"turn": turn_idx, "post_offload": post_offload, "session_id": session_id},
     ):
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as sess, sess.post(
-                f"{sglang_url}/generate",
-                json={
-                    "rid": rid,
-                    "input_ids": prompt_ids,
-                    "sampling_params": sp,
-                    "return_logprob": True,
-                },
-                headers=headers,
-            ) as r:
-                if r.status >= 400:
-                    text = await r.text()
+        output_ids, output_log_probs, finish = await _sglang_generate_once(
+            prompt_ids=prompt_ids,
+            sampling_params=sp,
+            sglang_url=sglang_url,
+            headers=headers,
+            logger=logger,
+            log_prefix=adapter.log_prefix,
+            session_id=session_id,
+        )
+
+        if offload_mod is not None and output_ids and output_ids[-1] == offload_mod.offload_open_token_id():
+            ebnf_sp = offload_mod.apply_ebnf_phase_constrained_sampling(sp)
+            # Remaining context after free tokens (0 = unlimited).
+            if session.max_context_tokens > 0:
+                used = len(prompt_ids) + len(output_ids)
+                rem = session.max_context_tokens - used
+                if rem <= 0:
                     logger.warning(
-                        "[%s] sid=%s rid=%s sglang upstream %d: %.200s",
+                        "[%s] sid=%s no context left for offload ebnf continue",
                         adapter.log_prefix,
                         session_id,
-                        rid,
-                        r.status,
-                        text,
                     )
-                    raise RuntimeError(f"sglang upstream {r.status}: {text[:400]}")
-                data = await r.json(content_type=None)
-            meta = data.get("meta_info") or {}
-            output_token_logprobs = meta.get("output_token_logprobs") or []
-            output_ids = [x[1] for x in output_token_logprobs]
-            output_log_probs = [float(x[0]) for x in output_token_logprobs]
-            finish = (meta.get("finish_reason") or {}).get("type", "stop") or "stop"
-        except (asyncio.CancelledError, aiohttp.ClientError, asyncio.TimeoutError) as e:
-            # free the sglang slot eagerly on client cancel/timeout, else the
-            # orphaned generation keeps occupying KV until its own length cap
-            logger.debug("[%s] sid=%s rid=%s turn aborted: %s", adapter.log_prefix, session_id, rid, type(e).__name__)
-            try:
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as s2:
-                    await s2.post(f"{sglang_url}/abort_request", json={"rid": rid})
-            except Exception:
-                pass
-            raise
+                    rem = 0
+                else:
+                    ebnf_sp["max_new_tokens"] = min(int(ebnf_sp.get("max_new_tokens", rem)), rem)
+            else:
+                rem = 1  # proceed
+            if rem > 0:
+                cont_ids, cont_lps, finish = await _sglang_generate_once(
+                    prompt_ids=list(prompt_ids) + list(output_ids),
+                    sampling_params=ebnf_sp,
+                    sglang_url=sglang_url,
+                    headers=headers,
+                    logger=logger,
+                    log_prefix=adapter.log_prefix,
+                    session_id=session_id,
+                )
+                output_ids = list(output_ids) + list(cont_ids)
+                output_log_probs = list(output_log_probs) + list(cont_lps)
 
     return TurnRecord(
         prompt_ids=list(prompt_ids),
