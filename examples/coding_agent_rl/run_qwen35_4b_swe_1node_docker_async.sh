@@ -63,7 +63,7 @@ export N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-8}"
 export GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))}"
 export SWE_BOOT_CONCURRENCY="${SWE_BOOT_CONCURRENCY:-32}"
 # 200 prompts / batch=3 ≈ 67 steps/epoch.
-export NUM_ROLLOUT="${NUM_ROLLOUT:-100}"
+export NUM_ROLLOUT="${NUM_ROLLOUT:-200}"
 
 # Prefer actor GPUs: agents are sandbox-bound; train was the bottleneck on 4+4.
 # TP=1 CP=2 → DP=3 on 6 actor GPUs (GDN still all-gathers full seq per CP group).

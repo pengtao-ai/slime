@@ -125,6 +125,26 @@ ROLLOUT_STOP_TOKEN_IDS="${ROLLOUT_STOP_TOKEN_IDS:-248046 248044}"
 LOG_DIR="${RUN_ROOT}"
 mkdir -p "${LOG_DIR}/rollout_dumps" "${LOG_DIR}/timelines" "${SAVE_DIR}"
 LOG_FILE="${LOG_DIR}/run.log"
+
+# ---------------------------------------------------------------------------
+# [NEW] wandb — coding_agent_rl 曲线上报（整段新增，勿拆散）
+# ---------------------------------------------------------------------------
+export USE_WANDB=1
+export WANDB_API_KEY=7c7f22bc2f23cda64c29fd2d78e4112890cee22f
+export WANDB_PROJECT=slime-coding-agent
+export WANDB_GROUP="${EXP_TAG}"
+export WANDB_DIR="${RUN_ROOT}/wandb"
+WANDB_ARGS=(
+   --use-wandb
+   --wandb-project "${WANDB_PROJECT}"
+   --wandb-group "${WANDB_GROUP}"
+   --wandb-key "${WANDB_API_KEY}"
+   --wandb-dir "${WANDB_DIR}"
+)
+# ---------------------------------------------------------------------------
+# [NEW] wandb end
+# ---------------------------------------------------------------------------
+
 echo "======================================================================"
 echo "Async training log: ${LOG_FILE}"
 echo "RUN_ROOT=${RUN_ROOT}"
@@ -133,6 +153,7 @@ echo "ACTOR_GPUS=${ACTOR_GPUS} ROLLOUT_GPUS=${ROLLOUT_GPUS} (TP=${TP_SIZE} PP=${
 echo "ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE} N_SAMPLES=${N_SAMPLES_PER_PROMPT} GLOBAL_BATCH=${GLOBAL_BATCH_SIZE}"
 echo "QWEN_GDN_BACKEND=${QWEN_GDN_BACKEND}"
 echo "SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS=${SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS:-160000}"
+echo "W&B [NEW]: project=${WANDB_PROJECT} group=${WANDB_GROUP} dir=${WANDB_DIR}"
 echo "======================================================================"
 if (( GLOBAL_BATCH_SIZE % DP_SIZE != 0 )); then
   echo "ERROR: GLOBAL_BATCH_SIZE(${GLOBAL_BATCH_SIZE}) must be divisible by DP(${DP_SIZE})" >&2
@@ -388,6 +409,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    "${ROLLOUT_ARGS[@]}" \
    "${OPTIMIZER_ARGS[@]}" \
    "${ALGO_ARGS[@]}" \
+   "${WANDB_ARGS[@]}" \
    "${PERF_ARGS[@]}" \
    "${SGLANG_ARGS[@]}" \
    "${MISC_ARGS[@]}" \
